@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -rn \"typesupport_identifier\" /opt/ros/jazzy/include/rosidl_typesupport_introspection_cpp/rosidl_typesupport_introspection_cpp/*.hpp)",
+      "Bash(nm -D /home/abe/projects/drixo_ws_ros2/rmw/install/rmw_unix_socket_cpp/lib/librmw_unix_socket_cpp.so)",
+      "Bash(find /home/abe/projects/drixo_ws_ros2/ws_cyclone_opt/src/rmw_cyclonedds/rmw_cyclonedds_cpp -name \"package.xml\" -exec cat {} \\\\;)",
+      "Bash(find /home/abe/projects/drixo_ws_ros2/iceoryx_ws/src/rmw_iceoryx/rmw_iceoryx_cpp -name \"package.xml\" -exec cat {} \\\\;)",
+      "Bash(grep -n \"rmw_message_info_t\\\\|rmw_gid_t\\\\|rmw_qos_profile_t\" /opt/ros/jazzy/include/rmw/rmw/*.h)",
+      "Bash(grep -n \"return RMW_RET_OK\" /home/abe/projects/drixo_ws_ros2/rmw/rmw_unix_socket_cpp/src/*.cpp)",
+      "Bash(cat)",
+      "Read(//tmp/**)",
+      "Bash(clangd --version)",
+      "Bash(code --list-extensions)",
+      "Bash(bash -c 'source /opt/ros/*/setup.bash 2>/dev/null; echo \"ROS_DISTRO=$ROS_DISTRO\"; echo \"AMENT_PREFIX_PATH=$AMENT_PREFIX_PATH\"')",
+      "Bash(ln -sf /home/abe/projects/drixo_ws_ros2/rmw/build/rmw_unix_socket_cpp/compile_commands.json /home/abe/projects/drixo_ws_ros2/rmw/compile_commands.json)",
+      "Bash(git rm:*)",
+      "Bash(find /home/abe/projects/drixo_ws_ros2/drix_ocean_ws/src/cortix_msgs/msg -name \"AlgoStatus*\" -exec echo \"=== {} ===\" \\\\; -exec cat {} \\\\;)",
+      "Bash(grep -n \"members_->data\\\\|members_.*typesupport\" /home/abe/projects/drixo_ws_ros2/ws_rmw_zenoh/src/rmw_zenoh/rmw_zenoh_cpp/src/detail/*.cpp)",
+      "Bash(ls /opt/ros/jazzy/lib/libfastcdr*)",
+      "Bash(pkg-config --cflags fastcdr)",
+      "Bash(grep -rn \"serialized\\\\|generic\\\\|babel_fish\\\\|GenericPub\\\\|raw\" /home/abe/projects/drixo_ws_ros2/drix_ocean_ws/src/lib_ros_data_transfer/src/*.cpp /home/abe/projects/drixo_ws_ros2/drix_ocean_ws/src/lib_ros_data_transfer/src/*.hpp)"
+    ],
+    "additionalDirectories": [
+      "/tmp",
+      "/home/abe/projects/drixo_ws_ros2/rmw/.vscode"
+    ]
+  }
+}
