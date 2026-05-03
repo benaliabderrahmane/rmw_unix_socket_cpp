@@ -237,59 +237,50 @@ rmw_ret_t rmw_wait(
 
   // 4. If nothing ready, block with epoll
   if (!something_ready) {
-    // Register all fds
+    // PERFORMANCE: only EPOLL_CTL_ADD fds we haven't registered before.
+    // Closed fds are auto-removed by the kernel, so we never need DEL.
     struct epoll_event ev;
     std::memset(&ev, 0, sizeof(ev));
 
-    // Track registered fds for cleanup
-    std::vector<int> registered_fds;
+    auto register_fd = [&](int fd) {
+        if (fd < 0) {return;}
+        if (ws_data->registered_fds.find(fd) != ws_data->registered_fds.end()) {
+          return;
+        }
+        ev.events = EPOLLIN;
+        ev.data.fd = fd;
+        if (epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_ADD, fd, &ev) == 0) {
+          ws_data->registered_fds.insert(fd);
+        }
+      };
 
     if (subscriptions) {
       for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
         if (!subscriptions->subscribers[i]) {continue;}
         auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
-        ev.events = EPOLLIN;
-        ev.data.fd = sub->socket_fd;
-        if (epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_ADD, sub->socket_fd, &ev) == 0) {
-          registered_fds.push_back(sub->socket_fd);
-        }
+        register_fd(sub->socket_fd);
       }
     }
-
     if (services) {
       for (size_t i = 0; i < services->service_count; ++i) {
         if (!services->services[i]) {continue;}
         auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
-        ev.events = EPOLLIN;
-        ev.data.fd = srv->socket_fd;
-        if (epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_ADD, srv->socket_fd, &ev) == 0) {
-          registered_fds.push_back(srv->socket_fd);
-        }
+        register_fd(srv->socket_fd);
       }
     }
-
     if (clients) {
       for (size_t i = 0; i < clients->client_count; ++i) {
         if (!clients->clients[i]) {continue;}
         auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
-        ev.events = EPOLLIN;
-        ev.data.fd = cli->socket_fd;
-        if (epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_ADD, cli->socket_fd, &ev) == 0) {
-          registered_fds.push_back(cli->socket_fd);
-        }
+        register_fd(cli->socket_fd);
       }
     }
-
     if (guard_conditions) {
       for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
         if (!guard_conditions->guard_conditions[i]) {continue;}
         auto * gc = static_cast<rmw_uds::UdsGuardCondition *>(
           guard_conditions->guard_conditions[i]);
-        ev.events = EPOLLIN;
-        ev.data.fd = gc->eventfd_fd;
-        if (epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_ADD, gc->eventfd_fd, &ev) == 0) {
-          registered_fds.push_back(gc->eventfd_fd);
-        }
+        register_fd(gc->eventfd_fd);
       }
     }
 
@@ -306,11 +297,7 @@ rmw_ret_t rmw_wait(
     // Block
     struct epoll_event ready_events[64];
     epoll_wait(ws_data->epoll_fd, ready_events, 64, timeout_ms);
-
-    // Cleanup: remove all fds from epoll
-    for (int fd : registered_fds) {
-      epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
-    }
+    // No EPOLL_CTL_DEL needed — fds stay registered across calls.
 
     // Drain again after epoll
     if (subscriptions) {

@@ -187,12 +187,33 @@ rmw_ret_t rmw_publish(
   hdr.payload_size = static_cast<uint32_t>(payload.size());
   hdr.msg_type = 0;  // topic message
 
-  // Find all subscribers for this topic
+  // PERFORMANCE: only lock the registry when the graph generation has changed
+  // since we last cached the subscriber list. The hot path is purely local.
   auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
-  rmw_uds::registry_lock(header);
-  auto subs = rmw_uds::registry_query(
-    header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(), nullptr, nullptr);
-  rmw_uds::registry_unlock(header);
+  uint64_t current_gen = rmw_uds::registry_generation(header);
+
+  std::vector<std::string> sub_paths;
+  {
+    std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
+    if (current_gen != pub_data->cached_generation) {
+      rmw_uds::registry_lock(header);
+      auto subs = rmw_uds::registry_query(
+        header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
+        nullptr, nullptr);
+      // Re-read the generation under lock to avoid losing updates that
+      // happened between our generation read above and the lock acquire.
+      pub_data->cached_generation = rmw_uds::registry_generation(header);
+      rmw_uds::registry_unlock(header);
+      pub_data->cached_subscriber_paths.clear();
+      pub_data->cached_subscriber_paths.reserve(subs.size());
+      for (const auto & s : subs) {
+        if (!s.socket_path.empty()) {
+          pub_data->cached_subscriber_paths.push_back(s.socket_path);
+        }
+      }
+    }
+    sub_paths = pub_data->cached_subscriber_paths;  // copy under lock
+  }
 
   // TRANSIENT_LOCAL: cache message and replay to late-joining subscribers
   if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
@@ -206,29 +227,24 @@ rmw_ret_t rmw_publish(
       pub_data->message_cache.pop_front();
     }
 
-    for (const auto & sub : subs) {
-      if (sub.socket_path.empty()) {continue;}
-      if (pub_data->known_subscriber_paths.count(sub.socket_path) == 0) {
-        pub_data->known_subscriber_paths.insert(sub.socket_path);
+    for (const auto & path : sub_paths) {
+      if (pub_data->known_subscriber_paths.count(path) == 0) {
+        pub_data->known_subscriber_paths.insert(path);
         for (size_t i = 0; i + 1 < pub_data->message_cache.size(); ++i) {
           const auto & cm = pub_data->message_cache[i];
           rmw_uds::send_to(
             pub_data->context->send_socket_fd,
-            sub.socket_path, cm.header,
-            cm.payload.data(), cm.payload.size());
+            path, cm.header, cm.payload.data(), cm.payload.size());
         }
       }
     }
   }
 
-  // Send current message to each subscriber
-  for (const auto & sub : subs) {
-    if (!sub.socket_path.empty()) {
-      rmw_uds::send_to(
-        pub_data->context->send_socket_fd,
-        sub.socket_path, hdr,
-        payload.data(), payload.size());
-    }
+  // Send current message to each subscriber (no registry lock held)
+  for (const auto & path : sub_paths) {
+    rmw_uds::send_to(
+      pub_data->context->send_socket_fd,
+      path, hdr, payload.data(), payload.size());
   }
 
   return RMW_RET_OK;
@@ -256,19 +272,34 @@ rmw_ret_t rmw_publish_serialized_message(
   hdr.payload_size = static_cast<uint32_t>(serialized_message->buffer_length);
   hdr.msg_type = 0;
 
+  // Reuse the cached subscriber list (refresh only on graph change)
   auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
-  rmw_uds::registry_lock(header);
-  auto subs = rmw_uds::registry_query(
-    header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(), nullptr, nullptr);
-  rmw_uds::registry_unlock(header);
-
-  for (const auto & sub : subs) {
-    if (!sub.socket_path.empty()) {
-      rmw_uds::send_to(
-        pub_data->context->send_socket_fd,
-        sub.socket_path, hdr,
-        serialized_message->buffer, serialized_message->buffer_length);
+  uint64_t current_gen = rmw_uds::registry_generation(header);
+  std::vector<std::string> sub_paths;
+  {
+    std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
+    if (current_gen != pub_data->cached_generation) {
+      rmw_uds::registry_lock(header);
+      auto subs = rmw_uds::registry_query(
+        header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
+        nullptr, nullptr);
+      pub_data->cached_generation = rmw_uds::registry_generation(header);
+      rmw_uds::registry_unlock(header);
+      pub_data->cached_subscriber_paths.clear();
+      pub_data->cached_subscriber_paths.reserve(subs.size());
+      for (const auto & s : subs) {
+        if (!s.socket_path.empty()) {
+          pub_data->cached_subscriber_paths.push_back(s.socket_path);
+        }
+      }
     }
+    sub_paths = pub_data->cached_subscriber_paths;
+  }
+
+  for (const auto & path : sub_paths) {
+    rmw_uds::send_to(
+      pub_data->context->send_socket_fd,
+      path, hdr, serialized_message->buffer, serialized_message->buffer_length);
   }
 
   return RMW_RET_OK;
