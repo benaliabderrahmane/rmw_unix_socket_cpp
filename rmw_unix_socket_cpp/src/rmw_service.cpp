@@ -239,24 +239,40 @@ rmw_ret_t rmw_send_response(
   hdr.payload_size = static_cast<uint32_t>(payload.size());
   hdr.msg_type = 2;  // response
 
-  // Find client socket by GID in registry
+  // PERFORMANCE: cache the (GID -> path) client list; only refresh on graph change.
   auto * header = rmw_uds::registry_header(srv_data->context->registry_ptr);
-  rmw_uds::registry_lock(header);
-  auto clients = rmw_uds::registry_query(
-    header, rmw_uds::ENTRY_CLIENT, srv_data->service_name.c_str(), nullptr, nullptr);
-  rmw_uds::registry_unlock(header);
+  uint64_t current_gen = rmw_uds::registry_generation(header);
+  std::vector<rmw_uds::CachedClient> clients_local;
+  {
+    std::lock_guard<std::mutex> lock(srv_data->client_cache_mutex);
+    if (current_gen != srv_data->cached_generation) {
+      rmw_uds::registry_lock(header);
+      auto clients = rmw_uds::registry_query(
+        header, rmw_uds::ENTRY_CLIENT, srv_data->service_name.c_str(),
+        nullptr, nullptr);
+      srv_data->cached_generation = rmw_uds::registry_generation(header);
+      rmw_uds::registry_unlock(header);
+      srv_data->cached_clients.clear();
+      srv_data->cached_clients.reserve(clients.size());
+      for (const auto & c : clients) {
+        if (c.socket_path.empty()) {continue;}
+        rmw_uds::CachedClient cc;
+        cc.socket_path = c.socket_path;
+        std::memcpy(cc.gid, c.gid, sizeof(cc.gid));
+        srv_data->cached_clients.push_back(std::move(cc));
+      }
+    }
+    clients_local = srv_data->cached_clients;
+  }
 
-  // Find the client whose GID matches
-  for (const auto & cli : clients) {
-    if (std::memcmp(cli.gid, request_header->writer_guid, sizeof(cli.gid)) == 0) {
+  for (const auto & c : clients_local) {
+    if (std::memcmp(c.gid, request_header->writer_guid, sizeof(c.gid)) == 0) {
       rmw_uds::send_to(
         srv_data->context->send_socket_fd,
-        cli.socket_path, hdr,
-        payload.data(), payload.size());
+        c.socket_path, hdr, payload.data(), payload.size());
       return RMW_RET_OK;
     }
   }
-
   // Client not found — might have disconnected
   return RMW_RET_OK;
 }

@@ -186,25 +186,37 @@ rmw_ret_t rmw_send_request(
   hdr.payload_size = static_cast<uint32_t>(payload.size());
   hdr.msg_type = 1;  // request
 
-  // Find service server in registry
+  // PERFORMANCE: cache the service path; only re-query the registry on
+  // graph generation change.
   auto * header = rmw_uds::registry_header(cli_data->context->registry_ptr);
-  rmw_uds::registry_lock(header);
-  auto services = rmw_uds::registry_query(
-    header, rmw_uds::ENTRY_SERVICE, cli_data->service_name.c_str(), nullptr, nullptr);
-  rmw_uds::registry_unlock(header);
-
-  // Send to first available service
-  for (const auto & srv : services) {
-    if (!srv.socket_path.empty()) {
-      rmw_uds::send_to(
-        cli_data->context->send_socket_fd,
-        srv.socket_path, hdr,
-        payload.data(), payload.size());
-      return RMW_RET_OK;
+  uint64_t current_gen = rmw_uds::registry_generation(header);
+  std::string service_path;
+  {
+    std::lock_guard<std::mutex> lock(cli_data->svc_cache_mutex);
+    if (current_gen != cli_data->cached_generation) {
+      rmw_uds::registry_lock(header);
+      auto services = rmw_uds::registry_query(
+        header, rmw_uds::ENTRY_SERVICE, cli_data->service_name.c_str(),
+        nullptr, nullptr);
+      cli_data->cached_generation = rmw_uds::registry_generation(header);
+      rmw_uds::registry_unlock(header);
+      cli_data->cached_service_path.clear();
+      for (const auto & srv : services) {
+        if (!srv.socket_path.empty()) {
+          cli_data->cached_service_path = srv.socket_path;
+          break;
+        }
+      }
     }
+    service_path = cli_data->cached_service_path;
   }
 
-  // No service found — still return OK (request might be sent later)
+  if (!service_path.empty()) {
+    rmw_uds::send_to(
+      cli_data->context->send_socket_fd,
+      service_path, hdr, payload.data(), payload.size());
+  }
+  // No service found yet — still return OK (request will be sent on retry)
   return RMW_RET_OK;
 }
 

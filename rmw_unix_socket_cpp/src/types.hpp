@@ -119,6 +119,13 @@ struct UdsPublisher
   UdsContext * context = nullptr;
   UdsNode * node = nullptr;
 
+  // PERFORMANCE: cache the matching subscriber socket paths to avoid locking
+  // the registry on every publish. We re-query only when the registry's
+  // generation counter changes (graph topology actually changed).
+  std::mutex sub_cache_mutex;
+  uint64_t cached_generation = 0;
+  std::vector<std::string> cached_subscriber_paths;
+
   // TRANSIENT_LOCAL: cache of last N messages for late-joining subscribers
   std::mutex cache_mutex;
   std::deque<CachedMessage> message_cache;
@@ -149,6 +156,13 @@ struct UdsSubscription
   const void * on_new_message_user_data = nullptr;
 };
 
+// Cached client routing entry for service responses (path + GID)
+struct CachedClient
+{
+  std::string socket_path;
+  uint8_t gid[16];
+};
+
 // Service server data
 struct UdsService
 {
@@ -165,6 +179,13 @@ struct UdsService
   int32_t registry_index = -1;
   UdsContext * context = nullptr;
   UdsNode * node = nullptr;
+
+  // PERFORMANCE: cache client (GID -> socket path) so send_response doesn't
+  // hit the registry mutex per response.
+  std::mutex client_cache_mutex;
+  uint64_t cached_generation = 0;
+  std::vector<CachedClient> cached_clients;
+
   // Callback support
   std::mutex callback_mutex;
   rmw_event_callback_t on_new_request_cb = nullptr;
@@ -188,6 +209,13 @@ struct UdsClient
   int32_t registry_index = -1;
   UdsContext * context = nullptr;
   UdsNode * node = nullptr;
+
+  // PERFORMANCE: cache the service socket path so send_request doesn't
+  // hit the registry mutex on every call.
+  std::mutex svc_cache_mutex;
+  uint64_t cached_generation = 0;
+  std::string cached_service_path;
+
   // Callback support
   std::mutex callback_mutex;
   rmw_event_callback_t on_new_response_cb = nullptr;
@@ -204,6 +232,10 @@ struct UdsGuardCondition
 struct UdsWaitSet
 {
   int epoll_fd = -1;
+  // PERFORMANCE: track which fds are already registered with epoll so we
+  // don't issue EPOLL_CTL_ADD/DEL on every rmw_wait call. The kernel
+  // automatically removes fds from epoll when they are closed.
+  std::set<int> registered_fds;
 };
 
 }  // namespace rmw_uds
