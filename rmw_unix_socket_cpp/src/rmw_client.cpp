@@ -105,9 +105,7 @@ rmw_client_t * rmw_create_client(
   entry.qos_durability = static_cast<uint8_t>(cli_data->qos.durability);
   entry.qos_depth = static_cast<uint32_t>(cli_data->qos.depth);
 
-  rmw_uds::registry_lock(header);
   cli_data->registry_index = rmw_uds::registry_add(header, entry);
-  rmw_uds::registry_unlock(header);
 
   if (cli_data->registry_index < 0) {
     rmw_uds::close_socket(cli_data->socket_fd, cli_data->socket_path);
@@ -118,9 +116,7 @@ rmw_client_t * rmw_create_client(
 
   auto * cli = rmw_client_allocate();
   if (!cli) {
-    rmw_uds::registry_lock(header);
     rmw_uds::registry_remove(header, cli_data->registry_index);
-    rmw_uds::registry_unlock(header);
     rmw_uds::close_socket(cli_data->socket_fd, cli_data->socket_path);
     delete cli_data;
     return nullptr;
@@ -141,9 +137,7 @@ rmw_ret_t rmw_destroy_client(rmw_node_t * node, rmw_client_t * client)
   if (cli_data) {
     if (cli_data->context && cli_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(cli_data->context->registry_ptr);
-      rmw_uds::registry_lock(header);
       rmw_uds::registry_remove(header, cli_data->registry_index);
-      rmw_uds::registry_unlock(header);
     }
     rmw_uds::close_socket(cli_data->socket_fd, cli_data->socket_path);
     delete cli_data;
@@ -194,12 +188,10 @@ rmw_ret_t rmw_send_request(
   {
     std::lock_guard<std::mutex> lock(cli_data->svc_cache_mutex);
     if (current_gen != cli_data->cached_generation) {
-      rmw_uds::registry_lock(header);
       auto services = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_SERVICE, cli_data->service_name.c_str(),
         nullptr, nullptr);
       cli_data->cached_generation = rmw_uds::registry_generation(header);
-      rmw_uds::registry_unlock(header);
       cli_data->cached_service_path.clear();
       for (const auto & srv : services) {
         if (!srv.socket_path.empty()) {
@@ -318,10 +310,8 @@ rmw_ret_t rmw_service_server_is_available(
   auto * cli_data = static_cast<rmw_uds::UdsClient *>(client->data);
   auto * header = rmw_uds::registry_header(cli_data->context->registry_ptr);
 
-  rmw_uds::registry_lock(header);
   auto services = rmw_uds::registry_query(
     header, rmw_uds::ENTRY_SERVICE, cli_data->service_name.c_str(), nullptr, nullptr);
-  rmw_uds::registry_unlock(header);
 
   *is_available = !services.empty();
   return RMW_RET_OK;

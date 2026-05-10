@@ -34,15 +34,10 @@ static std::vector<rmw_uds::RegistryQueryResult> query_all(
   const char * node_ns = nullptr)
 {
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
-  rmw_uds::registry_lock(header);
-  // Only clean up entries from processes in our own PID namespace.
-  // In Docker without --pid=host, kill(pid, 0) fails for PIDs from other
-  // containers, so we only remove entries where /proc/<pid> doesn't exist
-  // (which means the PID is visible to us but the process is dead).
+  // Lock-free: cleanup_stale + query both use the per-slot seqlock protocol
+  // and may safely run concurrently with other readers/writers.
   rmw_uds::registry_cleanup_stale(header);
-  auto results = rmw_uds::registry_query(header, type, topic, node_name, node_ns);
-  rmw_uds::registry_unlock(header);
-  return results;
+  return rmw_uds::registry_query(header, type, topic, node_name, node_ns);
 }
 
 // Helper: build names_and_types from a map of topic -> set<type>

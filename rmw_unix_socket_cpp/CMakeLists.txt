@@ -92,6 +92,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_registry ${_unit_test_deps})
   target_include_directories(test_registry PRIVATE src)
 
+  # Unit test: registry concurrency / lock-free seqlock stress
+  ament_add_gtest(test_registry_concurrent
+    test/test_registry_concurrent.cpp src/registry.cpp)
+  target_link_libraries(test_registry_concurrent ${_unit_test_deps})
+  target_include_directories(test_registry_concurrent PRIVATE src)
+
   # Unit test: serialization round-trips
   ament_add_gtest(test_serialization test/test_serialization.cpp src/serialization.cpp)
   target_link_libraries(test_serialization ${_unit_test_deps})

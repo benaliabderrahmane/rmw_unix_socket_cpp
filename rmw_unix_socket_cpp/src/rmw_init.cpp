@@ -98,10 +98,7 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   // permanently eats registry slots.
   {
     auto * init_header = rmw_uds::registry_header(ctx->registry_ptr);
-    if (rmw_uds::registry_lock(init_header) == 0) {
-      rmw_uds::registry_cleanup_stale(init_header);
-      rmw_uds::registry_unlock(init_header);
-    }
+    rmw_uds::registry_cleanup_stale(init_header);
     rmw_uds::cleanup_orphan_socket_files(domain_id);
   }
 

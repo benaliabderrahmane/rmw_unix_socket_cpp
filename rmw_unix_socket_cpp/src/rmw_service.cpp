@@ -105,9 +105,7 @@ rmw_service_t * rmw_create_service(
   entry.qos_durability = static_cast<uint8_t>(srv_data->qos.durability);
   entry.qos_depth = static_cast<uint32_t>(srv_data->qos.depth);
 
-  rmw_uds::registry_lock(header);
   srv_data->registry_index = rmw_uds::registry_add(header, entry);
-  rmw_uds::registry_unlock(header);
 
   if (srv_data->registry_index < 0) {
     rmw_uds::close_socket(srv_data->socket_fd, srv_data->socket_path);
@@ -118,9 +116,7 @@ rmw_service_t * rmw_create_service(
 
   auto * srv = rmw_service_allocate();
   if (!srv) {
-    rmw_uds::registry_lock(header);
     rmw_uds::registry_remove(header, srv_data->registry_index);
-    rmw_uds::registry_unlock(header);
     rmw_uds::close_socket(srv_data->socket_fd, srv_data->socket_path);
     delete srv_data;
     return nullptr;
@@ -141,9 +137,7 @@ rmw_ret_t rmw_destroy_service(rmw_node_t * node, rmw_service_t * service)
   if (srv_data) {
     if (srv_data->context && srv_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(srv_data->context->registry_ptr);
-      rmw_uds::registry_lock(header);
       rmw_uds::registry_remove(header, srv_data->registry_index);
-      rmw_uds::registry_unlock(header);
     }
     rmw_uds::close_socket(srv_data->socket_fd, srv_data->socket_path);
     delete srv_data;
@@ -246,12 +240,10 @@ rmw_ret_t rmw_send_response(
   {
     std::lock_guard<std::mutex> lock(srv_data->client_cache_mutex);
     if (current_gen != srv_data->cached_generation) {
-      rmw_uds::registry_lock(header);
       auto clients = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_CLIENT, srv_data->service_name.c_str(),
         nullptr, nullptr);
       srv_data->cached_generation = rmw_uds::registry_generation(header);
-      rmw_uds::registry_unlock(header);
       srv_data->cached_clients.clear();
       srv_data->cached_clients.reserve(clients.size());
       for (const auto & c : clients) {
