@@ -54,9 +54,7 @@ rmw_node_t * rmw_create_node(
   std::strncpy(entry.node_name, name, sizeof(entry.node_name) - 1);
   std::strncpy(entry.node_namespace, namespace_, sizeof(entry.node_namespace) - 1);
 
-  rmw_uds::registry_lock(header);
   node_data->registry_index = rmw_uds::registry_add(header, entry);
-  rmw_uds::registry_unlock(header);
 
   if (node_data->registry_index < 0) {
     auto _r [[maybe_unused]] = rmw_destroy_guard_condition(graph_gc);
@@ -67,9 +65,7 @@ rmw_node_t * rmw_create_node(
 
   auto * node = rmw_node_allocate();
   if (!node) {
-    rmw_uds::registry_lock(header);
     rmw_uds::registry_remove(header, node_data->registry_index);
-    rmw_uds::registry_unlock(header);
     auto _r [[maybe_unused]] = rmw_destroy_guard_condition(graph_gc);
     delete node_data;
     RMW_SET_ERROR_MSG("failed to allocate rmw_node_t");
@@ -97,9 +93,7 @@ rmw_ret_t rmw_destroy_node(rmw_node_t * node)
     // Remove from registry
     if (node_data->context && node_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(node_data->context->registry_ptr);
-      rmw_uds::registry_lock(header);
       rmw_uds::registry_remove(header, node_data->registry_index);
-      rmw_uds::registry_unlock(header);
     }
 
     if (node_data->graph_guard_condition) {

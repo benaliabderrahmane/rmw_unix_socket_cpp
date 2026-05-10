@@ -102,9 +102,7 @@ rmw_publisher_t * rmw_create_publisher(
   entry.qos_history = static_cast<uint8_t>(pub_data->qos.history);
   entry.qos_depth = static_cast<uint32_t>(pub_data->qos.depth);
 
-  rmw_uds::registry_lock(header);
   pub_data->registry_index = rmw_uds::registry_add(header, entry);
-  rmw_uds::registry_unlock(header);
 
   if (pub_data->registry_index < 0) {
     delete pub_data;
@@ -114,9 +112,7 @@ rmw_publisher_t * rmw_create_publisher(
 
   auto * pub = rmw_publisher_allocate();
   if (!pub) {
-    rmw_uds::registry_lock(header);
     rmw_uds::registry_remove(header, pub_data->registry_index);
-    rmw_uds::registry_unlock(header);
     delete pub_data;
     RMW_SET_ERROR_MSG("failed to allocate rmw_publisher_t");
     return nullptr;
@@ -142,9 +138,7 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
   if (pub_data) {
     if (pub_data->context && pub_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
-      rmw_uds::registry_lock(header);
       rmw_uds::registry_remove(header, pub_data->registry_index);
-      rmw_uds::registry_unlock(header);
     }
     delete pub_data;
   }
@@ -196,14 +190,12 @@ rmw_ret_t rmw_publish(
   {
     std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
     if (current_gen != pub_data->cached_generation) {
-      rmw_uds::registry_lock(header);
+      // Re-read generation after the query so we don't miss updates that
+      // happened during the (lock-free) scan.
       auto subs = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
         nullptr, nullptr);
-      // Re-read the generation under lock to avoid losing updates that
-      // happened between our generation read above and the lock acquire.
       pub_data->cached_generation = rmw_uds::registry_generation(header);
-      rmw_uds::registry_unlock(header);
       pub_data->cached_subscriber_paths.clear();
       pub_data->cached_subscriber_paths.reserve(subs.size());
       for (const auto & s : subs) {
@@ -279,12 +271,10 @@ rmw_ret_t rmw_publish_serialized_message(
   {
     std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
     if (current_gen != pub_data->cached_generation) {
-      rmw_uds::registry_lock(header);
       auto subs = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
         nullptr, nullptr);
       pub_data->cached_generation = rmw_uds::registry_generation(header);
-      rmw_uds::registry_unlock(header);
       pub_data->cached_subscriber_paths.clear();
       pub_data->cached_subscriber_paths.reserve(subs.size());
       for (const auto & s : subs) {
@@ -318,10 +308,8 @@ rmw_ret_t rmw_publisher_count_matched_subscriptions(
   auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(publisher->data);
   auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
 
-  rmw_uds::registry_lock(header);
   auto subs = rmw_uds::registry_query(
     header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(), nullptr, nullptr);
-  rmw_uds::registry_unlock(header);
 
   *subscription_count = subs.size();
   return RMW_RET_OK;

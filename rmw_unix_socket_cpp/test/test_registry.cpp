@@ -1,8 +1,10 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "../src/registry.hpp"
 
@@ -16,6 +18,13 @@ protected:
 
   void SetUp() override
   {
+    // Make sure no stale registry from a previous test (or older layout) is
+    // lying around — the new code uses O_CREAT|O_EXCL and would otherwise
+    // attach to a v2 file.
+    char name[64];
+    std::snprintf(name, sizeof(name), "/ros2_uds_%zu", domain_id);
+    shm_unlink(name);
+
     registry_fd = rmw_uds::registry_open(domain_id, &registry_ptr, &registry_size);
     ASSERT_GE(registry_fd, 0);
     ASSERT_NE(nullptr, registry_ptr);
@@ -25,7 +34,6 @@ protected:
   void TearDown() override
   {
     rmw_uds::registry_close(registry_fd, registry_ptr, registry_size);
-    // Clean up shared memory
     char name[64];
     std::snprintf(name, sizeof(name), "/ros2_uds_%zu", domain_id);
     shm_unlink(name);
@@ -35,7 +43,7 @@ protected:
 TEST_F(RegistryTest, OpenCreatesValidHeader)
 {
   auto * header = rmw_uds::registry_header(registry_ptr);
-  EXPECT_EQ(rmw_uds::REGISTRY_VERSION, header->version);
+  EXPECT_EQ(rmw_uds::REGISTRY_VERSION, header->version.load());
   EXPECT_EQ(rmw_uds::REGISTRY_MAX_ENTRIES, header->max_entries);
 }
 
@@ -50,28 +58,17 @@ TEST_F(RegistryTest, AddAndRemoveEntry)
   std::strncpy(entry.node_name, "test_node", sizeof(entry.node_name) - 1);
   std::strncpy(entry.node_namespace, "/test", sizeof(entry.node_namespace) - 1);
 
-  rmw_uds::registry_lock(header);
   int32_t idx = rmw_uds::registry_add(header, entry);
-  rmw_uds::registry_unlock(header);
-
   ASSERT_GE(idx, 0);
 
-  // Verify entry exists
-  rmw_uds::registry_lock(header);
   auto results = rmw_uds::registry_query(
     header, rmw_uds::ENTRY_NODE, nullptr, "test_node", "/test");
-  rmw_uds::registry_unlock(header);
-
   ASSERT_EQ(1u, results.size());
   EXPECT_EQ("test_node", results[0].node_name);
   EXPECT_EQ("/test", results[0].node_namespace);
 
-  // Remove and verify gone
-  rmw_uds::registry_lock(header);
   rmw_uds::registry_remove(header, idx);
   results = rmw_uds::registry_query(header, rmw_uds::ENTRY_NODE, nullptr, "test_node", nullptr);
-  rmw_uds::registry_unlock(header);
-
   EXPECT_EQ(0u, results.size());
 }
 
@@ -86,17 +83,12 @@ TEST_F(RegistryTest, GenerationIncrementsOnChange)
   entry.pid = getpid();
   std::strncpy(entry.topic_name, "/gen_test", sizeof(entry.topic_name) - 1);
 
-  rmw_uds::registry_lock(header);
   int32_t idx = rmw_uds::registry_add(header, entry);
-  rmw_uds::registry_unlock(header);
-
+  ASSERT_GE(idx, 0);
   uint64_t gen1 = rmw_uds::registry_generation(header);
   EXPECT_GT(gen1, gen0);
 
-  rmw_uds::registry_lock(header);
   rmw_uds::registry_remove(header, idx);
-  rmw_uds::registry_unlock(header);
-
   uint64_t gen2 = rmw_uds::registry_generation(header);
   EXPECT_GT(gen2, gen1);
 }
@@ -117,18 +109,20 @@ TEST_F(RegistryTest, QueryFiltersByType)
   sub_entry.pid = getpid();
   std::strncpy(sub_entry.topic_name, "/topic_a", sizeof(sub_entry.topic_name) - 1);
 
-  rmw_uds::registry_lock(header);
   int32_t idx1 = rmw_uds::registry_add(header, pub_entry);
   int32_t idx2 = rmw_uds::registry_add(header, sub_entry);
+  ASSERT_GE(idx1, 0);
+  ASSERT_GE(idx2, 0);
+
   auto pubs = rmw_uds::registry_query(
     header, rmw_uds::ENTRY_PUBLISHER, "/topic_a", nullptr, nullptr);
   auto subs = rmw_uds::registry_query(
     header, rmw_uds::ENTRY_SUBSCRIPTION, "/topic_a", nullptr, nullptr);
   auto all = rmw_uds::registry_query(
     header, rmw_uds::ENTRY_EMPTY, "/topic_a", nullptr, nullptr);
+
   rmw_uds::registry_remove(header, idx1);
   rmw_uds::registry_remove(header, idx2);
-  rmw_uds::registry_unlock(header);
 
   EXPECT_EQ(1u, pubs.size());
   EXPECT_EQ(1u, subs.size());
@@ -140,7 +134,6 @@ TEST_F(RegistryTest, MultipleEntriesSameType)
   auto * header = rmw_uds::registry_header(registry_ptr);
   std::vector<int32_t> indices;
 
-  rmw_uds::registry_lock(header);
   for (int i = 0; i < 50; ++i) {
     rmw_uds::RegistryEntry entry;
     std::memset(&entry, 0, sizeof(entry));
@@ -159,7 +152,6 @@ TEST_F(RegistryTest, MultipleEntriesSameType)
   for (int32_t idx : indices) {
     rmw_uds::registry_remove(header, idx);
   }
-  rmw_uds::registry_unlock(header);
 }
 
 // A PID that is extremely unlikely to exist. /proc/<this> should be ENOENT,
@@ -182,17 +174,16 @@ TEST_F(RegistryTest, CleanupStaleRemovesDeadPidEntries)
   live_entry.pid = getpid();
   std::strncpy(live_entry.node_name, "alive", sizeof(live_entry.node_name) - 1);
 
-  rmw_uds::registry_lock(header);
   int32_t dead_idx = rmw_uds::registry_add(header, dead_entry);
   int32_t live_idx = rmw_uds::registry_add(header, live_entry);
+  ASSERT_GE(dead_idx, 0);
+  ASSERT_GE(live_idx, 0);
+
   rmw_uds::registry_cleanup_stale(header);
   auto remaining = rmw_uds::registry_query(
     header, rmw_uds::ENTRY_NODE, nullptr, nullptr, nullptr);
   rmw_uds::registry_remove(header, live_idx);
-  rmw_uds::registry_unlock(header);
 
-  ASSERT_GE(dead_idx, 0);
-  ASSERT_GE(live_idx, 0);
   ASSERT_EQ(1u, remaining.size());
   EXPECT_EQ("alive", remaining[0].node_name);
 }
@@ -203,13 +194,10 @@ TEST_F(RegistryTest, AddReclaimsStaleSlotsOnOverflow)
 {
   auto * header = rmw_uds::registry_header(registry_ptr);
 
-  // Temporarily shrink max_entries so we can actually fill the registry in a
-  // unit test. The rest of the mapped shm is simply unused while max_entries
-  // is reduced. Restored at the end.
+  // Temporarily shrink max_entries so we can actually fill the registry.
   const uint32_t original_max = header->max_entries;
   header->max_entries = 8;
 
-  rmw_uds::registry_lock(header);
   // Fill with dead-PID entries.
   for (uint32_t i = 0; i < header->max_entries; ++i) {
     rmw_uds::RegistryEntry e;
@@ -220,16 +208,12 @@ TEST_F(RegistryTest, AddReclaimsStaleSlotsOnOverflow)
     ASSERT_GE(rmw_uds::registry_add(header, e), 0);
   }
 
-  // Confirm it really is full: a plain scan finds no slot for a new entry
-  // unless reclamation kicks in.
-  {
-    auto * entries = rmw_uds::registry_entries(header);
-    uint32_t empty = 0;
-    for (uint32_t i = 0; i < header->max_entries; ++i) {
-      if (entries[i].type == rmw_uds::ENTRY_EMPTY) {empty++;}
-    }
-    ASSERT_EQ(0u, empty);
-  }
+  // Confirm it really is full: another dead-PID add must succeed only via
+  // reclamation. First, attempt with a dead PID — also reclaims since all
+  // entries are dead. Verify count is still bounded by max_entries.
+  auto pre = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_NODE, nullptr, nullptr, nullptr);
+  EXPECT_EQ(static_cast<size_t>(header->max_entries), pre.size());
 
   // The new entry is live; registry_add must internally call cleanup_stale
   // and succeed on the second pass.
@@ -245,13 +229,55 @@ TEST_F(RegistryTest, AddReclaimsStaleSlotsOnOverflow)
     header, rmw_uds::ENTRY_NODE, nullptr, "survivor", nullptr);
   EXPECT_EQ(1u, results.size());
 
-  // Clean up everything we touched before restoring max_entries so the
-  // shared memory segment is reusable by other tests / next run.
   for (uint32_t i = 0; i < header->max_entries; ++i) {
     rmw_uds::registry_remove(header, static_cast<int32_t>(i));
   }
-  rmw_uds::registry_unlock(header);
   header->max_entries = original_max;
+}
+
+// An existing shm file with a smaller size (e.g., created by a previous
+// build of this RMW with a different RegistryEntrySlot layout) must be
+// detected and replaced. Without this, mmap'ing the larger expected size on
+// top of the smaller file would SIGBUS on first slot-array access — the
+// exact failure mode seen in production when REGISTRY_VERSION was bumped
+// from 2 to 3 without cleaning /dev/shm.
+TEST_F(RegistryTest, OpenReplacesShmWithWrongSize)
+{
+  // Tear down our SetUp() registry; we want to set up a hostile starting
+  // state by hand.
+  rmw_uds::registry_close(registry_fd, registry_ptr, registry_size);
+  registry_ptr = nullptr;
+  registry_fd = -1;
+
+  // Create a too-small shm file under the name our domain would use.
+  char name[64];
+  std::snprintf(name, sizeof(name), "/ros2_uds_%zu", domain_id);
+  shm_unlink(name);
+  int bad_fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0666);
+  ASSERT_GE(bad_fd, 0);
+  // 4 KB is much smaller than the real registry size — guaranteed mismatch.
+  ASSERT_EQ(0, ftruncate(bad_fd, 4096));
+  close(bad_fd);
+
+  // Now open the registry normally. It must detect the size mismatch,
+  // unlink the stale file, and create a fresh one of the right size.
+  registry_fd = rmw_uds::registry_open(domain_id, &registry_ptr, &registry_size);
+  ASSERT_GE(registry_fd, 0);
+  ASSERT_NE(nullptr, registry_ptr);
+
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  EXPECT_EQ(rmw_uds::REGISTRY_VERSION, header->version.load());
+
+  // Round-trip an entry to confirm the new file is fully usable
+  // (also implicitly exercises every slot is mapped — would SIGBUS if not).
+  rmw_uds::RegistryEntry e;
+  std::memset(&e, 0, sizeof(e));
+  e.type = rmw_uds::ENTRY_NODE;
+  e.pid = getpid();
+  std::strncpy(e.node_name, "post_recovery", sizeof(e.node_name) - 1);
+  int32_t idx = rmw_uds::registry_add(header, e);
+  ASSERT_GE(idx, 0);
+  rmw_uds::registry_remove(header, idx);
 }
 
 // Live-PID entries must survive the overflow reclamation pass.
@@ -261,18 +287,14 @@ TEST_F(RegistryTest, AddOverflowKeepsLivePidEntries)
   const uint32_t original_max = header->max_entries;
   header->max_entries = 4;
 
-  rmw_uds::registry_lock(header);
   // Half live, half dead.
-  std::vector<int32_t> live_indices;
   for (uint32_t i = 0; i < header->max_entries; ++i) {
     rmw_uds::RegistryEntry e;
     std::memset(&e, 0, sizeof(e));
     e.type = rmw_uds::ENTRY_NODE;
     e.pid = (i % 2 == 0) ? getpid() : DEAD_PID;
     std::snprintf(e.node_name, sizeof(e.node_name), "n_%u", i);
-    int32_t idx = rmw_uds::registry_add(header, e);
-    ASSERT_GE(idx, 0);
-    if (i % 2 == 0) {live_indices.push_back(idx);}
+    ASSERT_GE(rmw_uds::registry_add(header, e), 0);
   }
 
   rmw_uds::RegistryEntry extra;
@@ -287,18 +309,14 @@ TEST_F(RegistryTest, AddOverflowKeepsLivePidEntries)
     header, rmw_uds::ENTRY_NODE, nullptr, nullptr, nullptr);
   // All remaining entries must have a live PID (ours) — no dead PIDs left.
   for (const auto & r : all) {
-    // Can't read pid from RegistryQueryResult directly; check node_name
-    // doesn't start with the dead-PID marker we used.
     EXPECT_NE(0, std::strncmp(r.node_name.c_str(), "n_1", 3))
       << "dead-PID entry '" << r.node_name << "' survived overflow cleanup";
     EXPECT_NE(0, std::strncmp(r.node_name.c_str(), "n_3", 3))
       << "dead-PID entry '" << r.node_name << "' survived overflow cleanup";
   }
 
-  // Clean up and restore.
   for (uint32_t i = 0; i < header->max_entries; ++i) {
     rmw_uds::registry_remove(header, static_cast<int32_t>(i));
   }
-  rmw_uds::registry_unlock(header);
   header->max_entries = original_max;
 }

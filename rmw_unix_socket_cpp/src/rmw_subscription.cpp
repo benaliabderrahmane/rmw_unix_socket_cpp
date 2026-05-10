@@ -147,9 +147,7 @@ rmw_subscription_t * rmw_create_subscription(
   entry.qos_history = static_cast<uint8_t>(sub_data->qos.history);
   entry.qos_depth = static_cast<uint32_t>(sub_data->qos.depth);
 
-  rmw_uds::registry_lock(header);
   sub_data->registry_index = rmw_uds::registry_add(header, entry);
-  rmw_uds::registry_unlock(header);
 
   if (sub_data->registry_index < 0) {
     rmw_uds::close_socket(sub_data->socket_fd, sub_data->socket_path);
@@ -160,9 +158,7 @@ rmw_subscription_t * rmw_create_subscription(
 
   auto * sub = rmw_subscription_allocate();
   if (!sub) {
-    rmw_uds::registry_lock(header);
     rmw_uds::registry_remove(header, sub_data->registry_index);
-    rmw_uds::registry_unlock(header);
     rmw_uds::close_socket(sub_data->socket_fd, sub_data->socket_path);
     delete sub_data;
     RMW_SET_ERROR_MSG("failed to allocate rmw_subscription_t");
@@ -193,9 +189,7 @@ rmw_ret_t rmw_destroy_subscription(
   if (sub_data) {
     if (sub_data->context && sub_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(sub_data->context->registry_ptr);
-      rmw_uds::registry_lock(header);
       rmw_uds::registry_remove(header, sub_data->registry_index);
-      rmw_uds::registry_unlock(header);
     }
     rmw_uds::close_socket(sub_data->socket_fd, sub_data->socket_path);
     delete sub_data;
@@ -452,10 +446,8 @@ rmw_ret_t rmw_subscription_count_matched_publishers(
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
   auto * header = rmw_uds::registry_header(sub_data->context->registry_ptr);
 
-  rmw_uds::registry_lock(header);
   auto pubs = rmw_uds::registry_query(
     header, rmw_uds::ENTRY_PUBLISHER, sub_data->topic_name.c_str(), nullptr, nullptr);
-  rmw_uds::registry_unlock(header);
 
   *publisher_count = pubs.size();
   return RMW_RET_OK;
