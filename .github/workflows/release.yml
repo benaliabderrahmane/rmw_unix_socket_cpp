@@ -1,0 +1,112 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag name for the release (e.g. v0.1.0)'
+        required: true
+
+jobs:
+  build:
+    name: build (${{ matrix.ros_distro }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ros_distro: [jazzy, kilted, rolling]
+    container:
+      image: ros:${{ matrix.ros_distro }}-ros-base
+    steps:
+      - name: Install build prerequisites
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git \
+            python3-colcon-common-extensions \
+            python3-rosdep
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve package dependencies
+        shell: bash
+        run: |
+          rosdep update --rosdistro=${{ matrix.ros_distro }}
+          rosdep install --from-paths rmw_unix_socket_cpp --ignore-src -r -y \
+            --rosdistro=${{ matrix.ros_distro }}
+
+      - name: Build (merge-install)
+        shell: bash
+        run: |
+          source /opt/ros/${{ matrix.ros_distro }}/setup.bash
+          colcon build \
+            --paths rmw_unix_socket_cpp \
+            --merge-install \
+            --event-handlers console_direct+ \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+
+      - name: Determine tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package install/
+        shell: bash
+        run: |
+          PKG="rmw_unix_socket_cpp-${{ steps.tag.outputs.name }}-${{ matrix.ros_distro }}-linux-x86_64"
+          mkdir -p "dist/${PKG}"
+          cp -a install/. "dist/${PKG}/"
+          tar -C dist -czf "${PKG}.tar.gz" "${PKG}"
+          sha256sum "${PKG}.tar.gz" > "${PKG}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.ros_distro }}
+          path: |
+            *.tar.gz
+            *.tar.gz.sha256
+          retention-days: 7
+
+  release:
+    name: publish github release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Determine tag
+        id: tag
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.tar.gz.sha256
