@@ -27,7 +27,9 @@ rmw_ret_t rmw_init_options_init(
   init_options->allocator = allocator;
   init_options->domain_id = RMW_DEFAULT_DOMAIN_ID;
   init_options->security_options = rmw_get_zero_initialized_security_options();
+#ifdef RMW_HAS_LOCALHOST_ONLY
   init_options->localhost_only = RMW_LOCALHOST_ONLY_DEFAULT;
+#endif
   init_options->discovery_options = rmw_get_zero_initialized_discovery_options();
   init_options->enclave = nullptr;
   init_options->impl = nullptr;

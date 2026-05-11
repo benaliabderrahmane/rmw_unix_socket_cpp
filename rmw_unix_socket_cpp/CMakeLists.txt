@@ -19,6 +19,21 @@ find_package(fastcdr CONFIG REQUIRED)
 find_package(rosidl_typesupport_fastrtps_c REQUIRED)
 find_package(rosidl_typesupport_fastrtps_cpp REQUIRED)
 
+# rmw_init_options_t::localhost_only was removed in Kilted (rmw >= 7.8).
+# Probe so we can keep setting it on older distros without breaking newer ones.
+include(CheckCXXSourceCompiles)
+set(_rmw_probe_saved_libs ${CMAKE_REQUIRED_LIBRARIES})
+set(CMAKE_REQUIRED_LIBRARIES rmw::rmw rcutils::rcutils)
+check_cxx_source_compiles("
+#include <rmw/init_options.h>
+int main() {
+  rmw_init_options_t o{};
+  o.localhost_only = RMW_LOCALHOST_ONLY_DEFAULT;
+  return 0;
+}
+" RMW_HAS_LOCALHOST_ONLY)
+set(CMAKE_REQUIRED_LIBRARIES ${_rmw_probe_saved_libs})
+
 add_library(rmw_unix_socket_cpp SHARED
   src/registry.cpp
   src/serialization.cpp
@@ -39,6 +54,10 @@ add_library(rmw_unix_socket_cpp SHARED
 )
 
 target_include_directories(rmw_unix_socket_cpp PRIVATE src)
+
+if(RMW_HAS_LOCALHOST_ONLY)
+  target_compile_definitions(rmw_unix_socket_cpp PRIVATE RMW_HAS_LOCALHOST_ONLY=1)
+endif()
 
 target_link_libraries(rmw_unix_socket_cpp PUBLIC
   rmw::rmw
