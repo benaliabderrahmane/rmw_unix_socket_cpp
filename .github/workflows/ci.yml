@@ -48,6 +48,13 @@ jobs:
             --dependency-types=build_export \
             --dependency-types=exec \
             --dependency-types=test
+          # Belt & suspenders: on Rolling, rosdep -r silently skips
+          # test_msgs when its key drifts between syncs. Install the
+          # test-only deps explicitly so find_package(test_msgs REQUIRED)
+          # in the BUILD_TESTING block always has what it needs.
+          apt-get install -y --no-install-recommends \
+            ros-${{ matrix.ros_distro }}-test-msgs \
+            ros-${{ matrix.ros_distro }}-rosidl-typesupport-cpp
 
       - name: Build
         shell: bash
