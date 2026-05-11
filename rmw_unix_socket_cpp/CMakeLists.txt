@@ -93,6 +93,11 @@ ament_export_targets(export_rmw_unix_socket_cpp)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
+  # rosidl_buffer was introduced in Rolling and is referenced by test_msgs'
+  # exported imported targets, but test_msgsConfig.cmake doesn't load it
+  # transitively. Pull it in first (QUIET so the call is a no-op on Jazzy /
+  # Kilted where the package doesn't exist).
+  find_package(rosidl_buffer QUIET)
   find_package(test_msgs REQUIRED)
   find_package(rosidl_typesupport_cpp REQUIRED)
 

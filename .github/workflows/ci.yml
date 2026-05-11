@@ -51,10 +51,23 @@ jobs:
           # Belt & suspenders: on Rolling, rosdep -r silently skips
           # test_msgs when its key drifts between syncs. Install the
           # test-only deps explicitly so find_package(test_msgs REQUIRED)
-          # in the BUILD_TESTING block always has what it needs.
+          # in the BUILD_TESTING block always has what it needs. Also pull
+          # rosidl-runtime-cpp by name so apt upgrades it: the base image
+          # is months behind the rolling sync, and a stale rosidl-runtime-cpp
+          # is missing buffer__traits.hpp which the latest test_msgs headers
+          # reference.
           apt-get install -y --no-install-recommends \
             ros-${{ matrix.ros_distro }}-test-msgs \
-            ros-${{ matrix.ros_distro }}-rosidl-typesupport-cpp
+            ros-${{ matrix.ros_distro }}-rosidl-typesupport-cpp \
+            ros-${{ matrix.ros_distro }}-rosidl-runtime-cpp
+          # rosidl_buffer is a Rolling-only package (introduced after Jazzy/
+          # Kilted were branched) and test_msgs' exported imported targets
+          # reference it. CMake side: find_package(rosidl_buffer QUIET) in
+          # CMakeLists handles the apt-missing case on older distros.
+          if [ "${{ matrix.ros_distro }}" = "rolling" ]; then
+            apt-get install -y --no-install-recommends \
+              ros-rolling-rosidl-buffer
+          fi
 
       - name: Build
         shell: bash
