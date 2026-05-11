@@ -1,4 +1,5 @@
 #include "identifier.hpp"
+#include "logging.hpp"
 #include "registry.hpp"
 #include "transport.hpp"
 #include "types.hpp"
@@ -89,6 +90,9 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   ctx->registry_fd = rmw_uds::registry_open(
     domain_id, &ctx->registry_ptr, &ctx->registry_size);
   if (ctx->registry_fd < 0) {
+    RMW_UDS_LOG_ERROR(
+      "rmw_init: failed to open shared memory registry for domain_id=%zu",
+      domain_id);
     delete ctx;
     RMW_SET_ERROR_MSG("failed to open shared memory registry");
     return RMW_RET_ERROR;
@@ -107,11 +111,17 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   // Create send socket
   ctx->send_socket_fd = rmw_uds::create_send_socket();
   if (ctx->send_socket_fd < 0) {
+    RMW_UDS_LOG_ERROR(
+      "rmw_init: failed to create send socket (domain_id=%zu)", domain_id);
     rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);
     delete ctx;
     RMW_SET_ERROR_MSG("failed to create send socket");
     return RMW_RET_ERROR;
   }
+
+  RMW_UDS_LOG_DEBUG(
+    "rmw_init: context up (domain_id=%zu, pid=%d)",
+    domain_id, static_cast<int>(getpid()));
 
   // Read initial generation
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);

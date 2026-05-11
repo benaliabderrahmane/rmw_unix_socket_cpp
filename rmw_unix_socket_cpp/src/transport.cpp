@@ -12,6 +12,8 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include "logging.hpp"
+
 namespace rmw_uds
 {
 
@@ -34,6 +36,9 @@ int create_bound_socket(const std::string & path)
 {
   int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   if (fd < 0) {
+    RMW_UDS_LOG_ERROR(
+      "socket(AF_UNIX, SOCK_DGRAM) failed: %s (errno=%d) — out of file descriptors?",
+      std::strerror(errno), errno);
     return -1;
   }
 
@@ -46,13 +51,22 @@ int create_bound_socket(const std::string & path)
   std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
 
   if (bind(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
+    RMW_UDS_LOG_ERROR(
+      "bind('%s') failed: %s (errno=%d)",
+      path.c_str(), std::strerror(errno), errno);
     close(fd);
     return -1;
   }
 
-  // Set large receive buffer
+  // Set large receive buffer. Kernel may silently cap at net.core.rmem_max;
+  // log the effective size when it falls short so a slow-subscriber drop
+  // later in the day can be traced back to an undersized recv buffer.
   int buf = RECV_BUF_SIZE;
-  setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+  if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf)) != 0) {
+    RMW_UDS_LOG_WARN(
+      "setsockopt(SO_RCVBUF=%d) on '%s' failed: %s — recv buffer left at kernel default",
+      RECV_BUF_SIZE, path.c_str(), std::strerror(errno));
+  }
 
   return fd;
 }
@@ -61,11 +75,18 @@ int create_send_socket()
 {
   int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
   if (fd < 0) {
+    RMW_UDS_LOG_ERROR(
+      "send socket(AF_UNIX, SOCK_DGRAM) failed: %s (errno=%d)",
+      std::strerror(errno), errno);
     return -1;
   }
 
   int buf = SEND_BUF_SIZE;
-  setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+  if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf)) != 0) {
+    RMW_UDS_LOG_WARN(
+      "setsockopt(SO_SNDBUF=%d) failed: %s — send buffer left at kernel default",
+      SEND_BUF_SIZE, std::strerror(errno));
+  }
 
   return fd;
 }
@@ -96,7 +117,59 @@ bool send_to(
   msg.msg_iovlen = (payload_size > 0) ? 2 : 1;
 
   ssize_t sent = sendmsg(send_fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
-  return sent >= 0;
+  if (sent >= 0) {
+    return true;
+  }
+
+  // Classify the failure. Hot path — every category is throttled so a
+  // persistently-failing peer can't drown the log. The destination path
+  // encodes the peer's prefix+pid (see make_socket_path) which is enough
+  // to identify the offending subscriber from the message alone.
+  const int err = errno;
+  const size_t total = sizeof(WireHeader) + payload_size;
+  switch (err) {
+    case EMSGSIZE:
+      // Message exceeds the kernel's per-datagram cap (typically the send
+      // or recv buffer size). This is a configuration-level problem, not
+      // transient backpressure — log every 5s with full size context.
+      RMW_UDS_LOG_ERROR_THROTTLE(
+        5000,
+        "UDS send to '%s' failed: message too big (%zu bytes incl. header). "
+        "Raise net.core.{wmem_max,rmem_max} or split the message.",
+        dest_path.c_str(), total);
+      break;
+    case EAGAIN:
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+    case EWOULDBLOCK:
+#endif
+    case ENOBUFS:
+      // Peer's receive queue is full (or our send queue, briefly). This
+      // is the classic "slow subscriber" symptom — the subscriber isn't
+      // calling rmw_take fast enough to drain its socket.
+      RMW_UDS_LOG_WARN_THROTTLE(
+        1000,
+        "UDS send to '%s' dropped: subscriber recv buffer full (%zu bytes, errno=%s). "
+        "Slow subscriber or undersized SO_RCVBUF.",
+        dest_path.c_str(), total, std::strerror(err));
+      break;
+    case ENOENT:
+    case ECONNREFUSED:
+      // Peer's socket file is gone (ENOENT) or unbound (ECONNREFUSED).
+      // Happens routinely during graceful shutdown — the publisher's
+      // cached subscriber list lags one graph-generation behind reality.
+      // Demote to debug to avoid scaring users at every node teardown.
+      RMW_UDS_LOG_DEBUG(
+        "UDS send to '%s' skipped: peer gone (%s) — likely subscriber teardown",
+        dest_path.c_str(), std::strerror(err));
+      break;
+    default:
+      RMW_UDS_LOG_WARN_THROTTLE(
+        1000,
+        "UDS send to '%s' failed: %s (errno=%d, %zu bytes)",
+        dest_path.c_str(), std::strerror(err), err, total);
+      break;
+  }
+  return false;
 }
 
 bool recv_from(
@@ -111,7 +184,19 @@ bool recv_from(
   ssize_t n = recv(socket_fd, recv_buf.data(), recv_buf.size(),
     MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC);
 
-  if (n <= 0) {
+  if (n < 0) {
+    // EAGAIN is the steady-state "nothing to read" case driven by wait()
+    // loops; staying silent is intentional. Anything else (EBADF, EINVAL,
+    // EINTR-after-shutdown) is worth surfacing.
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      RMW_UDS_LOG_WARN_THROTTLE(
+        1000,
+        "UDS recv (peek) failed: %s (errno=%d)",
+        std::strerror(errno), errno);
+    }
+    return false;
+  }
+  if (n == 0) {
     return false;
   }
 
@@ -122,7 +207,19 @@ bool recv_from(
 
   // Actually receive the message
   n = recv(socket_fd, recv_buf.data(), recv_buf.size(), MSG_DONTWAIT);
+  if (n < 0) {
+    if (errno != EAGAIN && errno != EWOULDBLOCK) {
+      RMW_UDS_LOG_WARN_THROTTLE(
+        1000, "UDS recv failed: %s (errno=%d)",
+        std::strerror(errno), errno);
+    }
+    return false;
+  }
   if (n < static_cast<ssize_t>(sizeof(WireHeader))) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000,
+      "UDS recv: runt datagram (%zd bytes, expected >= %zu) — dropped",
+      n, sizeof(WireHeader));
     return false;
   }
 
@@ -130,7 +227,13 @@ bool recv_from(
 
   size_t payload_len = static_cast<size_t>(n) - sizeof(WireHeader);
   if (payload_len != header_out.payload_size) {
-    // Mismatch — use actual received size
+    // Mismatch — typically the sender's payload was larger than our
+    // recv buffer and the kernel truncated. Surface it so we can correlate
+    // with the corresponding sender-side EMSGSIZE.
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000,
+      "UDS recv: payload size mismatch (got %zu, header says %u) — truncating",
+      payload_len, header_out.payload_size);
     payload_len = std::min(payload_len, static_cast<size_t>(header_out.payload_size));
   }
 
