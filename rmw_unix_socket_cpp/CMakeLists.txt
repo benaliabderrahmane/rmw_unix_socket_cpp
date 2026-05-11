@@ -103,6 +103,14 @@ if(BUILD_TESTING)
     rosidl_typesupport_fastrtps_cpp::rosidl_typesupport_fastrtps_cpp
     pthread rt)
 
+  # Imported targets for tests that pull in IDL-generated message types.
+  # ament_target_dependencies() was removed in Rolling, so link directly to
+  # ${test_msgs_TARGETS} (set by find_package(test_msgs)) and the
+  # rosidl_typesupport_cpp imported target. Same pattern works on Jazzy/Kilted.
+  set(_test_msg_deps
+    ${test_msgs_TARGETS}
+    rosidl_typesupport_cpp::rosidl_typesupport_cpp)
+
   # Unit test: registry
   ament_add_gtest(test_registry test/test_registry.cpp src/registry.cpp)
   target_link_libraries(test_registry ${_unit_test_deps})
@@ -116,9 +124,8 @@ if(BUILD_TESTING)
 
   # Unit test: serialization round-trips
   ament_add_gtest(test_serialization test/test_serialization.cpp src/serialization.cpp)
-  target_link_libraries(test_serialization ${_unit_test_deps})
+  target_link_libraries(test_serialization ${_unit_test_deps} ${_test_msg_deps})
   target_include_directories(test_serialization PRIVATE src)
-  ament_target_dependencies(test_serialization test_msgs rosidl_typesupport_cpp)
 
   # Unit test: transport
   ament_add_gtest(test_transport test/test_transport.cpp src/transport.cpp)
@@ -147,33 +154,28 @@ if(BUILD_TESTING)
 
   # RMW API: publish/subscribe round-trip
   ament_add_gtest(test_rmw_pub_sub test/test_rmw_pub_sub.cpp)
-  target_link_libraries(test_rmw_pub_sub ${_rmw_test_libs})
+  target_link_libraries(test_rmw_pub_sub ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_pub_sub PRIVATE src)
-  ament_target_dependencies(test_rmw_pub_sub test_msgs rosidl_typesupport_cpp)
 
   # RMW API: service/client round-trip
   ament_add_gtest(test_rmw_service_client test/test_rmw_service_client.cpp)
-  target_link_libraries(test_rmw_service_client ${_rmw_test_libs})
+  target_link_libraries(test_rmw_service_client ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_service_client PRIVATE src)
-  ament_target_dependencies(test_rmw_service_client test_msgs rosidl_typesupport_cpp)
 
   # RMW API: wait set
   ament_add_gtest(test_rmw_wait test/test_rmw_wait.cpp)
-  target_link_libraries(test_rmw_wait ${_rmw_test_libs})
+  target_link_libraries(test_rmw_wait ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_wait PRIVATE src)
-  ament_target_dependencies(test_rmw_wait test_msgs rosidl_typesupport_cpp)
 
   # RMW API: graph introspection
   ament_add_gtest(test_rmw_graph test/test_rmw_graph.cpp)
-  target_link_libraries(test_rmw_graph ${_rmw_test_libs})
+  target_link_libraries(test_rmw_graph ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_graph PRIVATE src)
-  ament_target_dependencies(test_rmw_graph test_msgs rosidl_typesupport_cpp)
 
   # RMW API: QoS, TRANSIENT_LOCAL, multi-subscriber/client
   ament_add_gtest(test_rmw_qos test/test_rmw_qos.cpp)
-  target_link_libraries(test_rmw_qos ${_rmw_test_libs})
+  target_link_libraries(test_rmw_qos ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_qos PRIVATE src)
-  ament_target_dependencies(test_rmw_qos test_msgs rosidl_typesupport_cpp)
 endif()
 
 ament_package()
