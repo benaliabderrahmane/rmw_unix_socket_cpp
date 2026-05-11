@@ -93,11 +93,8 @@ ament_export_targets(export_rmw_unix_socket_cpp)
 
 if(BUILD_TESTING)
   find_package(ament_cmake_gtest REQUIRED)
-  find_package(ament_lint_auto REQUIRED)
   find_package(test_msgs REQUIRED)
   find_package(rosidl_typesupport_cpp REQUIRED)
-
-  ament_lint_auto_find_test_dependencies()
 
   # Common includes for unit tests that compile sources directly
   set(_unit_test_deps rmw::rmw
