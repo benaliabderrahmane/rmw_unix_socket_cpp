@@ -33,8 +33,17 @@ jobs:
         shell: bash
         run: |
           rosdep update --rosdistro=${{ matrix.ros_distro }}
+          # rosdep's --from-paths defaults exclude test deps, so list types
+          # explicitly. Without this, test_msgs/rosidl_typesupport_cpp/etc.
+          # are skipped and BUILD_TESTING=ON (colcon build default) fails to
+          # configure.
           rosdep install --from-paths rmw_unix_socket_cpp --ignore-src -r -y \
-            --rosdistro=${{ matrix.ros_distro }}
+            --rosdistro=${{ matrix.ros_distro }} \
+            --dependency-types=buildtool \
+            --dependency-types=build \
+            --dependency-types=build_export \
+            --dependency-types=exec \
+            --dependency-types=test
 
       - name: Build
         shell: bash
