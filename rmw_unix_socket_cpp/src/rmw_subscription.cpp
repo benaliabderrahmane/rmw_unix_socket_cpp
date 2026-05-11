@@ -1,4 +1,5 @@
 #include "identifier.hpp"
+#include "logging.hpp"
 #include "registry.hpp"
 #include "serialization.hpp"
 #include "transport.hpp"
@@ -55,13 +56,24 @@ static void drain_subscription(rmw_uds::UdsSubscription * sub)
     msg.payload = std::move(payload);
     msg.received_timestamp_ns = now_ns();
 
+    bool overflow = false;
     {
       std::lock_guard<std::mutex> lock(sub->queue_mutex);
       sub->message_queue.push_back(std::move(msg));
-      // Enforce queue depth
+      // Enforce queue depth — any pops here mean we're dropping messages
+      // the kernel already delivered to us because the take() side isn't
+      // keeping up. This is the rcl-layer equivalent of "slow subscriber".
       while (sub->message_queue.size() > sub->queue_depth) {
         sub->message_queue.pop_front();
+        overflow = true;
       }
+    }
+    if (overflow) {
+      RMW_UDS_LOG_WARN_THROTTLE(
+        1000,
+        "subscription queue overflow on topic '%s' (depth=%zu) — "
+        "dropping oldest. Application is not calling take() fast enough.",
+        sub->topic_name.c_str(), sub->queue_depth);
     }
 
     // Trigger callback if set
@@ -125,6 +137,9 @@ rmw_subscription_t * rmw_create_subscription(
   sub_data->socket_path = rmw_uds::make_socket_path(ctx->domain_id, "sub");
   sub_data->socket_fd = rmw_uds::create_bound_socket(sub_data->socket_path);
   if (sub_data->socket_fd < 0) {
+    RMW_UDS_LOG_ERROR(
+      "failed to create subscription socket for topic '%s' at '%s'",
+      topic_name, sub_data->socket_path.c_str());
     delete sub_data;
     RMW_SET_ERROR_MSG("failed to create subscription socket");
     return nullptr;
@@ -150,6 +165,10 @@ rmw_subscription_t * rmw_create_subscription(
   sub_data->registry_index = rmw_uds::registry_add(header, entry);
 
   if (sub_data->registry_index < 0) {
+    RMW_UDS_LOG_ERROR(
+      "registry full — cannot create subscription for topic '%s' (node=%s%s). "
+      "Increase REGISTRY_MAX_ENTRIES or check for slot leaks.",
+      topic_name, node_data->ns.c_str(), node_data->name.c_str());
     rmw_uds::close_socket(sub_data->socket_fd, sub_data->socket_path);
     delete sub_data;
     RMW_SET_ERROR_MSG("registry full — cannot create subscription");
@@ -234,6 +253,15 @@ rmw_ret_t rmw_take(
   if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
     sub_data->callbacks, ros_message))
   {
+    // Surface to the log too: rcl only prints the SET_ERROR_MSG string if
+    // the caller checks the return code, but a corrupted/truncated payload
+    // (e.g. silently truncated by the kernel on send) is something the
+    // operator needs to see regardless. Throttle to bound the rate.
+    RMW_UDS_LOG_ERROR_THROTTLE(
+      1000,
+      "rmw_take: CDR deserialization failed on topic '%s' (payload=%zu bytes) "
+      "— likely truncated or type mismatch with publisher",
+      sub_data->topic_name.c_str(), msg.payload.size());
     char err_buf[512];
     std::snprintf(err_buf, sizeof(err_buf),
       "failed to deserialize message on topic '%s' (payload=%zu bytes)",
@@ -279,6 +307,15 @@ rmw_ret_t rmw_take_with_info(
   if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
     sub_data->callbacks, ros_message))
   {
+    // Surface to the log too: rcl only prints the SET_ERROR_MSG string if
+    // the caller checks the return code, but a corrupted/truncated payload
+    // (e.g. silently truncated by the kernel on send) is something the
+    // operator needs to see regardless. Throttle to bound the rate.
+    RMW_UDS_LOG_ERROR_THROTTLE(
+      1000,
+      "rmw_take: CDR deserialization failed on topic '%s' (payload=%zu bytes) "
+      "— likely truncated or type mismatch with publisher",
+      sub_data->topic_name.c_str(), msg.payload.size());
     char err_buf[512];
     std::snprintf(err_buf, sizeof(err_buf),
       "failed to deserialize message on topic '%s' (payload=%zu bytes)",

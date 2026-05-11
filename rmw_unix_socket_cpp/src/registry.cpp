@@ -10,6 +10,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "logging.hpp"
+
 namespace rmw_uds
 {
 
@@ -322,6 +324,19 @@ static bool pid_is_alive_or_unreachable(pid_t pid)
   return errno != ENOENT;  // Other errors -> be conservative, treat as alive
 }
 
+// Human-readable name for a slot's type — used only in log lines.
+static const char * entry_type_name(uint8_t t)
+{
+  switch (t) {
+    case ENTRY_NODE: return "node";
+    case ENTRY_PUBLISHER: return "publisher";
+    case ENTRY_SUBSCRIPTION: return "subscription";
+    case ENTRY_SERVICE: return "service";
+    case ENTRY_CLIENT: return "client";
+    default: return "?";
+  }
+}
+
 void registry_cleanup_stale(RegistryHeader * header)
 {
   auto * slots = registry_slots(header);
@@ -344,6 +359,18 @@ void registry_cleanup_stale(RegistryHeader * header)
     {
       continue;  // raced with another remover / writer
     }
+
+    // Surface the reclaim so a crashed-node incident leaves a breadcrumb
+    // in the ROS log. WARN level — this is an ungraceful exit, not routine.
+    RMW_UDS_LOG_WARN(
+      "reclaimed stale registry slot %u: %s pid=%d node=%s%s topic=%s — "
+      "owning process is gone (ungraceful exit)",
+      i, entry_type_name(expected),
+      static_cast<int>(snap.pid),
+      snap.node_namespace[0] ? snap.node_namespace : "",
+      snap.node_name,
+      snap.topic_name[0] ? snap.topic_name : "(none)");
+
     teardown_slot(&slots[i]);
     header->generation.fetch_add(1, std::memory_order_acq_rel);
   }

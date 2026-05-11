@@ -1,4 +1,5 @@
 #include "identifier.hpp"
+#include "logging.hpp"
 #include "registry.hpp"
 #include "serialization.hpp"
 #include "transport.hpp"
@@ -105,6 +106,11 @@ rmw_publisher_t * rmw_create_publisher(
   pub_data->registry_index = rmw_uds::registry_add(header, entry);
 
   if (pub_data->registry_index < 0) {
+    RMW_UDS_LOG_ERROR(
+      "registry full — cannot create publisher for topic '%s' (node=%s%s). "
+      "Increase REGISTRY_MAX_ENTRIES or check for slot leaks.",
+      topic_name,
+      node_data->ns.c_str(), node_data->name.c_str());
     delete pub_data;
     RMW_SET_ERROR_MSG("registry full — cannot create publisher");
     return nullptr;
@@ -168,6 +174,11 @@ rmw_ret_t rmw_publish(
   // Serialize the message using CDR
   std::vector<uint8_t> payload;
   if (!rmw_uds::serialize(ros_message, pub_data->callbacks, payload)) {
+    // Throttled — a broken type/serializer would otherwise log per-publish.
+    RMW_UDS_LOG_ERROR_THROTTLE(
+      1000,
+      "rmw_publish: CDR serialization failed for topic '%s' (type '%s')",
+      pub_data->topic_name.c_str(), pub_data->type_name.c_str());
     RMW_SET_ERROR_MSG("failed to serialize message");
     return RMW_RET_ERROR;
   }
