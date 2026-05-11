@@ -17,6 +17,10 @@ jobs:
         ros_distro: [jazzy, kilted, rolling]
     container:
       image: ros:${{ matrix.ros_distro }}-ros-base
+      # Default Docker /dev/shm is 64MB; one domain registry mmap is ~37MB
+      # and rmw_shutdown doesn't shm_unlink, so tests that init multiple
+      # domains across processes exhaust tmpfs and crash with SIGBUS.
+      options: --shm-size=1g
     steps:
       - name: Install build prerequisites
         shell: bash
