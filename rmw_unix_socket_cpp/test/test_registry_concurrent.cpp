@@ -137,6 +137,10 @@ TEST_F(RegistryConcurrentTest, ReadersNeverSeeTornEntries)
         }
         int32_t idx = rmw_uds::registry_add(header, e);
         if (idx >= 0) {
+          // Yield so the entry is visible for at least one scheduling slice;
+          // otherwise on a heavily contended 2-core CI runner readers can
+          // miss every single add/remove window and observation count = 0.
+          std::this_thread::yield();
           rmw_uds::registry_remove(header, idx);
         }
         ++counter;
@@ -169,7 +173,7 @@ TEST_F(RegistryConcurrentTest, ReadersNeverSeeTornEntries)
     readers.emplace_back(reader);
   }
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
   stop.store(true, std::memory_order_relaxed);
   w.join();
   for (auto & r : readers) {
