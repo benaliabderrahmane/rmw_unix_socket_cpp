@@ -243,11 +243,21 @@ rmw_ret_t rmw_publish(
     }
   }
 
-  // Send current message to each subscriber (no registry lock held)
+  // Surface EMSGSIZE; soft drops (EAGAIN/ENOENT) are logged in send_to.
+  bool config_error = false;
   for (const auto & path : sub_paths) {
-    rmw_uds::send_to(
-      pub_data->context->send_socket_fd,
-      path, hdr, payload.data(), payload.size());
+    if (rmw_uds::send_to(
+        pub_data->context->send_socket_fd,
+        path, hdr, payload.data(), payload.size()) == rmw_uds::SendResult::ConfigError)
+    {
+      config_error = true;
+    }
+  }
+  if (config_error) {
+    RMW_SET_ERROR_MSG(
+      "UDS send: message too large for kernel send buffer (EMSGSIZE). "
+      "Raise net.core.wmem_max or reduce message size.");
+    return RMW_RET_ERROR;
   }
 
   return RMW_RET_OK;
@@ -297,10 +307,21 @@ rmw_ret_t rmw_publish_serialized_message(
     sub_paths = pub_data->cached_subscriber_paths;
   }
 
+  bool config_error = false;
   for (const auto & path : sub_paths) {
-    rmw_uds::send_to(
-      pub_data->context->send_socket_fd,
-      path, hdr, serialized_message->buffer, serialized_message->buffer_length);
+    if (rmw_uds::send_to(
+        pub_data->context->send_socket_fd,
+        path, hdr, serialized_message->buffer,
+        serialized_message->buffer_length) == rmw_uds::SendResult::ConfigError)
+    {
+      config_error = true;
+    }
+  }
+  if (config_error) {
+    RMW_SET_ERROR_MSG(
+      "UDS send: serialized message too large for kernel send buffer (EMSGSIZE). "
+      "Raise net.core.wmem_max or reduce message size.");
+    return RMW_RET_ERROR;
   }
 
   return RMW_RET_OK;

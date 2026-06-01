@@ -54,8 +54,10 @@ TEST_F(TransportTest, SendAndReceive)
   std::vector<uint8_t> payload = {1, 2, 3, 4, 5};
   send_hdr.payload_size = static_cast<uint32_t>(payload.size());
 
-  ASSERT_TRUE(rmw_uds::send_to(
-    send_fd, recv_path, send_hdr, payload.data(), payload.size()));
+  ASSERT_EQ(
+    rmw_uds::SendResult::Ok,
+    rmw_uds::send_to(
+      send_fd, recv_path, send_hdr, payload.data(), payload.size()));
 
   // Receive
   rmw_uds::WireHeader recv_hdr;
@@ -99,8 +101,10 @@ TEST_F(TransportTest, MultipleMessages)
     hdr.sequence_number = i;
     hdr.payload_size = sizeof(int);
     hdr.msg_type = 0;
-    ASSERT_TRUE(rmw_uds::send_to(
-      send_fd, path, hdr, reinterpret_cast<const uint8_t *>(&i), sizeof(i)));
+    ASSERT_EQ(
+      rmw_uds::SendResult::Ok,
+      rmw_uds::send_to(
+        send_fd, path, hdr, reinterpret_cast<const uint8_t *>(&i), sizeof(i)));
   }
 
   for (int i = 0; i < N; ++i) {

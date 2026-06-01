@@ -108,6 +108,8 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
     rmw_uds::cleanup_orphan_socket_files(domain_id);
   }
 
+  rmw_uds::warn_if_sysctl_buffers_undersized();
+
   // Create send socket
   ctx->send_socket_fd = rmw_uds::create_send_socket();
   if (ctx->send_socket_fd < 0) {
