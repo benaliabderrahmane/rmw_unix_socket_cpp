@@ -1,4 +1,5 @@
 #include "identifier.hpp"
+#include "logging.hpp"
 #include "registry.hpp"
 #include "serialization.hpp"
 #include "transport.hpp"
@@ -186,29 +187,35 @@ rmw_ret_t rmw_take_request(
   }
 
   std::lock_guard<std::mutex> lock(srv_data->queue_mutex);
-  if (srv_data->request_queue.empty()) {
-    std::memset(request_header, 0, sizeof(rmw_service_info_t));
+  // Drop-garbage-and-continue: one corrupt datagram must not destroy a
+  // legitimate in-flight request and wedge the client into a timeout.
+  while (!srv_data->request_queue.empty()) {
+    auto msg = std::move(srv_data->request_queue.front());
+    srv_data->request_queue.pop_front();
+
+    if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
+      srv_data->request_callbacks, ros_request))
+    {
+      RMW_UDS_LOG_ERROR_THROTTLE(
+        1000,
+        "rmw_take_request: CDR deserialization failed on service '%s' "
+        "(payload=%zu bytes) — dropping datagram",
+        srv_data->service_name.c_str(), msg.payload.size());
+      continue;
+    }
+
+    // Fill request header
+    std::memcpy(request_header->request_id.writer_guid, msg.header.gid,
+      RMW_GID_STORAGE_SIZE);
+    request_header->request_id.sequence_number = msg.header.sequence_number;
+    request_header->source_timestamp = msg.header.source_timestamp_ns;
+    request_header->received_timestamp = msg.received_timestamp_ns;
+
+    *taken = true;
     return RMW_RET_OK;
   }
 
-  auto msg = std::move(srv_data->request_queue.front());
-  srv_data->request_queue.pop_front();
-
-  if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
-    srv_data->request_callbacks, ros_request))
-  {
-    RMW_SET_ERROR_MSG("failed to deserialize request");
-    return RMW_RET_ERROR;
-  }
-
-  // Fill request header
-  std::memcpy(request_header->request_id.writer_guid, msg.header.gid,
-    RMW_GID_STORAGE_SIZE);
-  request_header->request_id.sequence_number = msg.header.sequence_number;
-  request_header->source_timestamp = msg.header.source_timestamp_ns;
-  request_header->received_timestamp = msg.received_timestamp_ns;
-
-  *taken = true;
+  std::memset(request_header, 0, sizeof(rmw_service_info_t));
   return RMW_RET_OK;
 }
 
