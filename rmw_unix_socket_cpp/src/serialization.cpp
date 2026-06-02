@@ -104,7 +104,7 @@ bool serialize(
 {
   try {
     // Get estimated serialized size (4 bytes encapsulation + message)
-    auto data_length = 4 + callbacks->get_serialized_size(ros_message);
+    size_t data_length = size_t{4} + callbacks->get_serialized_size(ros_message);
     buffer.resize(data_length);
 
     eprosima::fastcdr::FastBuffer fastbuffer(
