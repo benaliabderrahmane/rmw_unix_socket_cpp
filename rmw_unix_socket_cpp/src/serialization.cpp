@@ -102,24 +102,33 @@ bool serialize(
   const message_type_support_callbacks_t * callbacks,
   std::vector<uint8_t> & buffer)
 {
-  // Get estimated serialized size (4 bytes encapsulation + message)
-  auto data_length = 4 + callbacks->get_serialized_size(ros_message);
-  buffer.resize(data_length);
+  try {
+    // Get estimated serialized size (4 bytes encapsulation + message)
+    auto data_length = 4 + callbacks->get_serialized_size(ros_message);
+    buffer.resize(data_length);
 
-  eprosima::fastcdr::FastBuffer fastbuffer(
-    reinterpret_cast<char *>(buffer.data()), data_length);
-  eprosima::fastcdr::Cdr ser(
-    fastbuffer,
-    eprosima::fastcdr::Cdr::DEFAULT_ENDIAN,
-    eprosima::fastcdr::CdrVersion::DDS_CDR);
+    eprosima::fastcdr::FastBuffer fastbuffer(
+      reinterpret_cast<char *>(buffer.data()), data_length);
+    eprosima::fastcdr::Cdr ser(
+      fastbuffer,
+      eprosima::fastcdr::Cdr::DEFAULT_ENDIAN,
+      eprosima::fastcdr::CdrVersion::DDS_CDR);
 
-  ser.serialize_encapsulation();
-  if (!callbacks->cdr_serialize(ros_message, ser)) {
+    ser.serialize_encapsulation();
+    if (!callbacks->cdr_serialize(ros_message, ser)) {
+      return false;
+    }
+
+    // Trim buffer to actual serialized size
+    buffer.resize(ser.get_serialized_data_length());
+  } catch (const eprosima::fastcdr::exception::Exception &) {
+    return false;
+  } catch (const std::exception &) {
+    // get_serialized_size() can throw std::overflow_error (string/sequence
+    // overflow); buffer.resize() can throw std::bad_alloc. Callers are
+    // extern "C", so nothing may escape across the C ABI.
     return false;
   }
-
-  // Trim buffer to actual serialized size
-  buffer.resize(ser.get_serialized_data_length());
   return true;
 }
 
