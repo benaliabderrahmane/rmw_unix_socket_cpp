@@ -238,7 +238,7 @@ rmw_ret_t rmw_publish(
 
     rmw_uds::CachedMessage cached;
     cached.header = hdr;
-    cached.payload = payload;
+    cached.payload = std::move(payload);  // last use of payload
     pub_data->message_cache.push_back(std::move(cached));
     while (pub_data->message_cache.size() > pub_data->qos.depth) {
       pub_data->message_cache.pop_front();
@@ -255,6 +255,16 @@ rmw_ret_t rmw_publish(
         }
       }
     }
+
+    // Send the current message, read from the cached copy since payload was
+    // moved. Trimming never disturbs back(), so it is the message just pushed.
+    const auto & current = pub_data->message_cache.back();
+    for (const auto & path : sub_paths) {
+      rmw_uds::send_to(
+        pub_data->context->send_socket_fd,
+        path, current.header, current.payload.data(), current.payload.size());
+    }
+    return RMW_RET_OK;
   }
 
   // Surface EMSGSIZE; soft drops (EAGAIN/ENOENT) are logged in send_to.
