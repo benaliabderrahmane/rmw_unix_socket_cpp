@@ -147,7 +147,8 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
 
   // Read initial generation
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
-  ctx->last_registry_generation = rmw_uds::registry_generation(header);
+  ctx->last_registry_generation.store(
+    rmw_uds::registry_generation(header), std::memory_order_relaxed);
 
   context->implementation_identifier = rmw_uds::identifier;
   context->impl = reinterpret_cast<rmw_context_impl_t *>(ctx);

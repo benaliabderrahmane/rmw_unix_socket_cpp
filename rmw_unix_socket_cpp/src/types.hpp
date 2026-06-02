@@ -99,7 +99,7 @@ struct UdsContext
   size_t registry_size = 0;
   int send_socket_fd = -1;
   std::atomic<bool> is_shutdown{false};
-  uint64_t last_registry_generation = 0;
+  std::atomic<uint64_t> last_registry_generation{0};
   rmw_guard_condition_t * graph_guard_condition = nullptr;
 
   // TRANSIENT_LOCAL publishers, for wait-side cache replay on graph change.

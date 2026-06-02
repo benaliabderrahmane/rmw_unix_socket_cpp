@@ -169,8 +169,8 @@ rmw_ret_t rmw_wait(
   if (ctx && ctx->registry_ptr) {
     auto * header = rmw_uds::registry_header(ctx->registry_ptr);
     uint64_t gen = rmw_uds::registry_generation(header);
-    if (gen != ctx->last_registry_generation) {
-      ctx->last_registry_generation = gen;
+    if (gen != ctx->last_registry_generation.load(std::memory_order_relaxed)) {
+      ctx->last_registry_generation.store(gen, std::memory_order_relaxed);
 
       // TRANSIENT_LOCAL late-joiner replay. Lock held across the loop —
       // rmw_destroy_publisher takes the same mutex then deletes, so this
