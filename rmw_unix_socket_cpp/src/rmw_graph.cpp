@@ -22,6 +22,9 @@
 
 static rmw_uds::UdsContext * get_context(const rmw_node_t * node)
 {
+  if (!node->data) {
+    return nullptr;
+  }
   auto * nd = static_cast<rmw_uds::UdsNode *>(node->data);
   return nd->context;
 }
@@ -139,6 +142,9 @@ rmw_ret_t rmw_count_publishers(
   RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(topic_name, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(count, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * ctx = get_context(node);
   auto pubs = query_all(ctx, rmw_uds::ENTRY_PUBLISHER, topic_name);
@@ -154,6 +160,9 @@ rmw_ret_t rmw_count_subscribers(
   RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(topic_name, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(count, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * ctx = get_context(node);
   auto subs = query_all(ctx, rmw_uds::ENTRY_SUBSCRIPTION, topic_name);
@@ -169,6 +178,9 @@ rmw_ret_t rmw_count_clients(
   RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(service_name, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(count, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * ctx = get_context(node);
   auto clients = query_all(ctx, rmw_uds::ENTRY_CLIENT, service_name);
@@ -184,6 +196,9 @@ rmw_ret_t rmw_count_services(
   RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(service_name, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(count, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * ctx = get_context(node);
   auto services = query_all(ctx, rmw_uds::ENTRY_SERVICE, service_name);
@@ -201,6 +216,9 @@ rmw_ret_t rmw_get_topic_names_and_types(
   RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(allocator, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(topic_names_and_types, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * ctx = get_context(node);
   auto pubs = query_all(ctx, rmw_uds::ENTRY_PUBLISHER);
@@ -225,6 +243,9 @@ rmw_ret_t rmw_get_service_names_and_types(
   RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(allocator, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(service_names_and_types, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * ctx = get_context(node);
   auto services = query_all(ctx, rmw_uds::ENTRY_SERVICE);
@@ -255,6 +276,9 @@ static rmw_ret_t get_names_types_by_node(
   RMW_CHECK_ARGUMENT_FOR_NULL(node_name, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(node_namespace, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(names_and_types, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * ctx = get_context(node);
   auto results = query_all(ctx, entry_type, nullptr, node_name, node_namespace);
@@ -331,6 +355,9 @@ rmw_ret_t rmw_get_publishers_info_by_topic(
   RMW_CHECK_ARGUMENT_FOR_NULL(allocator, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(topic_name, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(publishers_info, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * ctx = get_context(node);
   auto pubs = query_all(ctx, rmw_uds::ENTRY_PUBLISHER, topic_name);
@@ -374,6 +401,9 @@ rmw_ret_t rmw_get_subscriptions_info_by_topic(
   RMW_CHECK_ARGUMENT_FOR_NULL(allocator, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(topic_name, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(subscriptions_info, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * ctx = get_context(node);
   auto subs = query_all(ctx, rmw_uds::ENTRY_SUBSCRIPTION, topic_name);

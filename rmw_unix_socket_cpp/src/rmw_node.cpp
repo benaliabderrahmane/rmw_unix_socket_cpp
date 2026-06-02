@@ -134,6 +134,9 @@ rmw_ret_t rmw_destroy_node(rmw_node_t * node)
 rmw_ret_t rmw_node_assert_liveliness(const rmw_node_t * node)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   return RMW_RET_OK;
 }
 
