@@ -152,6 +152,11 @@ bool deserialize(
     }
   } catch (const eprosima::fastcdr::exception::Exception &) {
     return false;
+  } catch (const std::exception &) {
+    // cdr_deserialize() resizes message strings/sequences from attacker-controlled
+    // wire lengths and can throw std::bad_alloc/std::length_error. Callers are
+    // extern "C", so nothing may escape across the C ABI.
+    return false;
   }
   return true;
 }
