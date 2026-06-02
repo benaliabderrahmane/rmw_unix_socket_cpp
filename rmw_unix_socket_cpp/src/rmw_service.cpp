@@ -274,8 +274,23 @@ rmw_ret_t rmw_send_response(
       return RMW_RET_OK;
     }
   }
-  // Client not found — might have disconnected
-  return RMW_RET_OK;
+
+  // Cache miss — the cache may be stale. Do an authoritative direct query by
+  // client GID before giving up so a response is never silently discarded.
+  auto clients = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_CLIENT, srv_data->service_name.c_str(),
+    nullptr, nullptr);
+  for (const auto & c : clients) {
+    if (c.socket_path.empty()) {continue;}
+    if (std::memcmp(c.gid, request_header->writer_guid, sizeof(c.gid)) == 0) {
+      rmw_uds::send_to(
+        srv_data->context->send_socket_fd,
+        c.socket_path, hdr, payload.data(), payload.size());
+      return RMW_RET_OK;
+    }
+  }
+  RMW_SET_ERROR_MSG("no client matching request id; response discarded");
+  return RMW_RET_ERROR;
 }
 
 rmw_ret_t rmw_service_request_subscription_get_actual_qos(
