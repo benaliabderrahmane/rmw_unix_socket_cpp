@@ -119,7 +119,8 @@ rmw_ret_t rmw_destroy_node(rmw_node_t * node)
     delete node_data;
   }
 
-  rcutils_allocator_t alloc = node->context->options.allocator;
+  rcutils_allocator_t alloc = node->context ?
+    node->context->options.allocator : rcutils_get_default_allocator();
   if (node->name) {
     alloc.deallocate(const_cast<char *>(node->name), alloc.state);
   }

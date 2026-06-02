@@ -164,7 +164,8 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
     delete pub_data;
   }
 
-  rcutils_allocator_t alloc = node->context->options.allocator;
+  rcutils_allocator_t alloc = node->context ?
+    node->context->options.allocator : rcutils_get_default_allocator();
   if (publisher->topic_name) {
     alloc.deallocate(const_cast<char *>(publisher->topic_name), alloc.state);
   }
