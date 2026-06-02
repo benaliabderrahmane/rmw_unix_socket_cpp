@@ -132,6 +132,9 @@ rmw_ret_t rmw_destroy_service(rmw_node_t * node, rmw_service_t * service)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
   if (srv_data) {
@@ -161,6 +164,9 @@ rmw_ret_t rmw_take_request(
   RMW_CHECK_ARGUMENT_FOR_NULL(request_header, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(ros_request, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(taken, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   *taken = false;
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
@@ -214,6 +220,9 @@ rmw_ret_t rmw_send_response(
   RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(request_header, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(ros_response, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
 
@@ -275,6 +284,9 @@ rmw_ret_t rmw_service_request_subscription_get_actual_qos(
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(qos, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
   *qos = srv_data->qos;
   return RMW_RET_OK;
@@ -286,6 +298,9 @@ rmw_ret_t rmw_service_response_publisher_get_actual_qos(
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(qos, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
   *qos = srv_data->qos;
   return RMW_RET_OK;
@@ -297,6 +312,9 @@ rmw_ret_t rmw_service_set_on_new_request_callback(
   const void * user_data)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
   std::lock_guard<std::mutex> lock(srv_data->callback_mutex);
   srv_data->on_new_request_cb = callback;
