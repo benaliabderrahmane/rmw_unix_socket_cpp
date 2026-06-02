@@ -52,13 +52,25 @@ rmw_ret_t rmw_qos_profile_check_compatible(
     reason[0] = '\0';
   }
 
+  // Appends msg to reason (with a "; " separator) so multiple mismatches are
+  // all reported instead of the last one overwriting the rest.
+  size_t reason_len = 0;
   auto set_reason = [&](const char * msg) {
-      if (reason && reason_size > 0) {
-        std::snprintf(reason, reason_size, "%s", msg);
+      if (!reason || reason_size == 0 || reason_len >= reason_size - 1) {
+        return;
+      }
+      const char * sep = (reason_len > 0) ? "; " : "";
+      int n = std::snprintf(
+        reason + reason_len, reason_size - reason_len, "%s%s", sep, msg);
+      // snprintf returns the length it would have written; clamp to the
+      // space actually consumed so reason_len never overruns the buffer.
+      if (n > 0) {
+        size_t avail = reason_size - reason_len - 1;
+        reason_len += (static_cast<size_t>(n) < avail) ? static_cast<size_t>(n) : avail;
       }
     };
 
-  // Reliability: BEST_EFFORT pub + RELIABLE sub = incompatible
+  // Reliability: BEST_EFFORT pub + RELIABLE sub = warning
   auto pub_rel = publisher_profile.reliability;
   auto sub_rel = subscription_profile.reliability;
   if (pub_rel == RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT &&
@@ -68,7 +80,7 @@ rmw_ret_t rmw_qos_profile_check_compatible(
     set_reason("best effort publisher with reliable subscriber");
   }
 
-  // Durability: VOLATILE pub + TRANSIENT_LOCAL sub = incompatible
+  // Durability: VOLATILE pub + TRANSIENT_LOCAL sub = warning
   auto pub_dur = publisher_profile.durability;
   auto sub_dur = subscription_profile.durability;
   if (pub_dur == RMW_QOS_POLICY_DURABILITY_VOLATILE &&
