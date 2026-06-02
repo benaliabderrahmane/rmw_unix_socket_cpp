@@ -3,6 +3,7 @@
 #include "transport.hpp"
 #include "types.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -223,6 +224,56 @@ rmw_ret_t rmw_wait(
     }
   }
 
+  // Arm every entity fd with epoll on every wait. EPOLL_CTL_ADD is idempotent
+  // here: a still-live fd returns EEXIST (already armed), while a fd number
+  // reused after its previous owner was closed gets freshly armed. The kernel
+  // auto-removes closed fds, so no EPOLL_CTL_DEL is needed.
+  {
+    struct epoll_event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    auto register_fd = [&](int fd) {
+        if (fd < 0) {return;}
+        ev.events = EPOLLIN;
+        ev.data.fd = fd;
+        // EEXIST means the fd is already armed -> treat as success.
+        if (epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0 &&
+          errno != EEXIST)
+        {
+          // Other errors are ignored, as before.
+        }
+      };
+
+    if (subscriptions) {
+      for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
+        if (!subscriptions->subscribers[i]) {continue;}
+        auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
+        register_fd(sub->socket_fd);
+      }
+    }
+    if (services) {
+      for (size_t i = 0; i < services->service_count; ++i) {
+        if (!services->services[i]) {continue;}
+        auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
+        register_fd(srv->socket_fd);
+      }
+    }
+    if (clients) {
+      for (size_t i = 0; i < clients->client_count; ++i) {
+        if (!clients->clients[i]) {continue;}
+        auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
+        register_fd(cli->socket_fd);
+      }
+    }
+    if (guard_conditions) {
+      for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
+        if (!guard_conditions->guard_conditions[i]) {continue;}
+        auto * gc = static_cast<rmw_uds::UdsGuardCondition *>(
+          guard_conditions->guard_conditions[i]);
+        register_fd(gc->eventfd_fd);
+      }
+    }
+  }
+
   // 3. Check if anything is already ready
   bool something_ready = false;
 
@@ -276,53 +327,6 @@ rmw_ret_t rmw_wait(
 
   // 4. If nothing ready, block with epoll
   if (!something_ready) {
-    // PERFORMANCE: only EPOLL_CTL_ADD fds we haven't registered before.
-    // Closed fds are auto-removed by the kernel, so we never need DEL.
-    struct epoll_event ev;
-    std::memset(&ev, 0, sizeof(ev));
-
-    auto register_fd = [&](int fd) {
-        if (fd < 0) {return;}
-        if (ws_data->registered_fds.find(fd) != ws_data->registered_fds.end()) {
-          return;
-        }
-        ev.events = EPOLLIN;
-        ev.data.fd = fd;
-        if (epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_ADD, fd, &ev) == 0) {
-          ws_data->registered_fds.insert(fd);
-        }
-      };
-
-    if (subscriptions) {
-      for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
-        if (!subscriptions->subscribers[i]) {continue;}
-        auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
-        register_fd(sub->socket_fd);
-      }
-    }
-    if (services) {
-      for (size_t i = 0; i < services->service_count; ++i) {
-        if (!services->services[i]) {continue;}
-        auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
-        register_fd(srv->socket_fd);
-      }
-    }
-    if (clients) {
-      for (size_t i = 0; i < clients->client_count; ++i) {
-        if (!clients->clients[i]) {continue;}
-        auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
-        register_fd(cli->socket_fd);
-      }
-    }
-    if (guard_conditions) {
-      for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
-        if (!guard_conditions->guard_conditions[i]) {continue;}
-        auto * gc = static_cast<rmw_uds::UdsGuardCondition *>(
-          guard_conditions->guard_conditions[i]);
-        register_fd(gc->eventfd_fd);
-      }
-    }
-
     // Compute timeout. -1 means block forever (epoll_wait sentinel).
     int timeout_ms = -1;
     if (wait_timeout) {

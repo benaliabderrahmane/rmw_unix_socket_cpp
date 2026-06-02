@@ -239,10 +239,6 @@ struct UdsGuardCondition
 struct UdsWaitSet
 {
   int epoll_fd = -1;
-  // PERFORMANCE: track which fds are already registered with epoll so we
-  // don't issue EPOLL_CTL_ADD/DEL on every rmw_wait call. The kernel
-  // automatically removes fds from epoll when they are closed.
-  std::set<int> registered_fds;
 };
 
 }  // namespace rmw_uds
