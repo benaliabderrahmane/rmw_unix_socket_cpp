@@ -161,7 +161,9 @@ void registry_close(int fd, void * ptr, size_t size)
 
 // Snapshot one slot under the seqlock protocol. Returns true on a successful
 // snapshot of a non-empty slot, false if the slot is empty / we gave up.
-static bool snapshot_slot(RegistryEntrySlot * slot, RegistryEntrySlot * out)
+// On success, *out_seq (if non-null) receives the consistent even seq the
+// snapshot was taken at, so callers can detect a later remove+re-add (ABA).
+static bool snapshot_slot(RegistryEntrySlot * slot, RegistryEntrySlot * out, uint32_t * out_seq = nullptr)
 {
   for (int retry = 0; retry < MAX_READ_RETRIES; ++retry) {
     uint32_t s1 = slot->seq.load(std::memory_order_acquire);
@@ -193,6 +195,9 @@ static bool snapshot_slot(RegistryEntrySlot * slot, RegistryEntrySlot * out)
 
     uint32_t s2 = slot->seq.load(std::memory_order_acquire);
     if (s1 == s2) {
+      if (out_seq) {
+        *out_seq = s1;
+      }
       return true;
     }
     // Writer touched the slot — retry.
@@ -351,7 +356,8 @@ void registry_cleanup_stale(RegistryHeader * header)
 
   for (uint32_t i = 0; i < max; ++i) {
     RegistryEntrySlot snap;
-    if (!snapshot_slot(&slots[i], &snap)) {
+    uint32_t snap_seq;
+    if (!snapshot_slot(&slots[i], &snap, &snap_seq)) {
       continue;
     }
     if (snap.pid == 0) {
@@ -361,6 +367,13 @@ void registry_cleanup_stale(RegistryHeader * header)
     }
     if (pid_is_alive_or_unreachable(snap.pid)) {
       continue;
+    }
+    // ABA guard: a remove + live re-add of the same type leaves the state
+    // value unchanged but advances seq. Confirm the slot has not been touched
+    // since the snapshot, otherwise we would tear down a live entry. The
+    // acquire load is ordered before the acq_rel CAS by the control dependency.
+    if (slots[i].seq.load(std::memory_order_acquire) != snap_seq) {
+      continue;  // slot was rewritten since snapshot — not the entry we vetted
     }
     // Try to claim the slot for removal. The CAS-expected value is the state
     // we observed in the snapshot.
