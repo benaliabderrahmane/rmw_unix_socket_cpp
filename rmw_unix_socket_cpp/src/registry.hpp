@@ -2,6 +2,7 @@
 #define RMW_UNIX_SOCKET_CPP__REGISTRY_HPP_
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -53,6 +54,17 @@ struct RegistryEntry
   uint32_t qos_depth;
 };
 
+// Shm-mapped layout guard (see RegistryEntrySlot below). These structs are
+// copied byte-for-byte through shared memory; the offsets below depend only on
+// the Linux ABI (pid_t == 4) and the fixed char-array sizes. A change here must
+// bump REGISTRY_VERSION.
+static_assert(sizeof(RegistryEntry) == 1164, "RegistryEntry shm layout changed");
+static_assert(offsetof(RegistryEntry, type) == 0, "RegistryEntry layout changed");
+static_assert(offsetof(RegistryEntry, pid) == 4, "RegistryEntry layout changed");
+static_assert(offsetof(RegistryEntry, gid) == 8, "RegistryEntry layout changed");
+static_assert(offsetof(RegistryEntry, node_name) == 24, "RegistryEntry layout changed");
+static_assert(offsetof(RegistryEntry, qos_depth) == 1160, "RegistryEntry layout changed");
+
 // Internal slot layout as stored in shared memory. Implements a per-slot
 // seqlock + atomic state machine so readers never need a global mutex.
 //
@@ -99,6 +111,18 @@ struct RegistryEntrySlot
   uint32_t qos_depth;
 };
 
+// Shm-mapped layout guard: RegistryEntrySlot is mapped across processes; DESIGN
+// pins it at 1168 bytes. The seqlock head (seq + state + pad) makes it 4 bytes
+// larger than RegistryEntry. sizeof(pthread_mutex_t) is NOT asserted (libc/arch
+// specific), so RegistryHeader's total size is intentionally left unguarded.
+static_assert(sizeof(RegistryEntrySlot) == 1168, "RegistryEntrySlot shm layout changed");
+static_assert(offsetof(RegistryEntrySlot, seq) == 0, "RegistryEntrySlot layout changed");
+static_assert(offsetof(RegistryEntrySlot, state) == 4, "RegistryEntrySlot layout changed");
+static_assert(offsetof(RegistryEntrySlot, pid) == 8, "RegistryEntrySlot layout changed");
+static_assert(offsetof(RegistryEntrySlot, gid) == 12, "RegistryEntrySlot layout changed");
+static_assert(offsetof(RegistryEntrySlot, node_name) == 28, "RegistryEntrySlot layout changed");
+static_assert(offsetof(RegistryEntrySlot, qos_depth) == 1164, "RegistryEntrySlot layout changed");
+
 struct RegistryHeader
 {
   std::atomic<uint32_t> version;
@@ -108,6 +132,14 @@ struct RegistryHeader
   // Hot paths (add / remove / query / cleanup) never take it.
   pthread_mutex_t init_mutex;
 };
+
+// Header layout guard: only the integer prefix is asserted. The total size
+// depends on sizeof(pthread_mutex_t), which is libc/arch specific, so it is
+// deliberately not pinned here (DESIGN documents 56 bytes for glibc/x86_64).
+static_assert(offsetof(RegistryHeader, version) == 0, "RegistryHeader layout changed");
+static_assert(offsetof(RegistryHeader, max_entries) == 4, "RegistryHeader layout changed");
+static_assert(offsetof(RegistryHeader, generation) == 8, "RegistryHeader layout changed");
+static_assert(offsetof(RegistryHeader, init_mutex) == 16, "RegistryHeader layout changed");
 
 // Open or create the shared memory registry for the given domain_id.
 // Returns fd >= 0 on success, sets *out_ptr and *out_size.

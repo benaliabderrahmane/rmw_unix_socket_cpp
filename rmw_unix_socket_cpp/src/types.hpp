@@ -2,6 +2,7 @@
 #define RMW_UNIX_SOCKET_CPP__TYPES_HPP_
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -66,6 +67,17 @@ struct __attribute__((packed)) WireHeader
   uint32_t payload_size;                // 4 bytes
   uint8_t msg_type;                     // 1 byte: 0=topic, 1=request, 2=response
 };
+
+// Wire-format guard: WireHeader is blitted onto the datagram, so its packed
+// layout is a cross-process / cross-build contract. DESIGN pins 16+8+8+4+1.
+// A field reorder or type change must be deliberate (and bump the protocol).
+static_assert(RMW_GID_STORAGE_SIZE == 16, "WireHeader assumes a 16-byte GID");
+static_assert(sizeof(WireHeader) == 37, "WireHeader wire layout changed");
+static_assert(offsetof(WireHeader, gid) == 0, "WireHeader layout changed");
+static_assert(offsetof(WireHeader, sequence_number) == 16, "WireHeader layout changed");
+static_assert(offsetof(WireHeader, source_timestamp_ns) == 24, "WireHeader layout changed");
+static_assert(offsetof(WireHeader, payload_size) == 32, "WireHeader layout changed");
+static_assert(offsetof(WireHeader, msg_type) == 36, "WireHeader layout changed");
 
 // Message stored in subscription/service/client queues
 struct ReceivedMessage
