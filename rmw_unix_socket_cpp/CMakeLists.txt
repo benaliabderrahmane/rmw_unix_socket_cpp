@@ -22,8 +22,23 @@ find_package(rosidl_typesupport_fastrtps_cpp REQUIRED)
 # rmw_init_options_t::localhost_only was removed in Kilted (rmw >= 7.8).
 # Probe so we can keep setting it on older distros without breaking newer ones.
 include(CheckCXXSourceCompiles)
-set(_rmw_probe_saved_libs ${CMAKE_REQUIRED_LIBRARIES})
-set(CMAKE_REQUIRED_LIBRARIES rmw::rmw rcutils::rcutils)
+# The probe only needs the rmw headers, so feed it include dirs rather than
+# linking rmw::rmw / rcutils::rcutils. Linking the C rcutils target pulls its
+# INTERFACE_COMPILE_FEATURES (a C compile feature) into this CXX-only
+# try_compile; on toolchains where the scratch project doesn't enable C that
+# aborts configure with "No known features for C compiler" (seen on Rolling).
+set(_rmw_probe_saved_inc "${CMAKE_REQUIRED_INCLUDES}")
+# init_options.h pulls in rcutils/allocator.h, so the probe needs both the rmw
+# and rcutils include dirs (gathered without linking either target).
+set(CMAKE_REQUIRED_INCLUDES "")
+get_target_property(_rmw_probe_rmw_inc rmw::rmw INTERFACE_INCLUDE_DIRECTORIES)
+if(_rmw_probe_rmw_inc)
+  list(APPEND CMAKE_REQUIRED_INCLUDES ${_rmw_probe_rmw_inc})
+endif()
+get_target_property(_rmw_probe_rcutils_inc rcutils::rcutils INTERFACE_INCLUDE_DIRECTORIES)
+if(_rmw_probe_rcutils_inc)
+  list(APPEND CMAKE_REQUIRED_INCLUDES ${_rmw_probe_rcutils_inc})
+endif()
 check_cxx_source_compiles("
 #include <rmw/init_options.h>
 int main() {
@@ -32,7 +47,7 @@ int main() {
   return 0;
 }
 " RMW_HAS_LOCALHOST_ONLY)
-set(CMAKE_REQUIRED_LIBRARIES ${_rmw_probe_saved_libs})
+set(CMAKE_REQUIRED_INCLUDES "${_rmw_probe_saved_inc}")
 
 add_library(rmw_unix_socket_cpp SHARED
   src/registry.cpp
