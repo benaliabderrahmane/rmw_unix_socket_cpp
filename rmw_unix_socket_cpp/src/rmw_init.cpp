@@ -63,8 +63,11 @@ rmw_ret_t rmw_init_options_copy(
   // discovery_options.static_peers is heap-owned; deep-copy it so src and dst
   // don't alias the same array and double-free in rmw_init_options_fini.
   dst->discovery_options = rmw_get_zero_initialized_discovery_options();
+  // rmw_discovery_options_copy takes a non-const allocator (unlike the security
+  // variant), so copy the caller's allocator into a local first.
+  rcutils_allocator_t disc_alloc = src->allocator;
   ret = rmw_discovery_options_copy(
-    &src->discovery_options, &src->allocator, &dst->discovery_options);
+    &src->discovery_options, &disc_alloc, &dst->discovery_options);
   if (ret != RMW_RET_OK) {
     rmw_security_options_fini(&dst->security_options, &dst->allocator);
     return ret;
@@ -83,7 +86,8 @@ rmw_ret_t rmw_init_options_fini(rmw_init_options_t * init_options)
     init_options->enclave = nullptr;
   }
   rmw_security_options_fini(&init_options->security_options, &init_options->allocator);
-  rmw_discovery_options_fini(&init_options->discovery_options);
+  rmw_ret_t disc_ret = rmw_discovery_options_fini(&init_options->discovery_options);
+  (void)disc_ret;
   *init_options = rmw_get_zero_initialized_init_options();
   return RMW_RET_OK;
 }
@@ -192,9 +196,22 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   // discovery_options.static_peers is heap-owned; deep-copy it so context->options
   // owns its own array rather than aliasing the caller's options (mirrors enclave).
   context->options.discovery_options = rmw_get_zero_initialized_discovery_options();
-  rmw_discovery_options_copy(
-    &options->discovery_options, &options->allocator,
+  // rmw_discovery_options_copy needs a non-const allocator; copy into a local.
+  rcutils_allocator_t disc_alloc = options->allocator;
+  rmw_ret_t disc_ret = rmw_discovery_options_copy(
+    &options->discovery_options, &disc_alloc,
     &context->options.discovery_options);
+  if (disc_ret != RMW_RET_OK) {
+    if (enclave_copy) {
+      options->allocator.deallocate(enclave_copy, options->allocator.state);
+    }
+    close(ctx->send_socket_fd);
+    rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);
+    delete ctx;
+    *context = rmw_get_zero_initialized_context();
+    RMW_SET_ERROR_MSG("failed to copy discovery options");
+    return disc_ret;
+  }
   context->actual_domain_id = domain_id;
 
   return RMW_RET_OK;
@@ -236,7 +253,8 @@ rmw_ret_t rmw_context_fini(rmw_context_t * context)
       context->options.enclave, context->options.allocator.state);
     context->options.enclave = nullptr;
   }
-  rmw_discovery_options_fini(&context->options.discovery_options);
+  rmw_ret_t disc_ret = rmw_discovery_options_fini(&context->options.discovery_options);
+  (void)disc_ret;
 
   *context = rmw_get_zero_initialized_context();
   return RMW_RET_OK;
