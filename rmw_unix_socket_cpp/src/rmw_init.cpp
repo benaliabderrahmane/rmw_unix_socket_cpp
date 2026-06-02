@@ -1,3 +1,5 @@
+#include <sys/stat.h>
+
 #include "identifier.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
@@ -90,6 +92,13 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(options, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(context, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    options, options->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  if (context->impl != nullptr) {
+    RMW_SET_ERROR_MSG("expected a zero-initialized context");
+    return RMW_RET_INVALID_ARGUMENT;
+  }
 
   auto * ctx = new (std::nothrow) rmw_uds::UdsContext();
   if (!ctx) {
@@ -103,8 +112,19 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   }
   ctx->domain_id = domain_id;
 
-  // Ensure socket directory exists
-  rmw_uds::ensure_socket_dir(domain_id);
+  // Ensure socket directory exists. ensure_socket_dir swallows mkdir errors and
+  // only returns the path, so validate the directory here (in-scope) rather than
+  // changing its signature; downstream registry/socket setup would otherwise fail
+  // with a less specific error.
+  std::string socket_dir = rmw_uds::ensure_socket_dir(domain_id);
+  struct stat dir_st;
+  if (stat(socket_dir.c_str(), &dir_st) != 0 || !S_ISDIR(dir_st.st_mode)) {
+    RMW_UDS_LOG_ERROR(
+      "rmw_init: socket directory '%s' is not usable", socket_dir.c_str());
+    delete ctx;
+    RMW_SET_ERROR_MSG("failed to create socket directory");
+    return RMW_RET_ERROR;
+  }
 
   // Open shared memory registry
   ctx->registry_fd = rmw_uds::registry_open(
@@ -150,13 +170,25 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   ctx->last_registry_generation.store(
     rmw_uds::registry_generation(header), std::memory_order_relaxed);
 
+  // Deep-copy the caller-owned enclave string before committing any field on
+  // context, so a copy failure can tear the context down cleanly.
+  char * enclave_copy = nullptr;
+  if (options->enclave) {
+    enclave_copy = rcutils_strdup(options->enclave, options->allocator);
+    if (!enclave_copy) {
+      close(ctx->send_socket_fd);
+      rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);
+      delete ctx;
+      RMW_SET_ERROR_MSG("failed to copy enclave string");
+      return RMW_RET_BAD_ALLOC;
+    }
+  }
+
   context->implementation_identifier = rmw_uds::identifier;
   context->impl = reinterpret_cast<rmw_context_impl_t *>(ctx);
   context->instance_id = options->instance_id;
   context->options = *options;
-  if (options->enclave) {
-    context->options.enclave = rcutils_strdup(options->enclave, options->allocator);
-  }
+  context->options.enclave = enclave_copy;
   // discovery_options.static_peers is heap-owned; deep-copy it so context->options
   // owns its own array rather than aliasing the caller's options (mirrors enclave).
   context->options.discovery_options = rmw_get_zero_initialized_discovery_options();
