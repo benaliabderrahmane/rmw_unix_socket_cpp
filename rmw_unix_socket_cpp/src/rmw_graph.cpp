@@ -55,6 +55,11 @@ static rmw_ret_t fill_names_and_types(
   size_t idx = 0;
   for (const auto & [topic, types] : topic_types) {
     names_and_types->names.data[idx] = rcutils_strdup(topic.c_str(), *allocator);
+    if (!names_and_types->names.data[idx]) {
+      auto _r [[maybe_unused]] = rmw_names_and_types_fini(names_and_types);
+      RMW_SET_ERROR_MSG("failed to allocate topic name");
+      return RMW_RET_BAD_ALLOC;
+    }
 
     auto ret2 = rcutils_string_array_init(
       &names_and_types->types[idx], types.size(), allocator);
@@ -66,6 +71,11 @@ static rmw_ret_t fill_names_and_types(
     size_t tidx = 0;
     for (const auto & t : types) {
       names_and_types->types[idx].data[tidx] = rcutils_strdup(t.c_str(), *allocator);
+      if (!names_and_types->types[idx].data[tidx]) {
+        auto _r [[maybe_unused]] = rmw_names_and_types_fini(names_and_types);
+        RMW_SET_ERROR_MSG("failed to allocate type name");
+        return RMW_RET_BAD_ALLOC;
+      }
       tidx++;
     }
     idx++;
@@ -103,6 +113,12 @@ rmw_ret_t rmw_get_node_names(
   for (size_t i = 0; i < nodes.size(); ++i) {
     node_names->data[i] = rcutils_strdup(nodes[i].node_name.c_str(), alloc);
     node_namespaces->data[i] = rcutils_strdup(nodes[i].node_namespace.c_str(), alloc);
+    if (!node_names->data[i] || !node_namespaces->data[i]) {
+      auto _rn [[maybe_unused]] = rcutils_string_array_fini(node_names);
+      auto _rns [[maybe_unused]] = rcutils_string_array_fini(node_namespaces);
+      RMW_SET_ERROR_MSG("failed to allocate node name/namespace");
+      return RMW_RET_BAD_ALLOC;
+    }
   }
 
   return RMW_RET_OK;
@@ -130,6 +146,13 @@ rmw_ret_t rmw_get_node_names_with_enclaves(
 
   for (size_t i = 0; i < node_names->size; ++i) {
     enclaves->data[i] = rcutils_strdup("/", alloc);
+    if (!enclaves->data[i]) {
+      auto _rn [[maybe_unused]] = rcutils_string_array_fini(node_names);
+      auto _rns [[maybe_unused]] = rcutils_string_array_fini(node_namespaces);
+      auto _re [[maybe_unused]] = rcutils_string_array_fini(enclaves);
+      RMW_SET_ERROR_MSG("failed to allocate enclave");
+      return RMW_RET_BAD_ALLOC;
+    }
   }
   return RMW_RET_OK;
 }
