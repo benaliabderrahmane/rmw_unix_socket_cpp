@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <limits>
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -284,13 +285,19 @@ rmw_ret_t rmw_wait(
       }
     }
 
-    // Compute timeout
+    // Compute timeout. -1 means block forever (epoll_wait sentinel).
     int timeout_ms = -1;
     if (wait_timeout) {
-      timeout_ms = static_cast<int>(
-        wait_timeout->sec * 1000 + wait_timeout->nsec / 1000000);
-      if (timeout_ms == 0 && wait_timeout->nsec > 0) {
-        timeout_ms = 1;  // At least 1ms
+      // Accumulate in int64_t; RMW_DURATION_INFINITE (~9.2e12 ms) overflows int.
+      int64_t ms = static_cast<int64_t>(wait_timeout->sec) * 1000 +
+        static_cast<int64_t>(wait_timeout->nsec) / 1000000;
+      if (ms > std::numeric_limits<int>::max()) {
+        timeout_ms = -1;  // Infinite (or beyond epoll's range) -> block forever
+      } else {
+        timeout_ms = static_cast<int>(ms);
+        if (timeout_ms == 0 && wait_timeout->nsec > 0) {
+          timeout_ms = 1;  // At least 1ms
+        }
       }
     }
 
