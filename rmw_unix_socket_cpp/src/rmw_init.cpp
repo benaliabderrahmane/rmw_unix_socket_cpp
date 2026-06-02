@@ -10,6 +10,7 @@
 #include "rmw/init.h"
 #include "rmw/init_options.h"
 #include "rmw/rmw.h"
+#include "rmw/security_options.h"
 
 extern "C"
 {
@@ -48,6 +49,14 @@ rmw_ret_t rmw_init_options_copy(
     return RMW_RET_INVALID_ARGUMENT;
   }
   *dst = *src;
+  // security_options.security_root_path is heap-owned; deep-copy it so src and
+  // dst don't alias the same pointer and double-free in rmw_init_options_fini.
+  dst->security_options = rmw_get_zero_initialized_security_options();
+  rmw_ret_t ret = rmw_security_options_copy(
+    &src->security_options, &src->allocator, &dst->security_options);
+  if (ret != RMW_RET_OK) {
+    return ret;
+  }
   if (src->enclave) {
     dst->enclave = rcutils_strdup(src->enclave, src->allocator);
   }
