@@ -277,6 +277,11 @@ rmw_ret_t rmw_wait(
   // 3. Check if anything is already ready
   bool something_ready = false;
 
+  // Per-GC readiness from the step-3 consuming read, carried to step 5. One
+  // read drains the whole eventfd counter, so we never write it back (a
+  // non-atomic read-back would race a concurrent trigger and inflate it).
+  std::vector<bool> gc_triggered;
+
   if (subscriptions) {
     for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
       if (!subscriptions->subscribers[i]) {continue;}
@@ -311,6 +316,7 @@ rmw_ret_t rmw_wait(
   }
 
   if (guard_conditions) {
+    gc_triggered.assign(guard_conditions->guard_condition_count, false);
     for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
       if (!guard_conditions->guard_conditions[i]) {continue;}
       auto * gc = static_cast<rmw_uds::UdsGuardCondition *>(
@@ -319,8 +325,7 @@ rmw_ret_t rmw_wait(
       ssize_t r = read(gc->eventfd_fd, &val, sizeof(val));
       if (r == static_cast<ssize_t>(sizeof(val))) {
         something_ready = true;
-        // Write it back so it stays triggered for the ready check below
-        write(gc->eventfd_fd, &val, sizeof(val));
+        gc_triggered[i] = true;
       }
     }
   }
@@ -417,8 +422,10 @@ rmw_ret_t rmw_wait(
       auto * gc = static_cast<rmw_uds::UdsGuardCondition *>(
         guard_conditions->guard_conditions[i]);
       uint64_t val;
+      // Consume a trigger that landed during the epoll block; combine with the
+      // step-3 read so a GC seen ready then stays reported without a read-back.
       ssize_t r = read(gc->eventfd_fd, &val, sizeof(val));
-      if (r == static_cast<ssize_t>(sizeof(val))) {
+      if (r == static_cast<ssize_t>(sizeof(val)) || gc_triggered[i]) {
         any_ready = true;
       } else {
         guard_conditions->guard_conditions[i] = nullptr;
