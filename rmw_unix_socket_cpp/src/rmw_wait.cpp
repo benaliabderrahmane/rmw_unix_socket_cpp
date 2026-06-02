@@ -343,9 +343,31 @@ rmw_ret_t rmw_wait(
       }
     }
 
-    // Block
+    // Block, retrying on EINTR. A finite timeout uses a steady_clock deadline
+    // so a signal interruption neither returns TIMEOUT early nor busy-loops.
     struct epoll_event ready_events[64];
-    epoll_wait(ws_data->epoll_fd, ready_events, 64, timeout_ms);
+    const int64_t deadline_ns =
+      (timeout_ms >= 0) ? now_ns() + static_cast<int64_t>(timeout_ms) * 1000000 : 0;
+    int remaining_ms = timeout_ms;
+    while (true) {
+      int n = epoll_wait(ws_data->epoll_fd, ready_events, 64, remaining_ms);
+      if (n >= 0) {
+        break;
+      }
+      if (errno != EINTR) {
+        RMW_SET_ERROR_MSG("epoll_wait failed");
+        return RMW_RET_ERROR;
+      }
+      if (timeout_ms < 0) {
+        continue;  // Infinite wait: just re-block.
+      }
+      const int64_t rem_ns = deadline_ns - now_ns();
+      if (rem_ns <= 0) {
+        break;  // Deadline passed -> timeout; fall through to drain.
+      }
+      const int64_t rem_ms = rem_ns / 1000000;
+      remaining_ms = (rem_ms > 0) ? static_cast<int>(rem_ms) : 1;  // >=1ms while time remains
+    }
     // No EPOLL_CTL_DEL needed — fds stay registered across calls.
 
     // Drain again after epoll
