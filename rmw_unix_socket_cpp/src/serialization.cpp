@@ -5,8 +5,6 @@
 
 #include "serialization.hpp"
 
-#include <cstring>
-
 #include "fastcdr/Cdr.h"
 #include "fastcdr/FastBuffer.h"
 
@@ -68,7 +66,6 @@ ServiceCallbacks get_service_callbacks(
       result.service_name = srv_cb->service_name_;
       return result;
     }
-    rcutils_reset_error();
   }
   rcutils_reset_error();
 
@@ -91,7 +88,6 @@ ServiceCallbacks get_service_callbacks(
       result.service_name = srv_cb->service_name_;
       return result;
     }
-    rcutils_reset_error();
   }
   rcutils_reset_error();
   return result;

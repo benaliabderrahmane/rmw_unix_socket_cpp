@@ -179,7 +179,7 @@ struct UdsSubscription
 struct CachedClient
 {
   std::string socket_path;
-  uint8_t gid[16];
+  uint8_t gid[RMW_GID_STORAGE_SIZE];
 };
 
 // Service server data

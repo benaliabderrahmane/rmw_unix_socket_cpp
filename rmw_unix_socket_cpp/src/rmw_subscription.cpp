@@ -83,8 +83,6 @@ static void drain_subscription(rmw_uds::UdsSubscription * sub)
         sub->on_new_message_cb(sub->on_new_message_user_data, 1);
       }
     }
-
-    payload.clear();
   }
 }
 

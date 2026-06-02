@@ -52,7 +52,6 @@ static void drain_socket(
         queue.pop_front();
       }
     }
-    payload.clear();
   }
 }
 
