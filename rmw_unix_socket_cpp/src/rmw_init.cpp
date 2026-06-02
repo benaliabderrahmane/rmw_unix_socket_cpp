@@ -7,6 +7,7 @@
 #include "rcutils/strdup.h"
 #include "rmw/check_type_identifiers_match.h"
 #include "rmw/error_handling.h"
+#include "rmw/discovery_options.h"
 #include "rmw/init.h"
 #include "rmw/init_options.h"
 #include "rmw/rmw.h"
@@ -57,6 +58,15 @@ rmw_ret_t rmw_init_options_copy(
   if (ret != RMW_RET_OK) {
     return ret;
   }
+  // discovery_options.static_peers is heap-owned; deep-copy it so src and dst
+  // don't alias the same array and double-free in rmw_init_options_fini.
+  dst->discovery_options = rmw_get_zero_initialized_discovery_options();
+  ret = rmw_discovery_options_copy(
+    &src->discovery_options, &src->allocator, &dst->discovery_options);
+  if (ret != RMW_RET_OK) {
+    rmw_security_options_fini(&dst->security_options, &dst->allocator);
+    return ret;
+  }
   if (src->enclave) {
     dst->enclave = rcutils_strdup(src->enclave, src->allocator);
   }
@@ -71,6 +81,7 @@ rmw_ret_t rmw_init_options_fini(rmw_init_options_t * init_options)
     init_options->enclave = nullptr;
   }
   rmw_security_options_fini(&init_options->security_options, &init_options->allocator);
+  rmw_discovery_options_fini(&init_options->discovery_options);
   *init_options = rmw_get_zero_initialized_init_options();
   return RMW_RET_OK;
 }
@@ -145,6 +156,12 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   if (options->enclave) {
     context->options.enclave = rcutils_strdup(options->enclave, options->allocator);
   }
+  // discovery_options.static_peers is heap-owned; deep-copy it so context->options
+  // owns its own array rather than aliasing the caller's options (mirrors enclave).
+  context->options.discovery_options = rmw_get_zero_initialized_discovery_options();
+  rmw_discovery_options_copy(
+    &options->discovery_options, &options->allocator,
+    &context->options.discovery_options);
   context->actual_domain_id = domain_id;
 
   return RMW_RET_OK;
@@ -186,6 +203,7 @@ rmw_ret_t rmw_context_fini(rmw_context_t * context)
       context->options.enclave, context->options.allocator.state);
     context->options.enclave = nullptr;
   }
+  rmw_discovery_options_fini(&context->options.discovery_options);
 
   *context = rmw_get_zero_initialized_context();
   return RMW_RET_OK;
