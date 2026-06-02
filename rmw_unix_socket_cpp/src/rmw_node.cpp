@@ -78,6 +78,22 @@ rmw_node_t * rmw_create_node(
   node->namespace_ = rcutils_strdup(namespace_, context->options.allocator);
   node->context = context;
 
+  if (!node->name || !node->namespace_) {
+    rcutils_allocator_t alloc = context->options.allocator;
+    if (node->name) {
+      alloc.deallocate(const_cast<char *>(node->name), alloc.state);
+    }
+    if (node->namespace_) {
+      alloc.deallocate(const_cast<char *>(node->namespace_), alloc.state);
+    }
+    rmw_node_free(node);
+    rmw_uds::registry_remove(header, node_data->registry_index);
+    auto _r [[maybe_unused]] = rmw_destroy_guard_condition(graph_gc);
+    delete node_data;
+    RMW_SET_ERROR_MSG("failed to copy node name/namespace");
+    return nullptr;
+  }
+
   return node;
 }
 
