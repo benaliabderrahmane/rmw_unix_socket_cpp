@@ -216,12 +216,10 @@ rmw_ret_t rmw_publish(
   {
     std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
     if (current_gen != pub_data->cached_generation) {
-      // Re-read generation after the query so we don't miss updates that
-      // happened during the (lock-free) scan.
       auto subs = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
         nullptr, nullptr);
-      pub_data->cached_generation = rmw_uds::registry_generation(header);
+      pub_data->cached_generation = current_gen;
       pub_data->cached_subscriber_paths.clear();
       pub_data->cached_subscriber_paths.reserve(subs.size());
       for (const auto & s : subs) {
@@ -310,7 +308,7 @@ rmw_ret_t rmw_publish_serialized_message(
       auto subs = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
         nullptr, nullptr);
-      pub_data->cached_generation = rmw_uds::registry_generation(header);
+      pub_data->cached_generation = current_gen;
       pub_data->cached_subscriber_paths.clear();
       pub_data->cached_subscriber_paths.reserve(subs.size());
       for (const auto & s : subs) {

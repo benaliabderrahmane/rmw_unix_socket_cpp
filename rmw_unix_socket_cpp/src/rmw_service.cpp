@@ -259,7 +259,7 @@ rmw_ret_t rmw_send_response(
       auto clients = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_CLIENT, srv_data->service_name.c_str(),
         nullptr, nullptr);
-      srv_data->cached_generation = rmw_uds::registry_generation(header);
+      srv_data->cached_generation = current_gen;
       srv_data->cached_clients.clear();
       srv_data->cached_clients.reserve(clients.size());
       for (const auto & c : clients) {

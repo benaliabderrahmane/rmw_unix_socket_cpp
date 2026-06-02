@@ -198,7 +198,7 @@ rmw_ret_t rmw_send_request(
       auto services = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_SERVICE, cli_data->service_name.c_str(),
         nullptr, nullptr);
-      cli_data->cached_generation = rmw_uds::registry_generation(header);
+      cli_data->cached_generation = current_gen;
       cli_data->cached_service_path.clear();
       for (const auto & srv : services) {
         if (!srv.socket_path.empty()) {
