@@ -119,7 +119,11 @@ rmw_ret_t rmw_get_node_names_with_enclaves(
 
   rcutils_allocator_t alloc = rcutils_get_default_allocator();
   auto ret2 = rcutils_string_array_init(enclaves, node_names->size, &alloc);
-  if (ret2 != RCUTILS_RET_OK) {return RMW_RET_ERROR;}
+  if (ret2 != RCUTILS_RET_OK) {
+    auto _rn [[maybe_unused]] = rcutils_string_array_fini(node_names);
+    auto _rns [[maybe_unused]] = rcutils_string_array_fini(node_namespaces);
+    return RMW_RET_ERROR;
+  }
 
   for (size_t i = 0; i < node_names->size; ++i) {
     enclaves->data[i] = rcutils_strdup("/", alloc);
