@@ -370,13 +370,23 @@ rmw_ret_t rmw_take_sequence(
     auto msg = std::move(sub_data->message_queue.front());
     sub_data->message_queue.pop_front();
 
+    // Write successes contiguously at the *taken cursor (not the loop counter):
+    // a skipped failure must not leave an uninitialized hole that the consumer
+    // would read as a valid message, nor push a later success past size==*taken.
     if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
-      sub_data->callbacks, message_sequence->data[i]))
+      sub_data->callbacks, message_sequence->data[*taken]))
     {
+      // Dropped datagram already popped from the queue — log like the other
+      // take paths so the operator sees a truncated/mismatched payload. Throttle.
+      RMW_UDS_LOG_ERROR_THROTTLE(
+        1000,
+        "rmw_take_sequence: CDR deserialization failed on topic '%s' (payload=%zu bytes) "
+        "— likely truncated or type mismatch with publisher",
+        sub_data->topic_name.c_str(), msg.payload.size());
       continue;
     }
 
-    auto & info = message_info_sequence->data[i];
+    auto & info = message_info_sequence->data[*taken];
     info.source_timestamp = msg.header.source_timestamp_ns;
     info.received_timestamp = msg.received_timestamp_ns;
     info.publication_sequence_number = static_cast<uint64_t>(msg.header.sequence_number);
