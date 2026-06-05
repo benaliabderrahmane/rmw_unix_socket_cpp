@@ -129,6 +129,54 @@ TEST_F(RegistryTest, QueryFiltersByType)
   EXPECT_EQ(2u, all.size());
 }
 
+// Pins the invariant that the type pre-filter (which short-circuits on the
+// pre-snapshot state) must still return exactly the entry whose validated
+// type matches — with same-topic decoys of other types present. Guards
+// against a future edit dropping the authoritative post-snapshot re-check.
+TEST_F(RegistryTest, QueryTypeFilterExcludesOtherTypesSameTopic)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+
+  rmw_uds::RegistryEntry pub_entry;
+  std::memset(&pub_entry, 0, sizeof(pub_entry));
+  pub_entry.type = rmw_uds::ENTRY_PUBLISHER;
+  pub_entry.pid = getpid();
+  std::strncpy(pub_entry.topic_name, "/shared", sizeof(pub_entry.topic_name) - 1);
+
+  rmw_uds::RegistryEntry sub_entry;
+  std::memset(&sub_entry, 0, sizeof(sub_entry));
+  sub_entry.type = rmw_uds::ENTRY_SUBSCRIPTION;
+  sub_entry.pid = getpid();
+  std::strncpy(sub_entry.topic_name, "/shared", sizeof(sub_entry.topic_name) - 1);
+
+  rmw_uds::RegistryEntry srv_entry;
+  std::memset(&srv_entry, 0, sizeof(srv_entry));
+  srv_entry.type = rmw_uds::ENTRY_SERVICE;
+  srv_entry.pid = getpid();
+  std::strncpy(srv_entry.topic_name, "/shared", sizeof(srv_entry.topic_name) - 1);
+
+  int32_t pub_idx = rmw_uds::registry_add(header, pub_entry);
+  int32_t sub_idx = rmw_uds::registry_add(header, sub_entry);
+  int32_t srv_idx = rmw_uds::registry_add(header, srv_entry);
+  ASSERT_GE(pub_idx, 0);
+  ASSERT_GE(sub_idx, 0);
+  ASSERT_GE(srv_idx, 0);
+
+  auto pubs = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_PUBLISHER, "/shared", nullptr, nullptr);
+  auto subs = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_SUBSCRIPTION, "/shared", nullptr, nullptr);
+
+  rmw_uds::registry_remove(header, pub_idx);
+  rmw_uds::registry_remove(header, sub_idx);
+  rmw_uds::registry_remove(header, srv_idx);
+
+  ASSERT_EQ(1u, pubs.size());
+  EXPECT_EQ(rmw_uds::ENTRY_PUBLISHER, pubs[0].type);
+  ASSERT_EQ(1u, subs.size());
+  EXPECT_EQ(rmw_uds::ENTRY_SUBSCRIPTION, subs[0].type);
+}
+
 TEST_F(RegistryTest, MultipleEntriesSameType)
 {
   auto * header = rmw_uds::registry_header(registry_ptr);

@@ -355,6 +355,13 @@ void registry_cleanup_stale(RegistryHeader * header)
   uint32_t max = header->max_entries;
 
   for (uint32_t i = 0; i < max; ++i) {
+    // Fast-skip empty slots without snapshotting, mirroring registry_query.
+    // snapshot_slot would also bail on EMPTY, but only after loading seq; this
+    // drops that load for the empty slots in the 32768-slot scan. A slot that
+    // turns non-empty just after the skip is reclaimed on the next sweep.
+    if (slots[i].state.load(std::memory_order_acquire) == ENTRY_EMPTY) {
+      continue;
+    }
     RegistryEntrySlot snap;
     uint32_t snap_seq;
     if (!snapshot_slot(&slots[i], &snap, &snap_seq)) {
@@ -432,6 +439,14 @@ std::vector<RegistryQueryResult> registry_query(
     // Fast pre-check: skip clearly-empty slots without snapshotting.
     uint8_t pre_state = slots[i].state.load(std::memory_order_acquire);
     if (pre_state == ENTRY_EMPTY) {
+      continue;
+    }
+    // Type pre-filter: skip the full snapshot for slots whose current type
+    // can't match. pre_state is only an early-out — a slot rewritten to a
+    // different type between this load and the snapshot is still rejected by
+    // the authoritative post-snapshot type re-check below, so results stay
+    // seqlock-consistent. (RESERVED/EMPTY never equal a real type_filter.)
+    if (type_filter != ENTRY_EMPTY && pre_state != static_cast<uint8_t>(type_filter)) {
       continue;
     }
 
