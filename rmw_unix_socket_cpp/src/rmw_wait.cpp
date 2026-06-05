@@ -6,7 +6,10 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <iterator>
 #include <limits>
+#include <memory>
+#include <set>
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -176,26 +179,42 @@ rmw_ret_t rmw_wait(
       // is what keeps each pub pointer alive while we dereference it.
       std::lock_guard<std::mutex> tl_lock(ctx->transient_local_pubs_mutex);
       for (auto * pub : ctx->transient_local_pubs) {
-        std::vector<std::string> sub_paths;
+        std::shared_ptr<const std::vector<std::string>> sub_paths;
+        bool refreshed = false;
         {
           std::lock_guard<std::mutex> sc_lock(pub->sub_cache_mutex);
           if (rmw_uds::registry_generation(header) != pub->cached_generation) {
             auto subs = rmw_uds::registry_query(
               header, rmw_uds::ENTRY_SUBSCRIPTION,
               pub->topic_name.c_str(), nullptr, nullptr);
-            pub->cached_generation = rmw_uds::registry_generation(header);
-            pub->cached_subscriber_paths.clear();
-            pub->cached_subscriber_paths.reserve(subs.size());
+            auto fresh = std::make_shared<std::vector<std::string>>();
+            fresh->reserve(subs.size());
             for (const auto & s : subs) {
               if (!s.socket_path.empty()) {
-                pub->cached_subscriber_paths.push_back(s.socket_path);
+                fresh->push_back(s.socket_path);
               }
             }
+            pub->cached_generation = rmw_uds::registry_generation(header);
+            pub->cached_subscriber_paths = std::move(fresh);
+            refreshed = true;
           }
           sub_paths = pub->cached_subscriber_paths;
         }
         std::lock_guard<std::mutex> c_lock(pub->cache_mutex);
-        for (const auto & path : sub_paths) {
+        // On a graph change, drop known subscribers that are no longer present.
+        if (refreshed && sub_paths) {
+          std::set<std::string> current(sub_paths->begin(), sub_paths->end());
+          for (auto it = pub->known_subscriber_paths.begin();
+            it != pub->known_subscriber_paths.end(); )
+          {
+            it = (current.count(*it) == 0) ?
+              pub->known_subscriber_paths.erase(it) : std::next(it);
+          }
+        }
+        if (!sub_paths) {
+          continue;
+        }
+        for (const auto & path : *sub_paths) {
           if (pub->known_subscriber_paths.count(path) != 0) {
             continue;
           }

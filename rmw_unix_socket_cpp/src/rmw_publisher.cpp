@@ -213,23 +213,26 @@ rmw_ret_t rmw_publish(
   auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
   uint64_t current_gen = rmw_uds::registry_generation(header);
 
-  std::vector<std::string> sub_paths;
+  std::shared_ptr<const std::vector<std::string>> sub_paths;
+  bool refreshed = false;
   {
     std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
     if (current_gen != pub_data->cached_generation) {
       auto subs = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
         nullptr, nullptr);
-      pub_data->cached_generation = current_gen;
-      pub_data->cached_subscriber_paths.clear();
-      pub_data->cached_subscriber_paths.reserve(subs.size());
+      auto fresh = std::make_shared<std::vector<std::string>>();
+      fresh->reserve(subs.size());
       for (const auto & s : subs) {
         if (!s.socket_path.empty()) {
-          pub_data->cached_subscriber_paths.push_back(s.socket_path);
+          fresh->push_back(s.socket_path);
         }
       }
+      pub_data->cached_generation = current_gen;
+      pub_data->cached_subscriber_paths = std::move(fresh);
+      refreshed = true;
     }
-    sub_paths = pub_data->cached_subscriber_paths;  // copy under lock
+    sub_paths = pub_data->cached_subscriber_paths;  // refcount copy under lock
   }
 
   // TRANSIENT_LOCAL: cache message and replay to late-joining subscribers
@@ -244,14 +247,28 @@ rmw_ret_t rmw_publish(
       pub_data->message_cache.pop_front();
     }
 
-    for (const auto & path : sub_paths) {
-      if (pub_data->known_subscriber_paths.count(path) == 0) {
-        pub_data->known_subscriber_paths.insert(path);
-        for (size_t i = 0; i + 1 < pub_data->message_cache.size(); ++i) {
-          const auto & cm = pub_data->message_cache[i];
-          rmw_uds::send_to(
-            pub_data->context->send_socket_fd,
-            path, cm.header, cm.payload.data(), cm.payload.size());
+    // On a graph change, drop known subscribers that are no longer present so
+    // the set tracks only live subs (a reappearing sub gets a fresh path).
+    if (refreshed) {
+      std::set<std::string> current(sub_paths->begin(), sub_paths->end());
+      for (auto it = pub_data->known_subscriber_paths.begin();
+        it != pub_data->known_subscriber_paths.end(); )
+      {
+        it = (current.count(*it) == 0) ?
+          pub_data->known_subscriber_paths.erase(it) : std::next(it);
+      }
+    }
+
+    if (sub_paths) {
+      for (const auto & path : *sub_paths) {
+        if (pub_data->known_subscriber_paths.count(path) == 0) {
+          pub_data->known_subscriber_paths.insert(path);
+          for (size_t i = 0; i + 1 < pub_data->message_cache.size(); ++i) {
+            const auto & cm = pub_data->message_cache[i];
+            rmw_uds::send_to(
+              pub_data->context->send_socket_fd,
+              path, cm.header, cm.payload.data(), cm.payload.size());
+          }
         }
       }
     }
@@ -259,22 +276,26 @@ rmw_ret_t rmw_publish(
     // Send the current message, read from the cached copy since payload was
     // moved. Trimming never disturbs back(), so it is the message just pushed.
     const auto & current = pub_data->message_cache.back();
-    for (const auto & path : sub_paths) {
-      rmw_uds::send_to(
-        pub_data->context->send_socket_fd,
-        path, current.header, current.payload.data(), current.payload.size());
+    if (sub_paths) {
+      for (const auto & path : *sub_paths) {
+        rmw_uds::send_to(
+          pub_data->context->send_socket_fd,
+          path, current.header, current.payload.data(), current.payload.size());
+      }
     }
     return RMW_RET_OK;
   }
 
   // Surface EMSGSIZE; soft drops (EAGAIN/ENOENT) are logged in send_to.
   bool config_error = false;
-  for (const auto & path : sub_paths) {
-    if (rmw_uds::send_to(
-        pub_data->context->send_socket_fd,
-        path, hdr, payload.data(), payload.size()) == rmw_uds::SendResult::ConfigError)
-    {
-      config_error = true;
+  if (sub_paths) {
+    for (const auto & path : *sub_paths) {
+      if (rmw_uds::send_to(
+          pub_data->context->send_socket_fd,
+          path, hdr, payload.data(), payload.size()) == rmw_uds::SendResult::ConfigError)
+      {
+        config_error = true;
+      }
     }
   }
   if (config_error) {
@@ -312,33 +333,36 @@ rmw_ret_t rmw_publish_serialized_message(
   // Reuse the cached subscriber list (refresh only on graph change)
   auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
   uint64_t current_gen = rmw_uds::registry_generation(header);
-  std::vector<std::string> sub_paths;
+  std::shared_ptr<const std::vector<std::string>> sub_paths;
   {
     std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
     if (current_gen != pub_data->cached_generation) {
       auto subs = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
         nullptr, nullptr);
-      pub_data->cached_generation = current_gen;
-      pub_data->cached_subscriber_paths.clear();
-      pub_data->cached_subscriber_paths.reserve(subs.size());
+      auto fresh = std::make_shared<std::vector<std::string>>();
+      fresh->reserve(subs.size());
       for (const auto & s : subs) {
         if (!s.socket_path.empty()) {
-          pub_data->cached_subscriber_paths.push_back(s.socket_path);
+          fresh->push_back(s.socket_path);
         }
       }
+      pub_data->cached_generation = current_gen;
+      pub_data->cached_subscriber_paths = std::move(fresh);
     }
     sub_paths = pub_data->cached_subscriber_paths;
   }
 
   bool config_error = false;
-  for (const auto & path : sub_paths) {
-    if (rmw_uds::send_to(
-        pub_data->context->send_socket_fd,
-        path, hdr, serialized_message->buffer,
-        serialized_message->buffer_length) == rmw_uds::SendResult::ConfigError)
-    {
-      config_error = true;
+  if (sub_paths) {
+    for (const auto & path : *sub_paths) {
+      if (rmw_uds::send_to(
+          pub_data->context->send_socket_fd,
+          path, hdr, serialized_message->buffer,
+          serialized_message->buffer_length) == rmw_uds::SendResult::ConfigError)
+      {
+        config_error = true;
+      }
     }
   }
   if (config_error) {
