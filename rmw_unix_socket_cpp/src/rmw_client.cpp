@@ -206,6 +206,7 @@ rmw_ret_t rmw_send_request(
           break;
         }
       }
+      cli_data->cached_is_available = !services.empty();
     }
     service_path = cli_data->cached_service_path;
   }
@@ -338,10 +339,24 @@ rmw_ret_t rmw_service_server_is_available(
   auto * cli_data = static_cast<rmw_uds::UdsClient *>(client->data);
   auto * header = rmw_uds::registry_header(cli_data->context->registry_ptr);
 
-  auto services = rmw_uds::registry_query(
-    header, rmw_uds::ENTRY_SERVICE, cli_data->service_name.c_str(), nullptr, nullptr);
-
-  *is_available = !services.empty();
+  // PERFORMANCE: only re-query the registry on graph generation change;
+  // shares the generation/cache with rmw_send_request (one scan per change).
+  uint64_t current_gen = rmw_uds::registry_generation(header);
+  std::lock_guard<std::mutex> lock(cli_data->svc_cache_mutex);
+  if (current_gen != cli_data->cached_generation) {
+    auto services = rmw_uds::registry_query(
+      header, rmw_uds::ENTRY_SERVICE, cli_data->service_name.c_str(), nullptr, nullptr);
+    cli_data->cached_generation = current_gen;
+    cli_data->cached_service_path.clear();
+    for (const auto & srv : services) {
+      if (!srv.socket_path.empty()) {
+        cli_data->cached_service_path = srv.socket_path;
+        break;
+      }
+    }
+    cli_data->cached_is_available = !services.empty();
+  }
+  *is_available = cli_data->cached_is_available;
   return RMW_RET_OK;
 }
 
