@@ -234,6 +234,7 @@ struct UdsClient
   std::mutex svc_cache_mutex;
   uint64_t cached_generation = 0;
   std::string cached_service_path;
+  bool cached_is_available = false;
 
   // Callback support
   std::mutex callback_mutex;

@@ -65,6 +65,12 @@ TEST_F(ServiceClientTest, ServiceServerIsAvailable)
 
   EXPECT_EQ(RMW_RET_OK, rmw_service_server_is_available(node, cli, &available));
   EXPECT_TRUE(available);
+
+  // Same generation (no graph change): the cached short-circuit must return
+  // the cached value, not a stale default.
+  available = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_service_server_is_available(node, cli, &available));
+  EXPECT_TRUE(available);
 }
 
 TEST_F(ServiceClientTest, RequestResponseRoundTrip)
