@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 #include <dirent.h>
 #include <sys/socket.h>
@@ -91,7 +92,7 @@ int create_send_socket()
   return fd;
 }
 
-bool send_to(
+SendResult send_to(
   int send_fd,
   const std::string & dest_path,
   const WireHeader & header,
@@ -118,7 +119,7 @@ bool send_to(
 
   ssize_t sent = sendmsg(send_fd, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
   if (sent >= 0) {
-    return true;
+    return SendResult::Ok;
   }
 
   // Classify the failure. Hot path — every category is throttled so a
@@ -127,6 +128,7 @@ bool send_to(
   // to identify the offending subscriber from the message alone.
   const int err = errno;
   const size_t total = sizeof(WireHeader) + payload_size;
+  SendResult result = SendResult::SoftDrop;
   switch (err) {
     case EMSGSIZE:
       // Message exceeds the kernel's per-datagram cap (typically the send
@@ -137,6 +139,7 @@ bool send_to(
         "UDS send to '%s' failed: message too big (%zu bytes incl. header). "
         "Raise net.core.{wmem_max,rmem_max} or split the message.",
         dest_path.c_str(), total);
+      result = SendResult::ConfigError;
       break;
     case EAGAIN:
 #if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
@@ -169,7 +172,7 @@ bool send_to(
         dest_path.c_str(), std::strerror(err), err, total);
       break;
   }
-  return false;
+  return result;
 }
 
 bool recv_from(
@@ -316,6 +319,43 @@ void cleanup_orphan_socket_files(size_t domain_id)
   }
 
   closedir(dir);
+}
+
+void warn_if_sysctl_buffers_undersized()
+{
+  static std::once_flag once;
+  std::call_once(once, []() {
+      auto read_proc_int = [](const char * path) -> long {
+          FILE * f = std::fopen(path, "r");
+          if (!f) {
+            return -1;
+          }
+          long v = -1;
+          if (std::fscanf(f, "%ld", &v) != 1) {
+            v = -1;
+          }
+          std::fclose(f);
+          return v;
+        };
+
+      const long wmax = read_proc_int("/proc/sys/net/core/wmem_max");
+      const long rmax = read_proc_int("/proc/sys/net/core/rmem_max");
+
+      if (wmax > 0 && wmax < SEND_BUF_SIZE) {
+        RMW_UDS_LOG_WARN(
+          "net.core.wmem_max=%ld < requested SO_SNDBUF=%d. Large outbound "
+          "datagrams will fail with EMSGSIZE. Run: sudo sysctl -w "
+          "net.core.wmem_max=%d (or larger) and persist in /etc/sysctl.d/.",
+          wmax, SEND_BUF_SIZE, SEND_BUF_SIZE);
+      }
+      if (rmax > 0 && rmax < RECV_BUF_SIZE) {
+        RMW_UDS_LOG_WARN(
+          "net.core.rmem_max=%ld < requested SO_RCVBUF=%d. Subscribers may "
+          "drop large datagrams. Run: sudo sysctl -w net.core.rmem_max=%d "
+          "(or larger) and persist in /etc/sysctl.d/.",
+          rmax, RECV_BUF_SIZE, RECV_BUF_SIZE);
+      }
+    });
 }
 
 }  // namespace rmw_uds

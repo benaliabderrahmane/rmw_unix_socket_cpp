@@ -1,8 +1,12 @@
 #include "test_base.hpp"
 
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <chrono>
+
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "test_msgs/msg/basic_types.hpp"
 #include "test_msgs/srv/basic_types.hpp"
@@ -10,6 +14,8 @@
 #include "rmw/qos_profiles.h"
 #include "rosidl_typesupport_cpp/message_type_support.hpp"
 #include "rosidl_typesupport_cpp/service_type_support.hpp"
+
+#include "types.hpp"
 
 class QosTest : public RmwUdsNodeTest
 {
@@ -129,6 +135,78 @@ TEST_F(QosTest, TransientLocalCacheDepthEnforced)
   ASSERT_GE(received.size(), 3u);
   // The last received should be 6 (current message)
   EXPECT_EQ(6, received.back());
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+// --- Transport error propagation ---
+
+TEST_F(QosTest, PublishReturnsErrorOnEMSGSIZE)
+{
+  // Shrink SO_SNDBUF so any send hits EMSGSIZE — publish must return ERROR.
+  auto * ctx_impl = reinterpret_cast<rmw_uds::UdsContext *>(context.impl);
+  int small_buf = 2048;
+  ASSERT_EQ(
+    0,
+    setsockopt(
+      ctx_impl->send_socket_fd, SOL_SOCKET, SO_SNDBUF,
+      &small_buf, sizeof(small_buf)));
+
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_VOLATILE);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/emsgsize", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/emsgsize", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  // 64 KB — well above SOCK_MIN_SNDBUF the kernel will clamp us to.
+  constexpr size_t big_size = 64 * 1024;
+  rmw_serialized_message_t serialized;
+  serialized.buffer_capacity = big_size;
+  serialized.buffer_length = big_size;
+  serialized.buffer = static_cast<uint8_t *>(std::malloc(big_size));
+  ASSERT_NE(nullptr, serialized.buffer);
+  std::memset(serialized.buffer, 0x42, big_size);
+  serialized.allocator = rcutils_get_default_allocator();
+
+  EXPECT_EQ(RMW_RET_ERROR, rmw_publish_serialized_message(pub, &serialized, nullptr));
+
+  std::free(serialized.buffer);
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, PublishStillReturnsOkOnSoftDropPeerGone)
+{
+  // ENOENT on a vanished peer must stay RET_OK — only EMSGSIZE escalates.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_VOLATILE);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/peer_gone", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/peer_gone", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  // Warm pub's path cache, then unlink the sub's socket → next sendmsg = ENOENT.
+  test_msgs::msg::BasicTypes m;
+  m.int32_value = 1;
+  ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
+
+  auto * sub_impl = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+  unlink(sub_impl->socket_path.c_str());
+
+  m.int32_value = 2;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
 
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);

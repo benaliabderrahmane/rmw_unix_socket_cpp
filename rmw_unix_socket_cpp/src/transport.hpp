@@ -22,9 +22,11 @@ int create_bound_socket(const std::string & path);
 // Returns fd >= 0 on success, -1 on failure.
 int create_send_socket();
 
+// ConfigError = EMSGSIZE (hard, surface to caller); SoftDrop = transient.
+enum class SendResult { Ok, SoftDrop, ConfigError };
+
 // Send a datagram (header + payload) to the given socket path.
-// Returns true on success.
-bool send_to(
+SendResult send_to(
   int send_fd,
   const std::string & dest_path,
   const WireHeader & header,
@@ -48,6 +50,9 @@ void close_socket(int fd, const std::string & path);
 // in the filename) is no longer alive in our PID namespace, and unlink them.
 // Safe to call at startup to clean up after ungraceful shutdowns.
 void cleanup_orphan_socket_files(size_t domain_id);
+
+// One-shot per-process: warn if net.core.{w,r}mem_max < SO_{SND,RCV}BUF.
+void warn_if_sysctl_buffers_undersized();
 
 }  // namespace rmw_uds
 
