@@ -249,15 +249,19 @@ static int32_t try_add_once(RegistryHeader * header, const RegistryEntry & entry
       // Payload is committed (seq even). Publish the real type with release
       // ordering so any reader that now sees it also sees the payload.
       slots[i].state.store(static_cast<uint8_t>(entry.type), std::memory_order_release);
-      header->generation.fetch_add(1, std::memory_order_acq_rel);
-      // Bump the high-water bound to max(current, i+1). Relaxed is sound: the
-      // per-slot state release/acquire already orders payload visibility; this
-      // only widens which slots query/cleanup bother to scan.
+      // Widen the high-water bound to max(current, i+1) BEFORE bumping the
+      // generation. Readers gate their re-query on a generation acquire-load and
+      // then read high_water; if this store were sequenced AFTER the release
+      // generation bump, a reader could observe the new generation but a stale
+      // high_water, scan [0, stale) and miss this just-added slot. Done first,
+      // the relaxed store is sequenced-before the release fetch_add, so any
+      // reader that synchronizes on the generation also observes high_water.
       uint32_t want = i + 1;
       uint32_t cur = header->high_water_slot.load(std::memory_order_relaxed);
       while (cur < want &&
              !header->high_water_slot.compare_exchange_weak(
                cur, want, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+      header->generation.fetch_add(1, std::memory_order_acq_rel);
       return static_cast<int32_t>(i);
     }
   }
