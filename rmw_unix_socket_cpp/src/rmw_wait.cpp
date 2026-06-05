@@ -180,7 +180,6 @@ rmw_ret_t rmw_wait(
       std::lock_guard<std::mutex> tl_lock(ctx->transient_local_pubs_mutex);
       for (auto * pub : ctx->transient_local_pubs) {
         std::shared_ptr<const std::vector<std::string>> sub_paths;
-        bool refreshed = false;
         {
           std::lock_guard<std::mutex> sc_lock(pub->sub_cache_mutex);
           if (rmw_uds::registry_generation(header) != pub->cached_generation) {
@@ -196,21 +195,26 @@ rmw_ret_t rmw_wait(
             }
             pub->cached_generation = rmw_uds::registry_generation(header);
             pub->cached_subscriber_paths = std::move(fresh);
-            refreshed = true;
+
+            // Prune known subscribers no longer present, against the freshly-
+            // built canonical list while STILL holding sub_cache_mutex (nested
+            // lock order sub_cache_mutex -> cache_mutex), so a concurrent
+            // refresh (e.g. from rmw_publish) cannot make the pruning set stale
+            // and erase a still-live late-joiner.
+            std::lock_guard<std::mutex> prune_lock(pub->cache_mutex);
+            std::set<std::string> current(
+              pub->cached_subscriber_paths->begin(),
+              pub->cached_subscriber_paths->end());
+            for (auto it = pub->known_subscriber_paths.begin();
+              it != pub->known_subscriber_paths.end(); )
+            {
+              it = (current.count(*it) == 0) ?
+                pub->known_subscriber_paths.erase(it) : std::next(it);
+            }
           }
           sub_paths = pub->cached_subscriber_paths;
         }
         std::lock_guard<std::mutex> c_lock(pub->cache_mutex);
-        // On a graph change, drop known subscribers that are no longer present.
-        if (refreshed && sub_paths) {
-          std::set<std::string> current(sub_paths->begin(), sub_paths->end());
-          for (auto it = pub->known_subscriber_paths.begin();
-            it != pub->known_subscriber_paths.end(); )
-          {
-            it = (current.count(*it) == 0) ?
-              pub->known_subscriber_paths.erase(it) : std::next(it);
-          }
-        }
         if (!sub_paths) {
           continue;
         }
