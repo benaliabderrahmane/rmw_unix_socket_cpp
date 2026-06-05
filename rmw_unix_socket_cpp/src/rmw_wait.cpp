@@ -3,6 +3,7 @@
 #include "transport.hpp"
 #include "types.hpp"
 
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -51,7 +52,6 @@ static void drain_socket(
         queue.pop_front();
       }
     }
-    payload.clear();
   }
 }
 
@@ -168,8 +168,8 @@ rmw_ret_t rmw_wait(
   if (ctx && ctx->registry_ptr) {
     auto * header = rmw_uds::registry_header(ctx->registry_ptr);
     uint64_t gen = rmw_uds::registry_generation(header);
-    if (gen != ctx->last_registry_generation) {
-      ctx->last_registry_generation = gen;
+    if (gen != ctx->last_registry_generation.load(std::memory_order_relaxed)) {
+      ctx->last_registry_generation.store(gen, std::memory_order_relaxed);
 
       // TRANSIENT_LOCAL late-joiner replay. Lock held across the loop —
       // rmw_destroy_publisher takes the same mutex then deletes, so this
@@ -223,8 +223,63 @@ rmw_ret_t rmw_wait(
     }
   }
 
+  // Arm every entity fd with epoll on every wait. EPOLL_CTL_ADD is idempotent
+  // here: a still-live fd returns EEXIST (already armed), while a fd number
+  // reused after its previous owner was closed gets freshly armed. The kernel
+  // auto-removes closed fds, so no EPOLL_CTL_DEL is needed.
+  {
+    struct epoll_event ev;
+    std::memset(&ev, 0, sizeof(ev));
+    auto register_fd = [&](int fd) {
+        if (fd < 0) {return;}
+        ev.events = EPOLLIN;
+        ev.data.fd = fd;
+        // EEXIST means the fd is already armed -> treat as success.
+        if (epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0 &&
+          errno != EEXIST)
+        {
+          // Other errors are ignored, as before.
+        }
+      };
+
+    if (subscriptions) {
+      for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
+        if (!subscriptions->subscribers[i]) {continue;}
+        auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
+        register_fd(sub->socket_fd);
+      }
+    }
+    if (services) {
+      for (size_t i = 0; i < services->service_count; ++i) {
+        if (!services->services[i]) {continue;}
+        auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
+        register_fd(srv->socket_fd);
+      }
+    }
+    if (clients) {
+      for (size_t i = 0; i < clients->client_count; ++i) {
+        if (!clients->clients[i]) {continue;}
+        auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
+        register_fd(cli->socket_fd);
+      }
+    }
+    if (guard_conditions) {
+      for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
+        if (!guard_conditions->guard_conditions[i]) {continue;}
+        auto * gc = static_cast<rmw_uds::UdsGuardCondition *>(
+          guard_conditions->guard_conditions[i]);
+        register_fd(gc->eventfd_fd);
+      }
+    }
+  }
+
   // 3. Check if anything is already ready
   bool something_ready = false;
+
+  // Per-GC readiness from the step-3 consuming read, carried to step 5. One
+  // read drains the whole eventfd counter, so we never write it back (a
+  // non-atomic read-back would race a concurrent trigger and inflate it).
+  std::vector<bool> gc_triggered;
 
   if (subscriptions) {
     for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
@@ -260,6 +315,7 @@ rmw_ret_t rmw_wait(
   }
 
   if (guard_conditions) {
+    gc_triggered.assign(guard_conditions->guard_condition_count, false);
     for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
       if (!guard_conditions->guard_conditions[i]) {continue;}
       auto * gc = static_cast<rmw_uds::UdsGuardCondition *>(
@@ -268,61 +324,13 @@ rmw_ret_t rmw_wait(
       ssize_t r = read(gc->eventfd_fd, &val, sizeof(val));
       if (r == static_cast<ssize_t>(sizeof(val))) {
         something_ready = true;
-        // Write it back so it stays triggered for the ready check below
-        write(gc->eventfd_fd, &val, sizeof(val));
+        gc_triggered[i] = true;
       }
     }
   }
 
   // 4. If nothing ready, block with epoll
   if (!something_ready) {
-    // PERFORMANCE: only EPOLL_CTL_ADD fds we haven't registered before.
-    // Closed fds are auto-removed by the kernel, so we never need DEL.
-    struct epoll_event ev;
-    std::memset(&ev, 0, sizeof(ev));
-
-    auto register_fd = [&](int fd) {
-        if (fd < 0) {return;}
-        if (ws_data->registered_fds.find(fd) != ws_data->registered_fds.end()) {
-          return;
-        }
-        ev.events = EPOLLIN;
-        ev.data.fd = fd;
-        if (epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_ADD, fd, &ev) == 0) {
-          ws_data->registered_fds.insert(fd);
-        }
-      };
-
-    if (subscriptions) {
-      for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
-        if (!subscriptions->subscribers[i]) {continue;}
-        auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
-        register_fd(sub->socket_fd);
-      }
-    }
-    if (services) {
-      for (size_t i = 0; i < services->service_count; ++i) {
-        if (!services->services[i]) {continue;}
-        auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
-        register_fd(srv->socket_fd);
-      }
-    }
-    if (clients) {
-      for (size_t i = 0; i < clients->client_count; ++i) {
-        if (!clients->clients[i]) {continue;}
-        auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
-        register_fd(cli->socket_fd);
-      }
-    }
-    if (guard_conditions) {
-      for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
-        if (!guard_conditions->guard_conditions[i]) {continue;}
-        auto * gc = static_cast<rmw_uds::UdsGuardCondition *>(
-          guard_conditions->guard_conditions[i]);
-        register_fd(gc->eventfd_fd);
-      }
-    }
-
     // Compute timeout. -1 means block forever (epoll_wait sentinel).
     int timeout_ms = -1;
     if (wait_timeout) {
@@ -339,9 +347,31 @@ rmw_ret_t rmw_wait(
       }
     }
 
-    // Block
+    // Block, retrying on EINTR. A finite timeout uses a steady_clock deadline
+    // so a signal interruption neither returns TIMEOUT early nor busy-loops.
     struct epoll_event ready_events[64];
-    epoll_wait(ws_data->epoll_fd, ready_events, 64, timeout_ms);
+    const int64_t deadline_ns =
+      (timeout_ms >= 0) ? now_ns() + static_cast<int64_t>(timeout_ms) * 1000000 : 0;
+    int remaining_ms = timeout_ms;
+    while (true) {
+      int n = epoll_wait(ws_data->epoll_fd, ready_events, 64, remaining_ms);
+      if (n >= 0) {
+        break;
+      }
+      if (errno != EINTR) {
+        RMW_SET_ERROR_MSG("epoll_wait failed");
+        return RMW_RET_ERROR;
+      }
+      if (timeout_ms < 0) {
+        continue;  // Infinite wait: just re-block.
+      }
+      const int64_t rem_ns = deadline_ns - now_ns();
+      if (rem_ns <= 0) {
+        break;  // Deadline passed -> timeout; fall through to drain.
+      }
+      const int64_t rem_ms = rem_ns / 1000000;
+      remaining_ms = (rem_ms > 0) ? static_cast<int>(rem_ms) : 1;  // >=1ms while time remains
+    }
     // No EPOLL_CTL_DEL needed — fds stay registered across calls.
 
     // Drain again after epoll
@@ -391,8 +421,10 @@ rmw_ret_t rmw_wait(
       auto * gc = static_cast<rmw_uds::UdsGuardCondition *>(
         guard_conditions->guard_conditions[i]);
       uint64_t val;
+      // Consume a trigger that landed during the epoll block; combine with the
+      // step-3 read so a GC seen ready then stays reported without a read-back.
       ssize_t r = read(gc->eventfd_fd, &val, sizeof(val));
-      if (r == static_cast<ssize_t>(sizeof(val))) {
+      if (r == static_cast<ssize_t>(sizeof(val)) || gc_triggered[i]) {
         any_ready = true;
       } else {
         guard_conditions->guard_conditions[i] = nullptr;

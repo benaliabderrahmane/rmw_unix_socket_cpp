@@ -78,6 +78,22 @@ rmw_node_t * rmw_create_node(
   node->namespace_ = rcutils_strdup(namespace_, context->options.allocator);
   node->context = context;
 
+  if (!node->name || !node->namespace_) {
+    rcutils_allocator_t alloc = context->options.allocator;
+    if (node->name) {
+      alloc.deallocate(const_cast<char *>(node->name), alloc.state);
+    }
+    if (node->namespace_) {
+      alloc.deallocate(const_cast<char *>(node->namespace_), alloc.state);
+    }
+    rmw_node_free(node);
+    rmw_uds::registry_remove(header, node_data->registry_index);
+    auto _r [[maybe_unused]] = rmw_destroy_guard_condition(graph_gc);
+    delete node_data;
+    RMW_SET_ERROR_MSG("failed to copy node name/namespace");
+    return nullptr;
+  }
+
   return node;
 }
 
@@ -103,7 +119,8 @@ rmw_ret_t rmw_destroy_node(rmw_node_t * node)
     delete node_data;
   }
 
-  rcutils_allocator_t alloc = node->context->options.allocator;
+  rcutils_allocator_t alloc = node->context ?
+    node->context->options.allocator : rcutils_get_default_allocator();
   if (node->name) {
     alloc.deallocate(const_cast<char *>(node->name), alloc.state);
   }
@@ -118,6 +135,9 @@ rmw_ret_t rmw_destroy_node(rmw_node_t * node)
 rmw_ret_t rmw_node_assert_liveliness(const rmw_node_t * node)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   return RMW_RET_OK;
 }
 

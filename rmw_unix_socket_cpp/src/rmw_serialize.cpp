@@ -1,4 +1,3 @@
-#include "identifier.hpp"
 #include "serialization.hpp"
 
 #include <cstring>

@@ -1,4 +1,5 @@
 #include "identifier.hpp"
+#include "logging.hpp"
 #include "registry.hpp"
 #include "serialization.hpp"
 #include "transport.hpp"
@@ -132,6 +133,9 @@ rmw_ret_t rmw_destroy_service(rmw_node_t * node, rmw_service_t * service)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
   if (srv_data) {
@@ -161,6 +165,9 @@ rmw_ret_t rmw_take_request(
   RMW_CHECK_ARGUMENT_FOR_NULL(request_header, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(ros_request, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(taken, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   *taken = false;
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
@@ -180,29 +187,35 @@ rmw_ret_t rmw_take_request(
   }
 
   std::lock_guard<std::mutex> lock(srv_data->queue_mutex);
-  if (srv_data->request_queue.empty()) {
-    std::memset(request_header, 0, sizeof(rmw_service_info_t));
+  // Drop-garbage-and-continue: one corrupt datagram must not destroy a
+  // legitimate in-flight request and wedge the client into a timeout.
+  while (!srv_data->request_queue.empty()) {
+    auto msg = std::move(srv_data->request_queue.front());
+    srv_data->request_queue.pop_front();
+
+    if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
+      srv_data->request_callbacks, ros_request))
+    {
+      RMW_UDS_LOG_ERROR_THROTTLE(
+        1000,
+        "rmw_take_request: CDR deserialization failed on service '%s' "
+        "(payload=%zu bytes) — dropping datagram",
+        srv_data->service_name.c_str(), msg.payload.size());
+      continue;
+    }
+
+    // Fill request header
+    std::memcpy(request_header->request_id.writer_guid, msg.header.gid,
+      RMW_GID_STORAGE_SIZE);
+    request_header->request_id.sequence_number = msg.header.sequence_number;
+    request_header->source_timestamp = msg.header.source_timestamp_ns;
+    request_header->received_timestamp = msg.received_timestamp_ns;
+
+    *taken = true;
     return RMW_RET_OK;
   }
 
-  auto msg = std::move(srv_data->request_queue.front());
-  srv_data->request_queue.pop_front();
-
-  if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
-    srv_data->request_callbacks, ros_request))
-  {
-    RMW_SET_ERROR_MSG("failed to deserialize request");
-    return RMW_RET_ERROR;
-  }
-
-  // Fill request header
-  std::memcpy(request_header->request_id.writer_guid, msg.header.gid,
-    RMW_GID_STORAGE_SIZE);
-  request_header->request_id.sequence_number = msg.header.sequence_number;
-  request_header->source_timestamp = msg.header.source_timestamp_ns;
-  request_header->received_timestamp = msg.received_timestamp_ns;
-
-  *taken = true;
+  std::memset(request_header, 0, sizeof(rmw_service_info_t));
   return RMW_RET_OK;
 }
 
@@ -214,6 +227,9 @@ rmw_ret_t rmw_send_response(
   RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(request_header, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(ros_response, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
 
@@ -243,7 +259,7 @@ rmw_ret_t rmw_send_response(
       auto clients = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_CLIENT, srv_data->service_name.c_str(),
         nullptr, nullptr);
-      srv_data->cached_generation = rmw_uds::registry_generation(header);
+      srv_data->cached_generation = current_gen;
       srv_data->cached_clients.clear();
       srv_data->cached_clients.reserve(clients.size());
       for (const auto & c : clients) {
@@ -265,7 +281,30 @@ rmw_ret_t rmw_send_response(
       return RMW_RET_OK;
     }
   }
-  // Client not found — might have disconnected
+
+  // Cache miss — the cache may be stale. Do an authoritative direct query by
+  // client GID before giving up so a response is never silently discarded.
+  auto clients = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_CLIENT, srv_data->service_name.c_str(),
+    nullptr, nullptr);
+  for (const auto & c : clients) {
+    if (c.socket_path.empty()) {continue;}
+    if (std::memcmp(c.gid, request_header->writer_guid, sizeof(c.gid)) == 0) {
+      rmw_uds::send_to(
+        srv_data->context->send_socket_fd,
+        c.socket_path, hdr, payload.data(), payload.size());
+      return RMW_RET_OK;
+    }
+  }
+  // No live client matches this request id: the client timed out and shut down
+  // between issuing its request and our response, so its registry entry is gone.
+  // This is normal lifecycle, not an error — return OK and drop the response,
+  // matching rmw_cyclonedds (client_present_t::GONE -> RMW_RET_OK). Returning an
+  // error here would make rclcpp throw inside the executor callback.
+  RMW_UDS_LOG_DEBUG(
+    "rmw_send_response on '%s': no live client for the request id "
+    "(client gone) — response dropped",
+    srv_data->service_name.c_str());
   return RMW_RET_OK;
 }
 
@@ -275,6 +314,9 @@ rmw_ret_t rmw_service_request_subscription_get_actual_qos(
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(qos, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
   *qos = srv_data->qos;
   return RMW_RET_OK;
@@ -286,6 +328,9 @@ rmw_ret_t rmw_service_response_publisher_get_actual_qos(
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(qos, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
   *qos = srv_data->qos;
   return RMW_RET_OK;
@@ -297,6 +342,9 @@ rmw_ret_t rmw_service_set_on_new_request_callback(
   const void * user_data)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
   std::lock_guard<std::mutex> lock(srv_data->callback_mutex);
   srv_data->on_new_request_cb = callback;

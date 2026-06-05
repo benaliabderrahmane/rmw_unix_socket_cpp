@@ -164,7 +164,8 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
     delete pub_data;
   }
 
-  rcutils_allocator_t alloc = node->context->options.allocator;
+  rcutils_allocator_t alloc = node->context ?
+    node->context->options.allocator : rcutils_get_default_allocator();
   if (publisher->topic_name) {
     alloc.deallocate(const_cast<char *>(publisher->topic_name), alloc.state);
   }
@@ -216,12 +217,10 @@ rmw_ret_t rmw_publish(
   {
     std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
     if (current_gen != pub_data->cached_generation) {
-      // Re-read generation after the query so we don't miss updates that
-      // happened during the (lock-free) scan.
       auto subs = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
         nullptr, nullptr);
-      pub_data->cached_generation = rmw_uds::registry_generation(header);
+      pub_data->cached_generation = current_gen;
       pub_data->cached_subscriber_paths.clear();
       pub_data->cached_subscriber_paths.reserve(subs.size());
       for (const auto & s : subs) {
@@ -239,7 +238,7 @@ rmw_ret_t rmw_publish(
 
     rmw_uds::CachedMessage cached;
     cached.header = hdr;
-    cached.payload = payload;
+    cached.payload = std::move(payload);  // last use of payload
     pub_data->message_cache.push_back(std::move(cached));
     while (pub_data->message_cache.size() > pub_data->qos.depth) {
       pub_data->message_cache.pop_front();
@@ -256,6 +255,16 @@ rmw_ret_t rmw_publish(
         }
       }
     }
+
+    // Send the current message, read from the cached copy since payload was
+    // moved. Trimming never disturbs back(), so it is the message just pushed.
+    const auto & current = pub_data->message_cache.back();
+    for (const auto & path : sub_paths) {
+      rmw_uds::send_to(
+        pub_data->context->send_socket_fd,
+        path, current.header, current.payload.data(), current.payload.size());
+    }
+    return RMW_RET_OK;
   }
 
   // Surface EMSGSIZE; soft drops (EAGAIN/ENOENT) are logged in send_to.
@@ -310,7 +319,7 @@ rmw_ret_t rmw_publish_serialized_message(
       auto subs = rmw_uds::registry_query(
         header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
         nullptr, nullptr);
-      pub_data->cached_generation = rmw_uds::registry_generation(header);
+      pub_data->cached_generation = current_gen;
       pub_data->cached_subscriber_paths.clear();
       pub_data->cached_subscriber_paths.reserve(subs.size());
       for (const auto & s : subs) {

@@ -5,8 +5,6 @@
 
 #include "serialization.hpp"
 
-#include <cstring>
-
 #include "fastcdr/Cdr.h"
 #include "fastcdr/FastBuffer.h"
 
@@ -68,7 +66,6 @@ ServiceCallbacks get_service_callbacks(
       result.service_name = srv_cb->service_name_;
       return result;
     }
-    rcutils_reset_error();
   }
   rcutils_reset_error();
 
@@ -91,7 +88,6 @@ ServiceCallbacks get_service_callbacks(
       result.service_name = srv_cb->service_name_;
       return result;
     }
-    rcutils_reset_error();
   }
   rcutils_reset_error();
   return result;
@@ -104,7 +100,7 @@ bool serialize(
 {
   try {
     // Get estimated serialized size (4 bytes encapsulation + message)
-    auto data_length = 4 + callbacks->get_serialized_size(ros_message);
+    size_t data_length = size_t{4} + callbacks->get_serialized_size(ros_message);
     buffer.resize(data_length);
 
     eprosima::fastcdr::FastBuffer fastbuffer(
@@ -151,6 +147,11 @@ bool deserialize(
       return false;
     }
   } catch (const eprosima::fastcdr::exception::Exception &) {
+    return false;
+  } catch (const std::exception &) {
+    // cdr_deserialize() resizes message strings/sequences from attacker-controlled
+    // wire lengths and can throw std::bad_alloc/std::length_error. Callers are
+    // extern "C", so nothing may escape across the C ABI.
     return false;
   }
   return true;

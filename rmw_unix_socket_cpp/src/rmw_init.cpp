@@ -1,3 +1,5 @@
+#include <sys/stat.h>
+
 #include "identifier.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
@@ -7,6 +9,7 @@
 #include "rcutils/strdup.h"
 #include "rmw/check_type_identifiers_match.h"
 #include "rmw/error_handling.h"
+#include "rmw/discovery_options.h"
 #include "rmw/init.h"
 #include "rmw/init_options.h"
 #include "rmw/rmw.h"
@@ -57,6 +60,18 @@ rmw_ret_t rmw_init_options_copy(
   if (ret != RMW_RET_OK) {
     return ret;
   }
+  // discovery_options.static_peers is heap-owned; deep-copy it so src and dst
+  // don't alias the same array and double-free in rmw_init_options_fini.
+  dst->discovery_options = rmw_get_zero_initialized_discovery_options();
+  // rmw_discovery_options_copy takes a non-const allocator (unlike the security
+  // variant), so copy the caller's allocator into a local first.
+  rcutils_allocator_t disc_alloc = src->allocator;
+  ret = rmw_discovery_options_copy(
+    &src->discovery_options, &disc_alloc, &dst->discovery_options);
+  if (ret != RMW_RET_OK) {
+    rmw_security_options_fini(&dst->security_options, &dst->allocator);
+    return ret;
+  }
   if (src->enclave) {
     dst->enclave = rcutils_strdup(src->enclave, src->allocator);
   }
@@ -71,6 +86,8 @@ rmw_ret_t rmw_init_options_fini(rmw_init_options_t * init_options)
     init_options->enclave = nullptr;
   }
   rmw_security_options_fini(&init_options->security_options, &init_options->allocator);
+  rmw_ret_t disc_ret = rmw_discovery_options_fini(&init_options->discovery_options);
+  (void)disc_ret;
   *init_options = rmw_get_zero_initialized_init_options();
   return RMW_RET_OK;
 }
@@ -79,6 +96,13 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(options, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(context, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    options, options->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  if (context->impl != nullptr) {
+    RMW_SET_ERROR_MSG("expected a zero-initialized context");
+    return RMW_RET_INVALID_ARGUMENT;
+  }
 
   auto * ctx = new (std::nothrow) rmw_uds::UdsContext();
   if (!ctx) {
@@ -92,8 +116,19 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   }
   ctx->domain_id = domain_id;
 
-  // Ensure socket directory exists
-  rmw_uds::ensure_socket_dir(domain_id);
+  // Ensure socket directory exists. ensure_socket_dir swallows mkdir errors and
+  // only returns the path, so validate the directory here (in-scope) rather than
+  // changing its signature; downstream registry/socket setup would otherwise fail
+  // with a less specific error.
+  std::string socket_dir = rmw_uds::ensure_socket_dir(domain_id);
+  struct stat dir_st;
+  if (stat(socket_dir.c_str(), &dir_st) != 0 || !S_ISDIR(dir_st.st_mode)) {
+    RMW_UDS_LOG_ERROR(
+      "rmw_init: socket directory '%s' is not usable", socket_dir.c_str());
+    delete ctx;
+    RMW_SET_ERROR_MSG("failed to create socket directory");
+    return RMW_RET_ERROR;
+  }
 
   // Open shared memory registry
   ctx->registry_fd = rmw_uds::registry_open(
@@ -136,14 +171,46 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
 
   // Read initial generation
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
-  ctx->last_registry_generation = rmw_uds::registry_generation(header);
+  ctx->last_registry_generation.store(
+    rmw_uds::registry_generation(header), std::memory_order_relaxed);
+
+  // Deep-copy the caller-owned enclave string before committing any field on
+  // context, so a copy failure can tear the context down cleanly.
+  char * enclave_copy = nullptr;
+  if (options->enclave) {
+    enclave_copy = rcutils_strdup(options->enclave, options->allocator);
+    if (!enclave_copy) {
+      close(ctx->send_socket_fd);
+      rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);
+      delete ctx;
+      RMW_SET_ERROR_MSG("failed to copy enclave string");
+      return RMW_RET_BAD_ALLOC;
+    }
+  }
 
   context->implementation_identifier = rmw_uds::identifier;
   context->impl = reinterpret_cast<rmw_context_impl_t *>(ctx);
   context->instance_id = options->instance_id;
   context->options = *options;
-  if (options->enclave) {
-    context->options.enclave = rcutils_strdup(options->enclave, options->allocator);
+  context->options.enclave = enclave_copy;
+  // discovery_options.static_peers is heap-owned; deep-copy it so context->options
+  // owns its own array rather than aliasing the caller's options (mirrors enclave).
+  context->options.discovery_options = rmw_get_zero_initialized_discovery_options();
+  // rmw_discovery_options_copy needs a non-const allocator; copy into a local.
+  rcutils_allocator_t disc_alloc = options->allocator;
+  rmw_ret_t disc_ret = rmw_discovery_options_copy(
+    &options->discovery_options, &disc_alloc,
+    &context->options.discovery_options);
+  if (disc_ret != RMW_RET_OK) {
+    if (enclave_copy) {
+      options->allocator.deallocate(enclave_copy, options->allocator.state);
+    }
+    close(ctx->send_socket_fd);
+    rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);
+    delete ctx;
+    *context = rmw_get_zero_initialized_context();
+    RMW_SET_ERROR_MSG("failed to copy discovery options");
+    return disc_ret;
   }
   context->actual_domain_id = domain_id;
 
@@ -186,6 +253,8 @@ rmw_ret_t rmw_context_fini(rmw_context_t * context)
       context->options.enclave, context->options.allocator.state);
     context->options.enclave = nullptr;
   }
+  rmw_ret_t disc_ret = rmw_discovery_options_fini(&context->options.discovery_options);
+  (void)disc_ret;
 
   *context = rmw_get_zero_initialized_context();
   return RMW_RET_OK;

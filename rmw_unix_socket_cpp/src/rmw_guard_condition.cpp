@@ -74,6 +74,9 @@ rmw_ret_t rmw_trigger_guard_condition(
     rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * gc_data = static_cast<rmw_uds::UdsGuardCondition *>(guard_condition->data);
+  if (!gc_data || gc_data->eventfd_fd < 0) {
+    return RMW_RET_INVALID_ARGUMENT;
+  }
   uint64_t val = 1;
   ssize_t ret = write(gc_data->eventfd_fd, &val, sizeof(val));
   (void)ret;

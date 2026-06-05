@@ -113,3 +113,23 @@ TEST_F(ServiceClientTest, RequestResponseRoundTrip)
   EXPECT_TRUE(recv_response.bool_value);
   EXPECT_EQ("success", recv_response.string_value);
 }
+
+TEST_F(ServiceClientTest, SendResponseToGoneClientReturnsOk)
+{
+  // A service that responds after its client has shut down must NOT return an
+  // error: rclcpp throws inside the executor on any non-OK/non-TIMEOUT ret.
+  // Matches rmw_cyclonedds (client GONE -> RMW_RET_OK); the response is dropped.
+  srv = rmw_create_service(node, ts, "/gone_client_srv", &qos);
+  ASSERT_NE(nullptr, srv);
+
+  // No client is registered for this service, so the GID lookup in
+  // rmw_send_response finds no match — a true client-gone miss.
+  rmw_request_id_t request_id;
+  std::memset(&request_id, 0, sizeof(request_id));
+  request_id.sequence_number = 1;  // writer_guid left all-zero: matches no client
+
+  test_msgs::srv::BasicTypes::Response response;
+  response.bool_value = true;
+  response.int32_value = 7;
+  EXPECT_EQ(RMW_RET_OK, rmw_send_response(srv, &request_id, &response));
+}
