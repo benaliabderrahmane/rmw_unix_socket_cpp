@@ -296,8 +296,16 @@ rmw_ret_t rmw_send_response(
       return RMW_RET_OK;
     }
   }
-  RMW_SET_ERROR_MSG("no client matching request id; response discarded");
-  return RMW_RET_ERROR;
+  // No live client matches this request id: the client timed out and shut down
+  // between issuing its request and our response, so its registry entry is gone.
+  // This is normal lifecycle, not an error — return OK and drop the response,
+  // matching rmw_cyclonedds (client_present_t::GONE -> RMW_RET_OK). Returning an
+  // error here would make rclcpp throw inside the executor callback.
+  RMW_UDS_LOG_DEBUG(
+    "rmw_send_response on '%s': no live client for the request id "
+    "(client gone) — response dropped",
+    srv_data->service_name.c_str());
+  return RMW_RET_OK;
 }
 
 rmw_ret_t rmw_service_request_subscription_get_actual_qos(
