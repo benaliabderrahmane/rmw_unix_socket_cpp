@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
@@ -199,6 +200,43 @@ TEST_F(RegistryTest, MultipleEntriesSameType)
 
   for (int32_t idx : indices) {
     rmw_uds::registry_remove(header, idx);
+  }
+}
+
+// The high-water bound must shrink the scan range without dropping the
+// highest-index entry. Adding sequentially from an empty (fresh SetUp)
+// registry fills slots 0..4, so high_water must equal max(idx)+1 = the count.
+// Fails on unmodified main (no high_water_slot member) and on a buggy fix
+// that scans [0, hw) with hw==idx or [0, hw-1).
+TEST_F(RegistryTest, HighWaterBoundsScanWithoutLosingTopEntry)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  std::vector<int32_t> idx;
+  for (int i = 0; i < 5; ++i) {
+    rmw_uds::RegistryEntry e;
+    std::memset(&e, 0, sizeof(e));
+    e.type = rmw_uds::ENTRY_NODE;
+    e.pid = getpid();
+    std::snprintf(e.node_name, sizeof(e.node_name), "hw_%d", i);
+    int32_t k = rmw_uds::registry_add(header, e);
+    ASSERT_GE(k, 0);
+    idx.push_back(k);
+  }
+
+  // high_water is the count (slots fill 0..4), i.e. max(idx)+1.
+  uint32_t hw = header->high_water_slot.load();
+  EXPECT_EQ(static_cast<uint32_t>(*std::max_element(idx.begin(), idx.end())) + 1, hw);
+  EXPECT_LT(hw, header->max_entries);  // bound far below 32768 -> scan is cheap
+
+  // The top (highest-index) entry must still be found -> guards the [0, hw) vs
+  // [0, hw-1) and idx vs idx+1 off-by-ones.
+  auto top = rmw_uds::registry_query(header, rmw_uds::ENTRY_NODE, nullptr, "hw_4", nullptr);
+  EXPECT_EQ(1u, top.size());
+  auto all = rmw_uds::registry_query(header, rmw_uds::ENTRY_NODE, nullptr, nullptr, nullptr);
+  EXPECT_EQ(5u, all.size());
+
+  for (int32_t k : idx) {
+    rmw_uds::registry_remove(header, k);
   }
 }
 
