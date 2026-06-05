@@ -170,7 +170,9 @@ static bool snapshot_slot(RegistryEntrySlot * slot, RegistryEntrySlot * out)
       continue;
     }
     uint8_t st = slot->state.load(std::memory_order_acquire);
-    if (st == ENTRY_EMPTY) {
+    if (st == ENTRY_EMPTY || st == ENTRY_RESERVED) {
+      // RESERVED = a writer claimed the slot but has not yet published its
+      // payload. Treat it as empty so we never snapshot a half-built slot.
       return false;
     }
 
@@ -230,12 +232,17 @@ static int32_t try_add_once(RegistryHeader * header, const RegistryEntry & entry
 
   for (uint32_t i = 0; i < max; ++i) {
     uint8_t expected = ENTRY_EMPTY;
-    // CAS state EMPTY -> entry.type. Winner owns the slot.
+    // CAS state EMPTY -> RESERVED. Winner owns the slot, but readers still see
+    // it as empty until we publish the real type below — so no reader can
+    // snapshot the slot before its payload is committed under the seqlock.
     if (slots[i].state.compare_exchange_strong(
-        expected, static_cast<uint8_t>(entry.type),
+        expected, static_cast<uint8_t>(ENTRY_RESERVED),
         std::memory_order_acq_rel, std::memory_order_relaxed))
     {
       write_slot_payload(&slots[i], entry);
+      // Payload is committed (seq even). Publish the real type with release
+      // ordering so any reader that now sees it also sees the payload.
+      slots[i].state.store(static_cast<uint8_t>(entry.type), std::memory_order_release);
       header->generation.fetch_add(1, std::memory_order_acq_rel);
       return static_cast<int32_t>(i);
     }
@@ -345,6 +352,11 @@ void registry_cleanup_stale(RegistryHeader * header)
   for (uint32_t i = 0; i < max; ++i) {
     RegistryEntrySlot snap;
     if (!snapshot_slot(&slots[i], &snap)) {
+      continue;
+    }
+    if (snap.pid == 0) {
+      // pid==0 is never a real entry — only a transient snapshot of a slot
+      // whose payload is not yet written. Never reclaim it.
       continue;
     }
     if (pid_is_alive_or_unreachable(snap.pid)) {

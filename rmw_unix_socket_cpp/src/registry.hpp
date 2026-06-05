@@ -27,6 +27,11 @@ enum RegistryEntryType : uint8_t
   ENTRY_SUBSCRIPTION,
   ENTRY_SERVICE,
   ENTRY_CLIENT,
+  // Transient claim state: a writer won the slot but has not yet committed its
+  // payload. Readers treat it like ENTRY_EMPTY so they never observe a slot
+  // before its payload is published. Never stored in a RegistryEntry; lives
+  // only in the slot's atomic state field, so it costs no struct layout.
+  ENTRY_RESERVED = 0xFF,
 };
 
 // User-facing struct, passed to registry_add. Plain data, no atomics.
@@ -52,11 +57,12 @@ struct RegistryEntry
 // seqlock + atomic state machine so readers never need a global mutex.
 //
 // Protocol (writer):
-//   1. CAS state EMPTY -> target_type    (claims the slot atomically)
+//   1. CAS state EMPTY -> RESERVED       (claims the slot; readers treat as EMPTY)
 //   2. seq.fetch_add(1, acq_rel)         -> seq becomes odd (write in progress)
 //   3. memcpy payload fields
 //   4. seq.fetch_add(1, acq_rel)         -> seq becomes even (snapshot stable)
-//   5. generation.fetch_add(1, acq_rel)  -> wakes cached readers
+//   5. state.store(target_type, release) -> publishes the committed payload
+//   6. generation.fetch_add(1, acq_rel)  -> wakes cached readers
 //
 // Protocol (reader):
 //   1. s1 = seq.load(acquire); if (s1 & 1) skip slot (writer in progress)
