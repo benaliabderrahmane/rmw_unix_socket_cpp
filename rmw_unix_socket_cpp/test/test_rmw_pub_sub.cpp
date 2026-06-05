@@ -8,6 +8,16 @@
 #include "rmw/qos_profiles.h"
 #include "rosidl_typesupport_cpp/message_type_support.hpp"
 
+#include <chrono>
+#include <thread>
+#include <vector>
+
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include "../src/types.hpp"  // UdsSubscription + WireHeader layouts only (no linked symbols)
+
 class PubSubTest : public RmwUdsNodeTest
 {
 protected:
@@ -199,4 +209,88 @@ TEST_F(PubSubTest, StringMessages)
   EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv_msg, &taken, nullptr));
   ASSERT_TRUE(taken);
   EXPECT_EQ("Hello from Unix sockets!", recv_msg.string_value);
+}
+
+// Regression for the rmw_take_sequence cursor bug: a deserialize failure in the
+// middle of a batch must not leave an uninitialized hole or miscount size — each
+// success is written at the *taken cursor, not the loop index. We inject
+// [good, corrupt, good] straight into the subscription's datagram socket via raw
+// POSIX sendto (a single SOCK_DGRAM sender preserves order, so the corrupt one
+// lands between the two good ones). Before the fix the second good message was
+// written at data[2] and lost, while size == *taken == 2 exposed data[1] (the
+// hole from the failed deserialize) to the consumer as a valid message.
+TEST_F(PubSubTest, TakeSequenceSkipsMidBatchCorruptContiguously)
+{
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub = rmw_create_subscription(node, ts, "/take_seq_corrupt", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+  auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+  ASSERT_FALSE(sub_data->socket_path.empty());
+
+  // A valid wire payload via the public rmw_serialize API (identical CDR bytes
+  // to what a publisher emits, so the take path deserializes it cleanly).
+  test_msgs::msg::BasicTypes good;
+  good.int32_value = 4242;
+  good.bool_value = true;
+  rcutils_allocator_t allocator = rcutils_get_default_allocator();
+  rmw_serialized_message_t good_ser = rmw_get_zero_initialized_serialized_message();
+  ASSERT_EQ(RMW_RET_OK, rmw_serialized_message_init(&good_ser, 0, &allocator));
+  ASSERT_EQ(RMW_RET_OK, rmw_serialize(&good, ts, &good_ser));
+
+  int send_fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+  ASSERT_GE(send_fd, 0);
+  struct sockaddr_un addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, sub_data->socket_path.c_str(), sizeof(addr.sun_path) - 1);
+
+  // Each datagram is the packed WireHeader followed by the payload (recv_from's framing).
+  auto inject = [&](const uint8_t * payload, size_t len) {
+    rmw_uds::WireHeader hdr;
+    std::memset(&hdr, 0, sizeof(hdr));
+    hdr.payload_size = static_cast<uint32_t>(len);
+    hdr.msg_type = 0;  // topic message
+    std::vector<uint8_t> dgram(sizeof(hdr) + len);
+    std::memcpy(dgram.data(), &hdr, sizeof(hdr));
+    if (len > 0) {std::memcpy(dgram.data() + sizeof(hdr), payload, len);}
+    ASSERT_EQ(
+      static_cast<ssize_t>(dgram.size()),
+      ::sendto(send_fd, dgram.data(), dgram.size(), 0,
+        reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)));
+  };
+
+  const uint8_t corrupt[4] = {0xDE, 0xAD, 0xBE, 0xEF};  // too short to deserialize
+  inject(good_ser.buffer, good_ser.buffer_length);
+  inject(corrupt, sizeof(corrupt));
+  inject(good_ser.buffer, good_ser.buffer_length);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));  // defensive; datagrams already buffered
+
+  test_msgs::msg::BasicTypes out[3];
+  void * out_ptrs[3] = {&out[0], &out[1], &out[2]};
+  rmw_message_sequence_t seq;
+  seq.data = out_ptrs;
+  seq.size = 0;
+  seq.capacity = 3;
+  seq.allocator = nullptr;
+
+  rmw_message_info_t infos[3];
+  std::memset(infos, 0, sizeof(infos));
+  rmw_message_info_sequence_t info_seq;
+  info_seq.data = infos;
+  info_seq.size = 0;
+  info_seq.capacity = 3;
+  info_seq.allocator = nullptr;
+
+  size_t taken = 99;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_sequence(sub, 3, &seq, &info_seq, &taken, nullptr));
+
+  EXPECT_EQ(2u, taken);
+  EXPECT_EQ(2u, seq.size);
+  EXPECT_EQ(2u, info_seq.size);
+  EXPECT_EQ(4242, out[0].int32_value);
+  EXPECT_EQ(4242, out[1].int32_value);  // the bug left this a hole and lost it
+
+  ::close(send_fd);
+  EXPECT_EQ(RMW_RET_OK, rmw_serialized_message_fini(&good_ser));
 }
