@@ -170,6 +170,44 @@ rmw_ret_t rmw_wait(
     uint64_t gen = rmw_uds::registry_generation(header);
     if (gen != ctx->last_registry_generation) {
       ctx->last_registry_generation = gen;
+
+      // TRANSIENT_LOCAL late-joiner replay. Lock held across the loop —
+      // rmw_destroy_publisher takes the same mutex then deletes, so this
+      // is what keeps each pub pointer alive while we dereference it.
+      std::lock_guard<std::mutex> tl_lock(ctx->transient_local_pubs_mutex);
+      for (auto * pub : ctx->transient_local_pubs) {
+        std::vector<std::string> sub_paths;
+        {
+          std::lock_guard<std::mutex> sc_lock(pub->sub_cache_mutex);
+          if (rmw_uds::registry_generation(header) != pub->cached_generation) {
+            auto subs = rmw_uds::registry_query(
+              header, rmw_uds::ENTRY_SUBSCRIPTION,
+              pub->topic_name.c_str(), nullptr, nullptr);
+            pub->cached_generation = rmw_uds::registry_generation(header);
+            pub->cached_subscriber_paths.clear();
+            pub->cached_subscriber_paths.reserve(subs.size());
+            for (const auto & s : subs) {
+              if (!s.socket_path.empty()) {
+                pub->cached_subscriber_paths.push_back(s.socket_path);
+              }
+            }
+          }
+          sub_paths = pub->cached_subscriber_paths;
+        }
+        std::lock_guard<std::mutex> c_lock(pub->cache_mutex);
+        for (const auto & path : sub_paths) {
+          if (pub->known_subscriber_paths.count(path) != 0) {
+            continue;
+          }
+          pub->known_subscriber_paths.insert(path);
+          for (const auto & cm : pub->message_cache) {
+            rmw_uds::send_to(
+              ctx->send_socket_fd,
+              path, cm.header, cm.payload.data(), cm.payload.size());
+          }
+        }
+      }
+
       // Trigger all graph guard conditions in the guard_conditions list
       if (guard_conditions) {
         for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {

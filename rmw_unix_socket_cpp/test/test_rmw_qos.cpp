@@ -182,6 +182,62 @@ TEST_F(QosTest, PublishReturnsErrorOnEMSGSIZE)
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
+TEST_F(QosTest, TransientLocalReplayOnWaitNoSubsequentPublish)
+{
+  // Late sub must receive cached msgs from rmw_wait alone — no fresh publish.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/wait_replay", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  for (int i = 1; i <= 3; ++i) {
+    test_msgs::msg::BasicTypes m;
+    m.int32_value = i;
+    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
+  }
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/wait_replay", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+
+  rmw_subscriptions_t subscriptions;
+  void * sub_array[1] = {sub->data};
+  subscriptions.subscribers = sub_array;
+  subscriptions.subscriber_count = 1;
+
+  rmw_time_t timeout;
+  timeout.sec = 0;
+  timeout.nsec = 500 * 1000 * 1000;  // 500 ms
+
+  EXPECT_EQ(RMW_RET_OK, rmw_wait(
+      &subscriptions, nullptr, nullptr, nullptr, nullptr, ws, &timeout));
+  EXPECT_NE(nullptr, subscriptions.subscribers[0]);
+
+  std::vector<int> received;
+  for (int i = 0; i < 10; ++i) {
+    test_msgs::msg::BasicTypes recv;
+    bool taken = false;
+    EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    if (!taken) {break;}
+    received.push_back(recv.int32_value);
+  }
+
+  ASSERT_EQ(3u, received.size());
+  EXPECT_EQ(1, received[0]);
+  EXPECT_EQ(2, received[1]);
+  EXPECT_EQ(3, received[2]);
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
 TEST_F(QosTest, PublishStillReturnsOkOnSoftDropPeerGone)
 {
   // ENOENT on a vanished peer must stay RET_OK — only EMSGSIZE escalates.
@@ -208,6 +264,51 @@ TEST_F(QosTest, PublishStillReturnsOkOnSoftDropPeerGone)
   m.int32_value = 2;
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
 
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalReplayOnWaitDepthOne)
+{
+  // depth=1 + late-join: the single cached msg must reach the new sub via wait.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 1);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/depth1_wait", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  test_msgs::msg::BasicTypes m;
+  m.int32_value = 42;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/depth1_wait", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+
+  rmw_subscriptions_t subscriptions;
+  void * sub_array[1] = {sub->data};
+  subscriptions.subscribers = sub_array;
+  subscriptions.subscriber_count = 1;
+
+  rmw_time_t timeout;
+  timeout.sec = 0;
+  timeout.nsec = 500 * 1000 * 1000;
+  EXPECT_EQ(RMW_RET_OK, rmw_wait(
+      &subscriptions, nullptr, nullptr, nullptr, nullptr, ws, &timeout));
+  EXPECT_NE(nullptr, subscriptions.subscribers[0]);
+
+  test_msgs::msg::BasicTypes recv;
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+  ASSERT_TRUE(taken);
+  EXPECT_EQ(42, recv.int32_value);
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }

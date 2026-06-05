@@ -75,6 +75,9 @@ struct ReceivedMessage
   int64_t received_timestamp_ns;
 };
 
+// Forward declaration: publisher type defined below.
+struct UdsPublisher;
+
 // Per-context implementation data
 struct UdsContext
 {
@@ -86,6 +89,10 @@ struct UdsContext
   std::atomic<bool> is_shutdown{false};
   uint64_t last_registry_generation = 0;
   rmw_guard_condition_t * graph_guard_condition = nullptr;
+
+  // TRANSIENT_LOCAL publishers, for wait-side cache replay on graph change.
+  std::mutex transient_local_pubs_mutex;
+  std::vector<UdsPublisher *> transient_local_pubs;
 };
 
 // Node data

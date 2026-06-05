@@ -5,6 +5,7 @@
 #include "transport.hpp"
 #include "types.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 
@@ -129,6 +130,12 @@ rmw_publisher_t * rmw_create_publisher(
   pub->topic_name = rcutils_strdup(topic_name, node->context->options.allocator);
   pub->options = publisher_options ? *publisher_options : rmw_get_default_publisher_options();
   pub->can_loan_messages = false;
+
+  if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
+    std::lock_guard<std::mutex> lock(ctx->transient_local_pubs_mutex);
+    ctx->transient_local_pubs.push_back(pub_data);
+  }
+
   return pub;
 }
 
@@ -142,6 +149,14 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
 
   auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(publisher->data);
   if (pub_data) {
+    if (pub_data->context &&
+      pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL)
+    {
+      auto * ctx = pub_data->context;
+      std::lock_guard<std::mutex> lock(ctx->transient_local_pubs_mutex);
+      auto & v = ctx->transient_local_pubs;
+      v.erase(std::remove(v.begin(), v.end(), pub_data), v.end());
+    }
     if (pub_data->context && pub_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
       rmw_uds::registry_remove(header, pub_data->registry_index);
