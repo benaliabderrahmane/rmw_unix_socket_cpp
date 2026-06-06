@@ -93,6 +93,53 @@ TEST_F(QosTest, TransientLocalLateJoiner)
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
+TEST_F(QosTest, KnownSubscriberPathsPrunedOnChurn)
+{
+  // The publisher's known_subscriber_paths must not accumulate dead entries as
+  // subscribers churn: each create/destroy bumps the registry generation, and a
+  // restarted subscriber gets a brand-new unique socket path. Without pruning on
+  // refresh the set is insert-only and grows by one per churned subscriber.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/churn", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  // Seed the cache so there is something to replay.
+  test_msgs::msg::BasicTypes seed;
+  seed.int32_value = 1;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &seed, nullptr));
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  constexpr int kChurn = 8;
+  for (int i = 0; i < kChurn; ++i) {
+    // New sub bumps generation -> next publish refreshes + records this sub.
+    auto * sub = rmw_create_subscription(node, ts, "/churn", &qos, &sub_opts);
+    ASSERT_NE(nullptr, sub);
+    test_msgs::msg::BasicTypes m;
+    m.int32_value = i + 2;
+    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
+    // Destroy bumps generation again; next publish refreshes + prunes the gone sub.
+    auto _r [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
+  }
+
+  // After the loop every churned sub is destroyed, so known should be empty.
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  size_t known_size = 0;
+  {
+    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
+    known_size = pub_data->known_subscriber_paths.size();
+  }
+  // With the prune: tracks only live subs (0 here). Without it: grows to kChurn.
+  EXPECT_LE(known_size, 1u)
+    << "known_subscriber_paths leaked dead entries: size=" << known_size;
+
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
 TEST_F(QosTest, TransientLocalCacheDepthEnforced)
 {
   auto qos = make_qos(

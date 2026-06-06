@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -143,7 +144,9 @@ struct UdsPublisher
   // generation counter changes (graph topology actually changed).
   std::mutex sub_cache_mutex;
   uint64_t cached_generation = 0;
-  std::vector<std::string> cached_subscriber_paths;
+  // Copy-on-write: swapped wholesale on graph-generation change so the publish/
+  // wait hot path copies one refcount instead of N strings. Null until first refresh.
+  std::shared_ptr<const std::vector<std::string>> cached_subscriber_paths;
 
   // TRANSIENT_LOCAL: cache of last N messages for late-joining subscribers
   std::mutex cache_mutex;
