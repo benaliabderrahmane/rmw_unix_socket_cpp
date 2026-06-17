@@ -18,7 +18,9 @@ namespace rmw_uds
 
 static constexpr uint32_t REGISTRY_MAX_ENTRIES = 32768;
 // Layout v3: per-slot seqlock + atomic state. No global mutex on hot paths.
-static constexpr uint32_t REGISTRY_VERSION = 3;
+// Layout v4: adds a monotonic high_water_slot bound to the header so query and
+// cleanup scan only the used slot prefix instead of all REGISTRY_MAX_ENTRIES.
+static constexpr uint32_t REGISTRY_VERSION = 4;
 
 enum RegistryEntryType : uint8_t
 {
@@ -131,6 +133,10 @@ struct RegistryHeader
   // Robust mutex retained only for the one-time init handshake on shm creation.
   // Hot paths (add / remove / query / cleanup) never take it.
   pthread_mutex_t init_mutex;
+  // Monotonic upper bound on used slot indices: max(idx)+1 ever stored. Lets
+  // query/cleanup scan only [0, high_water_slot) instead of all max_entries.
+  // Only grows; over-scan is always safe, so reads need no strict ordering.
+  std::atomic<uint32_t> high_water_slot;
 };
 
 // Header layout guard: only the integer prefix is asserted. The total size

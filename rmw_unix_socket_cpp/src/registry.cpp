@@ -48,6 +48,7 @@ static void initialize_header(RegistryHeader * header, size_t total_size)
   std::memset(static_cast<void *>(header), 0, total_size);
   header->max_entries = REGISTRY_MAX_ENTRIES;
   header->generation.store(0, std::memory_order_relaxed);
+  header->high_water_slot.store(0, std::memory_order_relaxed);
 
   pthread_mutexattr_t attr;
   pthread_mutexattr_init(&attr);
@@ -248,6 +249,18 @@ static int32_t try_add_once(RegistryHeader * header, const RegistryEntry & entry
       // Payload is committed (seq even). Publish the real type with release
       // ordering so any reader that now sees it also sees the payload.
       slots[i].state.store(static_cast<uint8_t>(entry.type), std::memory_order_release);
+      // Widen the high-water bound to max(current, i+1) BEFORE bumping the
+      // generation. Readers gate their re-query on a generation acquire-load and
+      // then read high_water; if this store were sequenced AFTER the release
+      // generation bump, a reader could observe the new generation but a stale
+      // high_water, scan [0, stale) and miss this just-added slot. Done first,
+      // the relaxed store is sequenced-before the release fetch_add, so any
+      // reader that synchronizes on the generation also observes high_water.
+      uint32_t want = i + 1;
+      uint32_t cur = header->high_water_slot.load(std::memory_order_relaxed);
+      while (cur < want &&
+             !header->high_water_slot.compare_exchange_weak(
+               cur, want, std::memory_order_relaxed, std::memory_order_relaxed)) {}
       header->generation.fetch_add(1, std::memory_order_acq_rel);
       return static_cast<int32_t>(i);
     }
@@ -352,7 +365,10 @@ static const char * entry_type_name(uint8_t t)
 void registry_cleanup_stale(RegistryHeader * header)
 {
   auto * slots = registry_slots(header);
+  // Scan only [0, high_water): over-scan is safe, under-scan is impossible.
+  uint32_t hw = header->high_water_slot.load(std::memory_order_acquire);
   uint32_t max = header->max_entries;
+  if (hw < max) { max = hw; }
 
   for (uint32_t i = 0; i < max; ++i) {
     // Fast-skip empty slots without snapshotting, mirroring registry_query.
@@ -433,7 +449,10 @@ std::vector<RegistryQueryResult> registry_query(
 {
   std::vector<RegistryQueryResult> results;
   auto * slots = registry_slots(header);
+  // Scan only [0, high_water): over-scan is safe, under-scan is impossible.
+  uint32_t hw = header->high_water_slot.load(std::memory_order_acquire);
   uint32_t max = header->max_entries;
+  if (hw < max) { max = hw; }
 
   for (uint32_t i = 0; i < max; ++i) {
     // Fast pre-check: skip clearly-empty slots without snapshotting.
