@@ -27,7 +27,7 @@ Build and source the workspace first:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
-cd /home/abe/projects/drixo_ws_ros2/rmw
+cd /path/to/your/workspace
 colcon build --packages-select rmw_unix_socket_cpp
 source install/setup.bash
 ```

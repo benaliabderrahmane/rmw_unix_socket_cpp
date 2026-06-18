@@ -67,7 +67,7 @@ Tests context initialization and shutdown lifecycle.
 | Test | What it validates | Why it matters |
 |------|-------------------|----------------|
 | `GetIdentifier` | `rmw_get_implementation_identifier()` returns `"rmw_unix_socket_cpp"` | The identifier string is used by `RMW_CHECK_TYPE_IDENTIFIERS_MATCH` in every API call. Wrong identifier = every call rejected. |
-| `GetSerializationFormat` | `rmw_get_serialization_format()` returns `"uds_introspection"` | Used by rosbag2 and tools to identify the wire format. Must be non-null and stable. |
+| `GetSerializationFormat` | `rmw_get_serialization_format()` returns `"cdr"` | Used by rosbag2 and tools to identify the wire format. The payload is standard DDS-CDR (fastcdr), so bags are interoperable with other CDR RMWs. |
 | `InitOptionsLifecycle` | Init, copy, fini of `rmw_init_options_t` | Options carry domain_id, security, allocator. A leak in copy/fini would accumulate over process lifetime. |
 | `InitShutdownLifecycle` | `rmw_init` → `rmw_shutdown` → `rmw_context_fini` | Full lifecycle. Validates shared memory registry is opened, send socket is created, and everything is cleaned up. Leaked fds or shm would accumulate across init/fini cycles. |
 | `NullArgumentsRejected` | Null pointers return `RMW_RET_INVALID_ARGUMENT` | Prevents segfaults from user error. Every public API must validate inputs. |

@@ -7,7 +7,7 @@
     Lightweight RMW implementation for ROS 2 using Unix domain sockets.
     Designed for localhost-only communication with minimal resource usage.
   </description>
-  <maintainer email="user@example.com">user</maintainer>
+  <maintainer email="benaliabderrahmen88@gmail.com">Abderahmane BENALI</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
