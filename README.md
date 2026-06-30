@@ -128,7 +128,7 @@ messages, but images and point clouds will be dropped.
 | `ulimit -n` (`nofile`) | 1024 | 65536 | Each pub/sub/service/client uses 1–2 fds. |
 
 ```bash
-sudo sysctl -w net.core.rmem_max=48000000 net.core.wmem_max=48000000 \
+sudo sysctl -w net.core.rmem_max=50331648 net.core.wmem_max=50331648 \
                 net.unix.max_dgram_qlen=4096
 ```
 
