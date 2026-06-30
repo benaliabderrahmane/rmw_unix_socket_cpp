@@ -11,10 +11,18 @@ jobs:
   build-and-test:
     name: build & test (${{ matrix.ros_distro }})
     runs-on: ubuntu-latest
+    # Experimental distros (e.g. the next release, Lyrical) run but never block
+    # CI: continue-on-error is true only for matrix entries flagged experimental.
+    continue-on-error: ${{ matrix.experimental || false }}
     strategy:
       fail-fast: false
       matrix:
         ros_distro: [jazzy, kilted, rolling]
+        # Sample: the next ROS 2 release (Lyrical Luth). Allowed to fail until
+        # ros:lyrical-ros-base and its packages are published and stable.
+        include:
+          - ros_distro: lyrical
+            experimental: true
     container:
       image: ros:${{ matrix.ros_distro }}-ros-base
       # Default Docker /dev/shm is 64MB; one domain registry mmap is ~37MB
@@ -64,9 +72,11 @@ jobs:
           # Kilted were branched) and test_msgs' exported imported targets
           # reference it. CMake side: find_package(rosidl_buffer QUIET) in
           # CMakeLists handles the apt-missing case on older distros.
-          if [ "${{ matrix.ros_distro }}" = "rolling" ]; then
+          # Lyrical was branched from Rolling after rosidl_buffer landed, so it
+          # ships the package too; install it for both.
+          if [ "${{ matrix.ros_distro }}" = "rolling" ] || [ "${{ matrix.ros_distro }}" = "lyrical" ]; then
             apt-get install -y --no-install-recommends \
-              ros-rolling-rosidl-buffer
+              ros-${{ matrix.ros_distro }}-rosidl-buffer
           fi
 
       - name: Build
