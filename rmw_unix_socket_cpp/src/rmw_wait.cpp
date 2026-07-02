@@ -40,14 +40,18 @@ static int64_t now_ns()
     std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// Drain a socket into a message queue (subscription, service, or client)
+// Drain a socket into a message queue (subscription, service, or client).
+// recv_mutex is the entity's per-fd receive lock: recv_from must not run
+// concurrently on one fd (see UdsSubscription::recv_mutex).
 static void drain_socket(
   int fd,
+  std::mutex & recv_mutex,
   std::mutex & queue_mutex,
   std::deque<rmw_uds::ReceivedMessage> & queue,
   size_t max_depth,
   uint8_t expected_msg_type)
 {
+  std::lock_guard<std::mutex> recv_lock(recv_mutex);
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
 
@@ -150,8 +154,8 @@ rmw_ret_t rmw_wait(
     for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
       if (!subscriptions->subscribers[i]) {continue;}
       auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
-      drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-        sub->queue_depth, 0);
+      drain_socket(sub->socket_fd, sub->recv_mutex, sub->queue_mutex,
+        sub->message_queue, sub->queue_depth, 0);
     }
   }
 
@@ -159,7 +163,8 @@ rmw_ret_t rmw_wait(
     for (size_t i = 0; i < services->service_count; ++i) {
       if (!services->services[i]) {continue;}
       auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
-      drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1);
+      drain_socket(srv->socket_fd, srv->recv_mutex, srv->queue_mutex,
+        srv->request_queue, 100, 1);
     }
   }
 
@@ -167,7 +172,8 @@ rmw_ret_t rmw_wait(
     for (size_t i = 0; i < clients->client_count; ++i) {
       if (!clients->clients[i]) {continue;}
       auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
-      drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2);
+      drain_socket(cli->socket_fd, cli->recv_mutex, cli->queue_mutex,
+        cli->response_queue, 100, 2);
     }
   }
 
@@ -416,22 +422,24 @@ rmw_ret_t rmw_wait(
       for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
         if (!subscriptions->subscribers[i]) {continue;}
         auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
-        drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-          sub->queue_depth, 0);
+        drain_socket(sub->socket_fd, sub->recv_mutex, sub->queue_mutex,
+          sub->message_queue, sub->queue_depth, 0);
       }
     }
     if (services) {
       for (size_t i = 0; i < services->service_count; ++i) {
         if (!services->services[i]) {continue;}
         auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
-        drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1);
+        drain_socket(srv->socket_fd, srv->recv_mutex, srv->queue_mutex,
+          srv->request_queue, 100, 1);
       }
     }
     if (clients) {
       for (size_t i = 0; i < clients->client_count; ++i) {
         if (!clients->clients[i]) {continue;}
         auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
-        drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2);
+        drain_socket(cli->socket_fd, cli->recv_mutex, cli->queue_mutex,
+          cli->response_queue, 100, 2);
       }
     }
   }

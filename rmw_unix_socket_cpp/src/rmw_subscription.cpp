@@ -59,43 +59,53 @@ static int64_t now_ns()
 // Drain socket into message queue
 static void drain_subscription(rmw_uds::UdsSubscription * sub)
 {
-  rmw_uds::WireHeader hdr;
-  std::vector<uint8_t> payload;
+  size_t received = 0;
+  {
+    // recv_from's probe-then-read is only atomic on this fd while no other
+    // drain runs (rmw_wait drains the same socket); see recv_mutex in types.hpp.
+    std::lock_guard<std::mutex> recv_lock(sub->recv_mutex);
+    rmw_uds::WireHeader hdr;
+    std::vector<uint8_t> payload;
 
-  while (rmw_uds::recv_from(sub->socket_fd, hdr, payload)) {
-    if (hdr.msg_type != 0) {continue;}  // Not a topic message
+    while (rmw_uds::recv_from(sub->socket_fd, hdr, payload)) {
+      if (hdr.msg_type != 0) {continue;}  // Not a topic message
 
-    rmw_uds::ReceivedMessage msg;
-    msg.header = hdr;
-    msg.payload = std::move(payload);
-    msg.received_timestamp_ns = now_ns();
+      rmw_uds::ReceivedMessage msg;
+      msg.header = hdr;
+      msg.payload = std::move(payload);
+      msg.received_timestamp_ns = now_ns();
 
-    bool overflow = false;
-    {
-      std::lock_guard<std::mutex> lock(sub->queue_mutex);
-      sub->message_queue.push_back(std::move(msg));
-      // Enforce queue depth — any pops here mean we're dropping messages
-      // the kernel already delivered to us because the take() side isn't
-      // keeping up. This is the rcl-layer equivalent of "slow subscriber".
-      while (sub->message_queue.size() > sub->queue_depth) {
-        sub->message_queue.pop_front();
-        overflow = true;
+      bool overflow = false;
+      {
+        std::lock_guard<std::mutex> lock(sub->queue_mutex);
+        sub->message_queue.push_back(std::move(msg));
+        // Enforce queue depth — any pops here mean we're dropping messages
+        // the kernel already delivered to us because the take() side isn't
+        // keeping up. This is the rcl-layer equivalent of "slow subscriber".
+        while (sub->message_queue.size() > sub->queue_depth) {
+          sub->message_queue.pop_front();
+          overflow = true;
+        }
       }
-    }
-    if (overflow) {
-      RMW_UDS_LOG_WARN_THROTTLE(
-        1000,
-        "subscription queue overflow on topic '%s' (depth=%zu) — "
-        "dropping oldest. Application is not calling take() fast enough.",
-        sub->topic_name.c_str(), sub->queue_depth);
-    }
-
-    // Trigger callback if set
-    {
-      std::lock_guard<std::mutex> lock(sub->callback_mutex);
-      if (sub->on_new_message_cb) {
-        sub->on_new_message_cb(sub->on_new_message_user_data, 1);
+      if (overflow) {
+        RMW_UDS_LOG_WARN_THROTTLE(
+          1000,
+          "subscription queue overflow on topic '%s' (depth=%zu) — "
+          "dropping oldest. Application is not calling take() fast enough.",
+          sub->topic_name.c_str(), sub->queue_depth);
       }
+      ++received;
+    }
+  }
+
+  // Fire the new-message callback after releasing recv_mutex: a callback
+  // that synchronously re-enters rmw_take on this subscription would
+  // otherwise self-deadlock on the non-recursive lock. The callback takes a
+  // count, so one batched notification is equivalent to one per message.
+  if (received > 0) {
+    std::lock_guard<std::mutex> lock(sub->callback_mutex);
+    if (sub->on_new_message_cb) {
+      sub->on_new_message_cb(sub->on_new_message_user_data, received);
     }
   }
 }

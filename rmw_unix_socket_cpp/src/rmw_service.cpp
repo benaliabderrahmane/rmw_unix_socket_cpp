@@ -186,18 +186,21 @@ rmw_ret_t rmw_take_request(
   *taken = false;
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
 
-  // Drain socket
-  rmw_uds::WireHeader hdr;
-  std::vector<uint8_t> payload;
-  while (rmw_uds::recv_from(srv_data->socket_fd, hdr, payload)) {
-    if (hdr.msg_type != 1) {payload.clear(); continue;}
-    rmw_uds::ReceivedMessage msg;
-    msg.header = hdr;
-    msg.payload = std::move(payload);
-    msg.received_timestamp_ns = now_ns();
-    std::lock_guard<std::mutex> lock(srv_data->queue_mutex);
-    srv_data->request_queue.push_back(std::move(msg));
-    payload.clear();
+  // Drain socket (recv_mutex: recv_from must not run concurrently on one fd)
+  {
+    std::lock_guard<std::mutex> recv_lock(srv_data->recv_mutex);
+    rmw_uds::WireHeader hdr;
+    std::vector<uint8_t> payload;
+    while (rmw_uds::recv_from(srv_data->socket_fd, hdr, payload)) {
+      if (hdr.msg_type != 1) {payload.clear(); continue;}
+      rmw_uds::ReceivedMessage msg;
+      msg.header = hdr;
+      msg.payload = std::move(payload);
+      msg.received_timestamp_ns = now_ns();
+      std::lock_guard<std::mutex> lock(srv_data->queue_mutex);
+      srv_data->request_queue.push_back(std::move(msg));
+      payload.clear();
+    }
   }
 
   std::lock_guard<std::mutex> lock(srv_data->queue_mutex);

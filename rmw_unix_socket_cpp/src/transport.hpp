@@ -49,6 +49,10 @@ SendResult send_to(
 
 // Receive a single datagram from a non-blocking socket.
 // Returns true if a message was received, false if EAGAIN/EWOULDBLOCK or error.
+// Callers must serialize calls on the same fd (the per-entity recv_mutex):
+// the size probe and the consuming read are two syscalls, and a concurrent
+// consumer between them makes the read land on a different datagram.
+// On a false return, header_out and payload_out are left unspecified.
 bool recv_from(
   int socket_fd,
   WireHeader & header_out,

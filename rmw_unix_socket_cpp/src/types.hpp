@@ -179,6 +179,11 @@ struct UdsSubscription
   const message_type_support_callbacks_t * callbacks = nullptr;
   int socket_fd = -1;
   std::string socket_path;
+  // Serializes recv_from on this socket. recv_from's probe-then-read pair is
+  // only atomic against other consumers of the same fd when drains hold this;
+  // without it a concurrent drain (rmw_wait vs rmw_take) can consume the
+  // probed datagram and make the second read land on a different-sized one.
+  std::mutex recv_mutex;
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> message_queue;
   size_t queue_depth = 10;
@@ -210,6 +215,7 @@ struct UdsService
   const message_type_support_callbacks_t * response_callbacks = nullptr;
   int socket_fd = -1;
   std::string socket_path;
+  std::mutex recv_mutex;  // serializes recv_from on this fd (see UdsSubscription)
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> request_queue;
   int32_t registry_index = -1;
@@ -239,6 +245,7 @@ struct UdsClient
   const message_type_support_callbacks_t * response_callbacks = nullptr;
   int socket_fd = -1;
   std::string socket_path;
+  std::mutex recv_mutex;  // serializes recv_from on this fd (see UdsSubscription)
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> response_queue;
   std::atomic<int64_t> sequence_number{1};

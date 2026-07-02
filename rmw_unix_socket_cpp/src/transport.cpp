@@ -194,12 +194,13 @@ bool recv_from(
   WireHeader & header_out,
   std::vector<uint8_t> & payload_out)
 {
-  // Peek to get message size
-  // Use a fixed buffer approach: header + payload up to recv buffer
-  static thread_local std::vector<uint8_t> recv_buf(256 * 1024);  // 256KB initial
-
-  ssize_t n = recv(socket_fd, recv_buf.data(), recv_buf.size(),
-    MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC);
+  // Probe the size of the next datagram without copying any of it: with a
+  // zero-length buffer, MSG_PEEK leaves the datagram queued and MSG_TRUNC
+  // makes recv return its true on-wire length. This is what lets us read the
+  // datagram exactly once below, straight into its destination — the old
+  // peek-into-a-scratch-buffer approach copied every payload three times
+  // (peek, real recv, then assign into payload_out).
+  ssize_t n = recv(socket_fd, nullptr, 0, MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC);
 
   if (n < 0) {
     // EAGAIN is the steady-state "nothing to read" case driven by wait()
@@ -208,28 +209,61 @@ bool recv_from(
     if (errno != EAGAIN && errno != EWOULDBLOCK) {
       RMW_UDS_LOG_WARN_THROTTLE(
         1000,
-        "UDS recv (peek) failed: %s (errno=%d)",
+        "UDS recv (probe) failed: %s (errno=%d)",
         std::strerror(errno), errno);
     }
     return false;
   }
-  if (n == 0) {
+  if (n < static_cast<ssize_t>(sizeof(WireHeader))) {
+    // Runt (or zero-length) datagram — not one of ours. Consume it so it
+    // doesn't sit at the head of the FIFO blocking real messages and waking
+    // a level-triggered epoll forever; a zero-length read discards exactly
+    // one datagram on SOCK_DGRAM. Safe only because callers hold the
+    // entity's recv_mutex, so the head cannot change under us.
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000,
+      "UDS recv (probe): runt datagram (%zd bytes, expected >= %zu) — consumed and dropped",
+      n, sizeof(WireHeader));
+    recv(socket_fd, nullptr, 0, MSG_DONTWAIT);
     return false;
   }
 
-  // Resize if needed
-  if (static_cast<size_t>(n) > recv_buf.size()) {
-    recv_buf.resize(static_cast<size_t>(n));
-  }
+  // Scatter-read the datagram in one syscall: header into header_out, payload
+  // into payload_out — the single copy out of the kernel, mirroring send_to's
+  // gather-write. The resize's zero-fill is overwritten by recvmsg right
+  // after; that is still far cheaper than the two extra copies it replaces.
+  payload_out.resize(static_cast<size_t>(n) - sizeof(WireHeader));
 
-  // Actually receive the message
-  n = recv(socket_fd, recv_buf.data(), recv_buf.size(), MSG_DONTWAIT);
+  struct iovec iov[2];
+  iov[0].iov_base = &header_out;
+  iov[0].iov_len = sizeof(WireHeader);
+  iov[1].iov_base = payload_out.data();
+  iov[1].iov_len = payload_out.size();
+
+  struct msghdr msg;
+  std::memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = iov;
+  msg.msg_iovlen = payload_out.empty() ? 1 : 2;
+
+  n = recvmsg(socket_fd, &msg, MSG_DONTWAIT);
   if (n < 0) {
     if (errno != EAGAIN && errno != EWOULDBLOCK) {
       RMW_UDS_LOG_WARN_THROTTLE(
         1000, "UDS recv failed: %s (errno=%d)",
         std::strerror(errno), errno);
     }
+    return false;
+  }
+  if (msg.msg_flags & MSG_TRUNC) {
+    // The datagram read was bigger than the buffer sized from the probe and
+    // the kernel discarded its tail. Callers serialize receives per fd
+    // (recv_mutex), so this should be impossible; kept as defense because a
+    // truncated read must never be delivered as a valid message. Recovery is
+    // the level-triggered epoll: the fd stays readable while datagrams
+    // remain, so the next wait re-drains.
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000,
+      "UDS recv: datagram changed size between probe and read — dropped");
     return false;
   }
   if (n < static_cast<ssize_t>(sizeof(WireHeader))) {
@@ -240,23 +274,20 @@ bool recv_from(
     return false;
   }
 
-  std::memcpy(&header_out, recv_buf.data(), sizeof(WireHeader));
-
   size_t payload_len = static_cast<size_t>(n) - sizeof(WireHeader);
   if (payload_len != header_out.payload_size) {
-    // Mismatch — typically the sender's payload was larger than our
-    // recv buffer and the kernel truncated. Surface it so we can correlate
-    // with the corresponding sender-side EMSGSIZE.
+    // Mismatch — the sender wrote a payload_size that doesn't match what
+    // actually arrived (corrupt or foreign datagram). Clamp so we never hand
+    // the caller more bytes than the wire really carried.
     RMW_UDS_LOG_WARN_THROTTLE(
       5000,
       "UDS recv: payload size mismatch (got %zu, header says %u) — truncating",
       payload_len, header_out.payload_size);
     payload_len = std::min(payload_len, static_cast<size_t>(header_out.payload_size));
   }
-
-  payload_out.assign(
-    recv_buf.data() + sizeof(WireHeader),
-    recv_buf.data() + sizeof(WireHeader) + payload_len);
+  // In the common case this is a no-op; it only shrinks (never reallocates)
+  // when the read raced with another consumer or the header disagreed.
+  payload_out.resize(payload_len);
 
   return true;
 }

@@ -17,7 +17,9 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "../src/transport.hpp"
@@ -130,6 +132,153 @@ TEST_F(TransportTest, MultipleMessages)
     std::memcpy(&val, recv_payload.data(), sizeof(val));
     EXPECT_EQ(i, val);
   }
+
+  close(send_fd);
+  rmw_uds::close_socket(recv_fd, path);
+}
+
+TEST_F(TransportTest, LargePayloadRoundTrip)
+{
+  // 100 KB — a payload spanning many pages so the scatter-read is exercised
+  // well past the header iovec, yet small enough to fit the default
+  // net.core.wmem_max datagram cap so the test passes on stock kernels.
+  auto path = rmw_uds::make_socket_path(domain_id, "large");
+  int recv_fd = rmw_uds::create_bound_socket(path);
+  int send_fd = rmw_uds::create_send_socket();
+  ASSERT_GE(recv_fd, 0);
+  ASSERT_GE(send_fd, 0);
+
+  std::vector<uint8_t> payload(100 * 1024);
+  for (size_t i = 0; i < payload.size(); ++i) {
+    payload[i] = static_cast<uint8_t>((i * 31 + 7) & 0xFF);
+  }
+
+  rmw_uds::WireHeader hdr;
+  std::memset(&hdr, 0, sizeof(hdr));
+  hdr.sequence_number = 7;
+  hdr.payload_size = static_cast<uint32_t>(payload.size());
+  ASSERT_EQ(
+    rmw_uds::SendResult::Ok,
+    rmw_uds::send_to(send_fd, path, hdr, payload.data(), payload.size()));
+
+  rmw_uds::WireHeader recv_hdr;
+  std::vector<uint8_t> recv_payload;
+  ASSERT_TRUE(rmw_uds::recv_from(recv_fd, recv_hdr, recv_payload));
+  EXPECT_EQ(7, recv_hdr.sequence_number);
+  EXPECT_EQ(payload, recv_payload);
+
+  close(send_fd);
+  rmw_uds::close_socket(recv_fd, path);
+}
+
+TEST_F(TransportTest, EmptyPayloadHeaderOnly)
+{
+  // A header-only datagram (payload_size == 0) takes the one-entry iovec
+  // branch on both the send and the receive side.
+  auto path = rmw_uds::make_socket_path(domain_id, "hdronly");
+  int recv_fd = rmw_uds::create_bound_socket(path);
+  int send_fd = rmw_uds::create_send_socket();
+  ASSERT_GE(recv_fd, 0);
+  ASSERT_GE(send_fd, 0);
+
+  rmw_uds::WireHeader hdr;
+  std::memset(&hdr, 0, sizeof(hdr));
+  hdr.sequence_number = 21;
+  hdr.payload_size = 0;
+  ASSERT_EQ(
+    rmw_uds::SendResult::Ok,
+    rmw_uds::send_to(send_fd, path, hdr, nullptr, 0));
+
+  rmw_uds::WireHeader recv_hdr;
+  std::vector<uint8_t> recv_payload = {0xAA};  // must come back empty
+  ASSERT_TRUE(rmw_uds::recv_from(recv_fd, recv_hdr, recv_payload));
+  EXPECT_EQ(21, recv_hdr.sequence_number);
+  EXPECT_TRUE(recv_payload.empty());
+
+  close(send_fd);
+  rmw_uds::close_socket(recv_fd, path);
+}
+
+// Helper: send a raw datagram (no WireHeader) to a bound socket path.
+static void send_raw(const std::string & dest, const void * data, size_t len)
+{
+  int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  ASSERT_GE(fd, 0);
+  struct sockaddr_un addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, dest.c_str(), sizeof(addr.sun_path) - 1);
+  ASSERT_EQ(
+    static_cast<ssize_t>(len),
+    sendto(fd, data, len, 0, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)));
+  close(fd);
+}
+
+TEST_F(TransportTest, EmptyDatagramConsumedNotStuck)
+{
+  // A zero-length datagram from a rogue local sender must be consumed, not
+  // left at the head of the queue. SOCK_DGRAM is FIFO: if recv_from only
+  // peeks it and returns false, every later message is stuck behind it and
+  // a level-triggered epoll wakes the waiter forever.
+  auto path = rmw_uds::make_socket_path(domain_id, "emptygram");
+  int recv_fd = rmw_uds::create_bound_socket(path);
+  ASSERT_GE(recv_fd, 0);
+
+  send_raw(path, "", 0);
+
+  rmw_uds::WireHeader hdr;
+  std::vector<uint8_t> payload;
+  EXPECT_FALSE(rmw_uds::recv_from(recv_fd, hdr, payload));
+
+  // A valid message queued behind the empty datagram must still get through.
+  int send_fd = rmw_uds::create_send_socket();
+  ASSERT_GE(send_fd, 0);
+  rmw_uds::WireHeader send_hdr;
+  std::memset(&send_hdr, 0, sizeof(send_hdr));
+  send_hdr.sequence_number = 11;
+  std::vector<uint8_t> body = {9, 8, 7};
+  send_hdr.payload_size = static_cast<uint32_t>(body.size());
+  ASSERT_EQ(
+    rmw_uds::SendResult::Ok,
+    rmw_uds::send_to(send_fd, path, send_hdr, body.data(), body.size()));
+
+  ASSERT_TRUE(rmw_uds::recv_from(recv_fd, hdr, payload));
+  EXPECT_EQ(11, hdr.sequence_number);
+  EXPECT_EQ(body, payload);
+
+  close(send_fd);
+  rmw_uds::close_socket(recv_fd, path);
+}
+
+TEST_F(TransportTest, RuntDatagramConsumedNotStuck)
+{
+  // Same property for a datagram shorter than WireHeader: dropped and
+  // consumed, so the valid message behind it is still delivered.
+  auto path = rmw_uds::make_socket_path(domain_id, "runt");
+  int recv_fd = rmw_uds::create_bound_socket(path);
+  ASSERT_GE(recv_fd, 0);
+
+  const char junk[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+  send_raw(path, junk, sizeof(junk));
+
+  rmw_uds::WireHeader hdr;
+  std::vector<uint8_t> payload;
+  EXPECT_FALSE(rmw_uds::recv_from(recv_fd, hdr, payload));
+
+  int send_fd = rmw_uds::create_send_socket();
+  ASSERT_GE(send_fd, 0);
+  rmw_uds::WireHeader send_hdr;
+  std::memset(&send_hdr, 0, sizeof(send_hdr));
+  send_hdr.sequence_number = 13;
+  std::vector<uint8_t> body = {1, 2};
+  send_hdr.payload_size = static_cast<uint32_t>(body.size());
+  ASSERT_EQ(
+    rmw_uds::SendResult::Ok,
+    rmw_uds::send_to(send_fd, path, send_hdr, body.data(), body.size()));
+
+  ASSERT_TRUE(rmw_uds::recv_from(recv_fd, hdr, payload));
+  EXPECT_EQ(13, hdr.sequence_number);
+  EXPECT_EQ(body, payload);
 
   close(send_fd);
   rmw_uds::close_socket(recv_fd, path);
