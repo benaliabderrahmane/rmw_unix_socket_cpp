@@ -175,6 +175,7 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
       auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
       rmw_uds::registry_remove(header, pub_data->registry_index);
     }
+    rmw_uds::shm_writer_close(pub_data->shm_ring);
     delete pub_data;
   }
 
@@ -304,13 +305,35 @@ rmw_ret_t rmw_publish(
     return RMW_RET_OK;
   }
 
+  // Large payloads travel through the publisher's shm ring: stage the bytes
+  // once, then fan out a fixed-size descriptor instead of copying the payload
+  // through every subscriber's socket buffer. Falls back to inline on any
+  // shm failure. (TRANSIENT_LOCAL returned above; its replay needs payloads
+  // that outlive the ring, so it always sends inline.)
+  rmw_uds::ShmPayloadDescriptor desc;
+  bool staged = false;
+  if (payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
+    std::lock_guard<std::mutex> lock(pub_data->shm_mutex);
+    staged = rmw_uds::shm_stage_payload(
+      pub_data->shm_ring, pub_data->context->domain_id,
+      payload.data(), payload.size(), desc);
+  }
+  const uint8_t * wire_data = payload.data();
+  size_t wire_size = payload.size();
+  if (staged) {
+    hdr.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
+    hdr.payload_size = static_cast<uint32_t>(sizeof(desc));
+    wire_data = reinterpret_cast<const uint8_t *>(&desc);
+    wire_size = sizeof(desc);
+  }
+
   // Surface EMSGSIZE; soft drops (EAGAIN/ENOENT) are logged in send_to.
   bool config_error = false;
   if (sub_paths) {
     for (const auto & path : *sub_paths) {
       if (rmw_uds::send_to(
           pub_data->context->send_socket_fd,
-          path, hdr, payload.data(), payload.size()) == rmw_uds::SendResult::ConfigError)
+          path, hdr, wire_data, wire_size) == rmw_uds::SendResult::ConfigError)
       {
         config_error = true;
       }
@@ -371,13 +394,34 @@ rmw_ret_t rmw_publish_serialized_message(
     sub_paths = pub_data->cached_subscriber_paths;
   }
 
+  // Same large-payload fork as rmw_publish: stage once, fan out descriptors.
+  // TRANSIENT_LOCAL keeps the inline path for consistency with rmw_publish
+  // (this entry point does not feed the replay cache).
+  rmw_uds::ShmPayloadDescriptor desc;
+  bool staged = false;
+  if (serialized_message->buffer_length >= rmw_uds::SHM_PAYLOAD_THRESHOLD &&
+    pub_data->qos.durability != RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL)
+  {
+    std::lock_guard<std::mutex> lock(pub_data->shm_mutex);
+    staged = rmw_uds::shm_stage_payload(
+      pub_data->shm_ring, pub_data->context->domain_id,
+      serialized_message->buffer, serialized_message->buffer_length, desc);
+  }
+  const uint8_t * wire_data = serialized_message->buffer;
+  size_t wire_size = serialized_message->buffer_length;
+  if (staged) {
+    hdr.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
+    hdr.payload_size = static_cast<uint32_t>(sizeof(desc));
+    wire_data = reinterpret_cast<const uint8_t *>(&desc);
+    wire_size = sizeof(desc);
+  }
+
   bool config_error = false;
   if (sub_paths) {
     for (const auto & path : *sub_paths) {
       if (rmw_uds::send_to(
           pub_data->context->send_socket_fd,
-          path, hdr, serialized_message->buffer,
-          serialized_message->buffer_length) == rmw_uds::SendResult::ConfigError)
+          path, hdr, wire_data, wire_size) == rmw_uds::SendResult::ConfigError)
       {
         config_error = true;
       }

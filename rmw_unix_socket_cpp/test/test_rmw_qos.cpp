@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include "test_msgs/msg/basic_types.hpp"
+#include "test_msgs/msg/unbounded_sequences.hpp"
 #include "test_msgs/srv/basic_types.hpp"
 
 #include "rmw/qos_profiles.h"
@@ -102,6 +103,59 @@ TEST_F(QosTest, TransientLocalLateJoiner)
   bool taken = false;
   EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
   EXPECT_FALSE(taken);
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalLargeMessageStaysInline)
+{
+  // TRANSIENT_LOCAL must never use the shm ring: the replay cache has to
+  // outlive ring records, so large latched messages send inline. This pins
+  // the ordering in rmw_publish (the TL branch returns before the shm fork)
+  // — a refactor that moves the fork earlier would go unnoticed by the
+  // small-message TL tests. 100 KB: over SHM_PAYLOAD_THRESHOLD, under the
+  // stock-kernel datagram cap so the inline sends work everywhere.
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, seq_ts, "/latched_large", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  test_msgs::msg::UnboundedSequences msg;
+  msg.uint8_values.resize(100 * 1024);
+  for (size_t i = 0; i < msg.uint8_values.size(); ++i) {
+    msg.uint8_values[i] = static_cast<uint8_t>((i * 7 + 1) & 0xFF);
+  }
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  EXPECT_EQ(nullptr, pub_data->shm_ring.base)
+    << "a TRANSIENT_LOCAL publish must not create a shm ring";
+
+  // A late joiner must get the cached message via inline replay.
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, seq_ts, "/latched_large", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  test_msgs::msg::UnboundedSequences trigger;
+  trigger.uint8_values = {1, 2, 3};
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &trigger, nullptr));
+  EXPECT_EQ(nullptr, pub_data->shm_ring.base);
+
+  test_msgs::msg::UnboundedSequences recv;
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+  ASSERT_TRUE(taken);
+  EXPECT_EQ(msg.uint8_values, recv.uint8_values);
+
+  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+  ASSERT_TRUE(taken);
+  EXPECT_EQ(trigger.uint8_values, recv.uint8_values);
 
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
@@ -226,8 +280,12 @@ TEST_F(QosTest, PublishReturnsErrorOnEMSGSIZE)
   auto * sub = rmw_create_subscription(node, ts, "/emsgsize", &qos, &sub_opts);
   ASSERT_NE(nullptr, sub);
 
-  // 64 KB — well above SOCK_MIN_SNDBUF the kernel will clamp us to.
-  constexpr size_t big_size = 64 * 1024;
+  // 32 KB — well above SOCK_MIN_SNDBUF the kernel will clamp us to, but
+  // below SHM_PAYLOAD_THRESHOLD so the message stays on the inline datagram
+  // path (payloads at or above the threshold bypass the socket buffer
+  // entirely via the shm ring; see the test below).
+  constexpr size_t big_size = 32 * 1024;
+  static_assert(big_size < rmw_uds::SHM_PAYLOAD_THRESHOLD, "must stay inline");
   rmw_serialized_message_t serialized;
   serialized.buffer_capacity = big_size;
   serialized.buffer_length = big_size;
@@ -238,6 +296,62 @@ TEST_F(QosTest, PublishReturnsErrorOnEMSGSIZE)
 
   EXPECT_EQ(RMW_RET_ERROR, rmw_publish_serialized_message(pub, &serialized, nullptr));
 
+  std::free(serialized.buffer);
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, LargePayloadBypassesSendBuffer)
+{
+  // Same shrunken SO_SNDBUF, but a payload above SHM_PAYLOAD_THRESHOLD:
+  // the bytes travel through the publisher's shm ring and only a small
+  // descriptor crosses the socket, so the publish succeeds and the message
+  // arrives intact where it previously died with EMSGSIZE.
+  auto * ctx_impl = reinterpret_cast<rmw_uds::UdsContext *>(context.impl);
+  int small_buf = 2048;
+  ASSERT_EQ(
+    0,
+    setsockopt(
+      ctx_impl->send_socket_fd, SOL_SOCKET, SO_SNDBUF,
+      &small_buf, sizeof(small_buf)));
+
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_VOLATILE);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/shm_bypass", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/shm_bypass", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  constexpr size_t big_size = 128 * 1024;
+  static_assert(big_size >= rmw_uds::SHM_PAYLOAD_THRESHOLD, "must use the ring");
+  rmw_serialized_message_t serialized;
+  serialized.buffer_capacity = big_size;
+  serialized.buffer_length = big_size;
+  serialized.buffer = static_cast<uint8_t *>(std::malloc(big_size));
+  ASSERT_NE(nullptr, serialized.buffer);
+  for (size_t i = 0; i < big_size; ++i) {
+    serialized.buffer[i] = static_cast<uint8_t>((i * 17 + 3) & 0xFF);
+  }
+  serialized.allocator = rcutils_get_default_allocator();
+
+  EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &serialized, nullptr));
+
+  rmw_serialized_message_t received = rmw_get_zero_initialized_serialized_message();
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_serialized_message_init(&received, 0, &serialized.allocator));
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_serialized_message(sub, &received, &taken, nullptr));
+  ASSERT_TRUE(taken);
+  ASSERT_EQ(big_size, received.buffer_length);
+  EXPECT_EQ(0, std::memcmp(serialized.buffer, received.buffer, big_size));
+
+  auto _f [[maybe_unused]] = rmw_serialized_message_fini(&received);
   std::free(serialized.buffer);
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);

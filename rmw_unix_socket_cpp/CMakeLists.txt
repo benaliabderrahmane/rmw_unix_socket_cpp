@@ -52,6 +52,7 @@ set(CMAKE_REQUIRED_INCLUDES "${_rmw_probe_saved_inc}")
 add_library(rmw_unix_socket_cpp SHARED
   src/registry.cpp
   src/serialization.cpp
+  src/shm_transport.cpp
   src/transport.cpp
   src/rmw_init.cpp
   src/rmw_node.cpp
@@ -151,6 +152,11 @@ if(BUILD_TESTING)
   ament_add_gtest(test_transport test/test_transport.cpp src/transport.cpp)
   target_link_libraries(test_transport ${_unit_test_deps})
   target_include_directories(test_transport PRIVATE src)
+
+  # Unit test: shared-memory payload transport
+  ament_add_gtest(test_shm_transport test/test_shm_transport.cpp src/shm_transport.cpp)
+  target_link_libraries(test_shm_transport ${_unit_test_deps})
+  target_include_directories(test_shm_transport PRIVATE src)
 
   # Common link/include for all RMW API tests (they include types.hpp which
   # needs fastrtps headers; linking the shared lib pulls them in).

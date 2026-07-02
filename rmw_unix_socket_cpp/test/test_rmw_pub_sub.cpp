@@ -18,6 +18,7 @@
 
 #include "test_msgs/msg/basic_types.hpp"
 #include "test_msgs/msg/strings.hpp"
+#include "test_msgs/msg/unbounded_sequences.hpp"
 
 #include "rmw/qos_profiles.h"
 #include "rosidl_typesupport_cpp/message_type_support.hpp"
@@ -201,6 +202,40 @@ TEST_F(PubSubTest, PublisherGetGid)
     if (gid.data[i] != 0) { all_zero = false; break; }
   }
   EXPECT_FALSE(all_zero);
+}
+
+TEST_F(PubSubTest, LargeMessageViaShmRing)
+{
+  // A payload well above SHM_PAYLOAD_THRESHOLD travels through the
+  // publisher's /dev/shm ring: the datagram carries only a descriptor and
+  // the subscriber copies the bytes out of the ring. This exercises the
+  // full path — stage on publish, descriptor resolve on drain, deserialize
+  // on take — through the public API.
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  pub = rmw_create_publisher(node, seq_ts, "/large_topic", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub = rmw_create_subscription(node, seq_ts, "/large_topic", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  test_msgs::msg::UnboundedSequences send_msg;
+  send_msg.uint8_values.resize(300 * 1024);  // ~300 KB serialized
+  for (size_t i = 0; i < send_msg.uint8_values.size(); ++i) {
+    send_msg.uint8_values[i] = static_cast<uint8_t>((i * 13 + 5) & 0xFF);
+  }
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &send_msg, nullptr));
+
+  // The publisher must actually have created its ring segment.
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  EXPECT_NE(nullptr, pub_data->shm_ring.base);
+
+  test_msgs::msg::UnboundedSequences recv_msg;
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv_msg, &taken, nullptr));
+  ASSERT_TRUE(taken);
+  EXPECT_EQ(send_msg.uint8_values, recv_msg.uint8_values);
 }
 
 TEST_F(PubSubTest, StringMessages)

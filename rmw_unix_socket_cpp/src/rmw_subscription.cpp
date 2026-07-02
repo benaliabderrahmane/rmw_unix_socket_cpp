@@ -63,7 +63,21 @@ static void drain_subscription(rmw_uds::UdsSubscription * sub)
   std::vector<uint8_t> payload;
 
   while (rmw_uds::recv_from(sub->socket_fd, hdr, payload)) {
-    if (hdr.msg_type != 0) {continue;}  // Not a topic message
+    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 0) {continue;}  // Not a topic message
+
+    if (hdr.msg_type & rmw_uds::SHM_PAYLOAD_FLAG) {
+      // The datagram carries a descriptor into the publisher's shm ring;
+      // swap it for the payload bytes. A failed fetch (publisher gone, or
+      // it lapped the ring) is a dropped message — the same outcome a
+      // socket-buffer overflow produces on the inline path.
+      if (!rmw_uds::shm_fetch_payload(
+          sub->shm_cache, sub->context->domain_id, payload))
+      {
+        continue;
+      }
+      hdr.msg_type &= ~rmw_uds::SHM_PAYLOAD_FLAG;
+      hdr.payload_size = static_cast<uint32_t>(payload.size());
+    }
 
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
@@ -223,6 +237,7 @@ rmw_ret_t rmw_destroy_subscription(
       rmw_uds::registry_remove(header, sub_data->registry_index);
     }
     rmw_uds::close_socket(sub_data->socket_fd, sub_data->socket_path);
+    rmw_uds::shm_reader_close(sub_data->shm_cache);
     delete sub_data;
   }
 

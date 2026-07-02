@@ -40,21 +40,39 @@ static int64_t now_ns()
     std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// Drain a socket into a message queue (subscription, service, or client)
+// Drain a socket into a message queue (subscription, service, or client).
+// shm_cache/domain_id resolve large-payload descriptors on subscription
+// sockets (only topic messages ever carry SHM_PAYLOAD_FLAG); services and
+// clients pass nullptr.
 static void drain_socket(
   int fd,
   std::mutex & queue_mutex,
   std::deque<rmw_uds::ReceivedMessage> & queue,
   size_t max_depth,
-  uint8_t expected_msg_type)
+  uint8_t expected_msg_type,
+  rmw_uds::ShmReaderCache * shm_cache = nullptr,
+  size_t domain_id = 0)
 {
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
 
   while (rmw_uds::recv_from(fd, hdr, payload)) {
-    if (hdr.msg_type != expected_msg_type) {
+    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != expected_msg_type) {
       payload.clear();
       continue;
+    }
+
+    if (hdr.msg_type & rmw_uds::SHM_PAYLOAD_FLAG) {
+      // Descriptor into the publisher's shm ring; swap it for the payload.
+      // A failed fetch (publisher gone or ring lapped) is a dropped message.
+      if (!shm_cache ||
+        !rmw_uds::shm_fetch_payload(*shm_cache, domain_id, payload))
+      {
+        payload.clear();
+        continue;
+      }
+      hdr.msg_type &= ~rmw_uds::SHM_PAYLOAD_FLAG;
+      hdr.payload_size = static_cast<uint32_t>(payload.size());
     }
 
     rmw_uds::ReceivedMessage msg;
@@ -151,7 +169,7 @@ rmw_ret_t rmw_wait(
       if (!subscriptions->subscribers[i]) {continue;}
       auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
       drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-        sub->queue_depth, 0);
+        sub->queue_depth, 0, &sub->shm_cache, sub->context->domain_id);
     }
   }
 
@@ -417,7 +435,7 @@ rmw_ret_t rmw_wait(
         if (!subscriptions->subscribers[i]) {continue;}
         auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
         drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-          sub->queue_depth, 0);
+          sub->queue_depth, 0, &sub->shm_cache, sub->context->domain_id);
       }
     }
     if (services) {

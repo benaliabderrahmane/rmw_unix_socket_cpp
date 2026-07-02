@@ -32,6 +32,8 @@
 #include "rmw/types.h"
 #include "rosidl_typesupport_fastrtps_cpp/message_type_support.h"
 
+#include "shm_transport.hpp"
+
 namespace rmw_uds
 {
 
@@ -81,6 +83,8 @@ struct __attribute__((packed)) WireHeader
   int64_t source_timestamp_ns;          // 8 bytes: ns since epoch
   uint32_t payload_size;                // 4 bytes
   uint8_t msg_type;                     // 1 byte: 0=topic, 1=request, 2=response
+                                        //   high bit = SHM_PAYLOAD_FLAG
+                                        //   (see shm_transport.hpp)
 };
 
 // Wire-format guard: WireHeader is blitted onto the datagram, so its packed
@@ -166,6 +170,12 @@ struct UdsPublisher
   std::mutex cache_mutex;
   std::deque<CachedMessage> message_cache;
   std::set<std::string> known_subscriber_paths;  // subs we've already replayed to
+
+  // Large payloads: per-publisher /dev/shm ring (created lazily on the first
+  // payload >= SHM_PAYLOAD_THRESHOLD). shm_mutex serializes staging when
+  // several threads publish on the same publisher.
+  std::mutex shm_mutex;
+  ShmRingWriter shm_ring;
 };
 
 // Subscription data
@@ -190,6 +200,10 @@ struct UdsSubscription
   std::mutex callback_mutex;
   rmw_event_callback_t on_new_message_cb = nullptr;
   const void * on_new_message_user_data = nullptr;
+
+  // Large payloads: mapped publisher rings this subscription reads from
+  // (internally locked; see ShmReaderCache).
+  ShmReaderCache shm_cache;
 };
 
 // Cached client routing entry for service responses (path + GID)
