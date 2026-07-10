@@ -207,9 +207,10 @@ std::unique_ptr<DurableShmSegment> shm_stage_durable(
     return nullptr;
   }
   // Test seam (cold path, large latched publishes only): when this env var is
-  // set, behave as if shared memory were unavailable so tests can exercise the
-  // inline fallback deterministically. Never set in production.
-  if (std::getenv("RMW_UDS_TEST_FORCE_SHM_FAILURE") != nullptr) {
+  // exactly "1", behave as if shared memory were unavailable so tests can
+  // exercise the inline fallback deterministically. Never set in production.
+  const char * force_fail = std::getenv("RMW_UDS_TEST_FORCE_SHM_FAILURE");
+  if (force_fail != nullptr && std::strcmp(force_fail, "1") == 0) {
     return nullptr;
   }
 

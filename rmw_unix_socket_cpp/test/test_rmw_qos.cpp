@@ -257,6 +257,7 @@ TEST_F(QosTest, TransientLocalPublishReturnsErrorOnEMSGSIZE)
 
   // 32 KiB: above the shrunken buffer, below SHM_PAYLOAD_THRESHOLD so it stays
   // on the inline datagram path (a durable-staged payload would bypass the cap).
+  static_assert(32 * 1024 < rmw_uds::SHM_PAYLOAD_THRESHOLD, "must stay inline");
   test_msgs::msg::UnboundedSequences msg;
   msg.uint8_values.resize(32 * 1024);
   EXPECT_EQ(RMW_RET_ERROR, rmw_publish(pub, &msg, nullptr));
@@ -421,6 +422,53 @@ TEST_F(QosTest, KnownSubscriberPathsPrunedOnChurn)
   // With the prune: tracks only live subs (0 here). Without it: grows to kChurn.
   EXPECT_LE(known_size, 1u)
     << "known_subscriber_paths leaked dead entries: size=" << known_size;
+
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalSerializedKnownSubscriberPathsPrunedOnChurn)
+{
+  // Same prune guarantee as KnownSubscriberPathsPrunedOnChurn, but driven
+  // through rmw_publish_serialized_message, which carries its own copy of the
+  // prune-on-refresh logic. Guards against that copy silently diverging: without
+  // the prune the serialized path's known_subscriber_paths grows by one per
+  // churned subscriber.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/churn_serialized", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  uint8_t bytes[] = {1, 2, 3, 4, 5, 6, 7, 8};
+  rmw_serialized_message_t msg;
+  msg.buffer = bytes;
+  msg.buffer_length = sizeof(bytes);
+  msg.buffer_capacity = sizeof(bytes);
+  msg.allocator = rcutils_get_default_allocator();
+
+  // Seed the cache so there is something to replay.
+  EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &msg, nullptr));
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  constexpr int kChurn = 8;
+  for (int i = 0; i < kChurn; ++i) {
+    auto * sub = rmw_create_subscription(node, ts, "/churn_serialized", &qos, &sub_opts);
+    ASSERT_NE(nullptr, sub);
+    EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &msg, nullptr));
+    auto _r [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+    EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &msg, nullptr));
+  }
+
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  size_t known_size = 0;
+  {
+    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
+    known_size = pub_data->known_subscriber_paths.size();
+  }
+  EXPECT_LE(known_size, 1u)
+    << "serialized-path known_subscriber_paths leaked dead entries: size=" << known_size;
 
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
