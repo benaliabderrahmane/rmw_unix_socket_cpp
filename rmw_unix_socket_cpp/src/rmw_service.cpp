@@ -158,6 +158,8 @@ rmw_ret_t rmw_destroy_service(rmw_node_t * node, rmw_service_t * service)
       rmw_uds::registry_remove(header, srv_data->registry_index);
     }
     rmw_uds::close_socket(srv_data->socket_fd, srv_data->socket_path);
+    rmw_uds::shm_writer_close(srv_data->shm_ring);
+    rmw_uds::shm_reader_close(srv_data->shm_cache);
     delete srv_data;
   }
 
@@ -190,7 +192,19 @@ rmw_ret_t rmw_take_request(
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
   while (rmw_uds::recv_from(srv_data->socket_fd, hdr, payload)) {
-    if (hdr.msg_type != 1) {payload.clear(); continue;}
+    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 1) {payload.clear(); continue;}
+    if (hdr.msg_type & rmw_uds::SHM_PAYLOAD_FLAG) {
+      // Descriptor into the client's shm ring; swap it for the payload bytes.
+      // A failed fetch (client gone, or it lapped the ring) drops the request.
+      if (!rmw_uds::shm_fetch_payload(
+          srv_data->shm_cache, srv_data->context->domain_id, payload))
+      {
+        payload.clear();
+        continue;
+      }
+      hdr.msg_type &= ~rmw_uds::SHM_PAYLOAD_FLAG;
+      hdr.payload_size = static_cast<uint32_t>(payload.size());
+    }
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
     msg.payload = std::move(payload);
@@ -263,6 +277,26 @@ rmw_ret_t rmw_send_response(
   hdr.payload_size = static_cast<uint32_t>(payload.size());
   hdr.msg_type = 2;  // response
 
+  // Large responses travel through the service's shm ring: stage the bytes once
+  // and send a descriptor instead of a datagram the kernel would reject. Falls
+  // back to inline on shm failure. Staged once here; both send sites below fan
+  // out the same wire_data/wire_size.
+  rmw_uds::ShmPayloadDescriptor desc;
+  const uint8_t * wire_data = payload.data();
+  size_t wire_size = payload.size();
+  if (payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
+    std::lock_guard<std::mutex> lock(srv_data->shm_mutex);
+    if (rmw_uds::shm_stage_payload(
+        srv_data->shm_ring, srv_data->context->domain_id,
+        payload.data(), payload.size(), desc))
+    {
+      hdr.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
+      hdr.payload_size = static_cast<uint32_t>(sizeof(desc));
+      wire_data = reinterpret_cast<const uint8_t *>(&desc);
+      wire_size = sizeof(desc);
+    }
+  }
+
   // PERFORMANCE: cache the (GID -> path) client list; only refresh on graph change.
   auto * header = rmw_uds::registry_header(srv_data->context->registry_ptr);
   uint64_t current_gen = rmw_uds::registry_generation(header);
@@ -291,7 +325,7 @@ rmw_ret_t rmw_send_response(
     if (std::memcmp(c.gid, request_header->writer_guid, sizeof(c.gid)) == 0) {
       rmw_uds::send_to(
         srv_data->context->send_socket_fd,
-        c.socket_path, hdr, payload.data(), payload.size());
+        c.socket_path, hdr, wire_data, wire_size);
       return RMW_RET_OK;
     }
   }
@@ -306,7 +340,7 @@ rmw_ret_t rmw_send_response(
     if (std::memcmp(c.gid, request_header->writer_guid, sizeof(c.gid)) == 0) {
       rmw_uds::send_to(
         srv_data->context->send_socket_fd,
-        c.socket_path, hdr, payload.data(), payload.size());
+        c.socket_path, hdr, wire_data, wire_size);
       return RMW_RET_OK;
     }
   }

@@ -242,6 +242,12 @@ struct UdsService
   uint64_t cached_generation = 0;
   std::vector<CachedClient> cached_clients;
 
+  // Large request/response payloads (>= SHM_PAYLOAD_THRESHOLD): shm_ring stages
+  // outgoing responses; shm_cache resolves descriptors on incoming requests.
+  std::mutex shm_mutex;
+  ShmRingWriter shm_ring;
+  ShmReaderCache shm_cache;
+
   // Callback support
   std::mutex callback_mutex;
   rmw_event_callback_t on_new_request_cb = nullptr;
@@ -272,6 +278,12 @@ struct UdsClient
   uint64_t cached_generation = 0;
   std::string cached_service_path;
   bool cached_is_available = false;
+
+  // Large request/response payloads (>= SHM_PAYLOAD_THRESHOLD): shm_ring stages
+  // outgoing requests; shm_cache resolves descriptors on incoming responses.
+  std::mutex shm_mutex;
+  ShmRingWriter shm_ring;
+  ShmReaderCache shm_cache;
 
   // Callback support
   std::mutex callback_mutex;

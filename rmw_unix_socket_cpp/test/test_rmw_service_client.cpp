@@ -21,6 +21,8 @@
 #include "rmw/qos_profiles.h"
 #include "rosidl_typesupport_cpp/service_type_support.hpp"
 
+#include "../src/types.hpp"  // UdsService/UdsClient shm_ring layout only (no linked symbols)
+
 class ServiceClientTest : public RmwUdsNodeTest
 {
 protected:
@@ -132,6 +134,64 @@ TEST_F(ServiceClientTest, RequestResponseRoundTrip)
   EXPECT_EQ(84, recv_response.int32_value);
   EXPECT_TRUE(recv_response.bool_value);
   EXPECT_EQ("success", recv_response.string_value);
+}
+
+TEST_F(ServiceClientTest, LargeRequestAndResponseViaShm)
+{
+  // A >4 MB request and a >4 MB response must round-trip. Both exceed the
+  // kernel's ~4 MB single-datagram cap (buffer-independent), so success proves
+  // the client's and service's shm rings carried the payloads: on the inline
+  // path (pre-change) the datagrams would be rejected and never delivered.
+  srv = rmw_create_service(node, ts, "/large_srv", &qos);
+  cli = rmw_create_client(node, ts, "/large_srv", &qos);
+  ASSERT_NE(nullptr, srv);
+  ASSERT_NE(nullptr, cli);
+
+  std::string big_req(5 * 1024 * 1024, '\0');
+  for (size_t i = 0; i < big_req.size(); ++i) {
+    big_req[i] = static_cast<char>('A' + (i % 26));
+  }
+  std::string big_resp(5 * 1024 * 1024, '\0');
+  for (size_t i = 0; i < big_resp.size(); ++i) {
+    big_resp[i] = static_cast<char>('a' + (i % 26));
+  }
+
+  test_msgs::srv::BasicTypes::Request request;
+  request.int32_value = 7;
+  request.string_value = big_req;
+  int64_t seq_id = 0;
+  EXPECT_EQ(RMW_RET_OK, rmw_send_request(cli, &request, &seq_id));
+
+  auto * cli_data = static_cast<rmw_uds::UdsClient *>(cli->data);
+  EXPECT_NE(nullptr, cli_data->shm_ring.base)
+    << "a >4 MB request must be staged into the client's shm ring";
+
+  test_msgs::srv::BasicTypes::Request recv_request;
+  rmw_service_info_t request_header;
+  std::memset(&request_header, 0, sizeof(request_header));
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_request(srv, &request_header, &recv_request, &taken));
+  ASSERT_TRUE(taken) << "service must receive the 5 MB request";
+  EXPECT_EQ(7, recv_request.int32_value);
+  EXPECT_EQ(big_req, recv_request.string_value);
+
+  test_msgs::srv::BasicTypes::Response response;
+  response.int32_value = 9;
+  response.string_value = big_resp;
+  EXPECT_EQ(RMW_RET_OK, rmw_send_response(srv, &request_header.request_id, &response));
+
+  auto * srv_data = static_cast<rmw_uds::UdsService *>(srv->data);
+  EXPECT_NE(nullptr, srv_data->shm_ring.base)
+    << "a >4 MB response must be staged into the service's shm ring";
+
+  test_msgs::srv::BasicTypes::Response recv_response;
+  rmw_service_info_t response_header;
+  std::memset(&response_header, 0, sizeof(response_header));
+  taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_response(cli, &response_header, &recv_response, &taken));
+  ASSERT_TRUE(taken) << "client must receive the 5 MB response";
+  EXPECT_EQ(9, recv_response.int32_value);
+  EXPECT_EQ(big_resp, recv_response.string_value);
 }
 
 TEST_F(ServiceClientTest, SendResponseToGoneClientReturnsOk)

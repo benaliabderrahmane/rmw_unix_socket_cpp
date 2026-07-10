@@ -158,6 +158,8 @@ rmw_ret_t rmw_destroy_client(rmw_node_t * node, rmw_client_t * client)
       rmw_uds::registry_remove(header, cli_data->registry_index);
     }
     rmw_uds::close_socket(cli_data->socket_fd, cli_data->socket_path);
+    rmw_uds::shm_writer_close(cli_data->shm_ring);
+    rmw_uds::shm_reader_close(cli_data->shm_cache);
     delete cli_data;
   }
 
@@ -225,10 +227,29 @@ rmw_ret_t rmw_send_request(
     service_path = cli_data->cached_service_path;
   }
 
+  // Large requests travel through the client's shm ring: stage the bytes once
+  // and send a descriptor instead of a datagram the kernel would reject. Falls
+  // back to inline on shm failure.
+  rmw_uds::ShmPayloadDescriptor desc;
+  const uint8_t * wire_data = payload.data();
+  size_t wire_size = payload.size();
+  if (payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
+    std::lock_guard<std::mutex> lock(cli_data->shm_mutex);
+    if (rmw_uds::shm_stage_payload(
+        cli_data->shm_ring, cli_data->context->domain_id,
+        payload.data(), payload.size(), desc))
+    {
+      hdr.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
+      hdr.payload_size = static_cast<uint32_t>(sizeof(desc));
+      wire_data = reinterpret_cast<const uint8_t *>(&desc);
+      wire_size = sizeof(desc);
+    }
+  }
+
   if (!service_path.empty()) {
     rmw_uds::send_to(
       cli_data->context->send_socket_fd,
-      service_path, hdr, payload.data(), payload.size());
+      service_path, hdr, wire_data, wire_size);
   }
   // No service found yet — still return OK (request will be sent on retry)
   return RMW_RET_OK;
@@ -255,7 +276,19 @@ rmw_ret_t rmw_take_response(
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
   while (rmw_uds::recv_from(cli_data->socket_fd, hdr, payload)) {
-    if (hdr.msg_type != 2) {payload.clear(); continue;}
+    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 2) {payload.clear(); continue;}
+    if (hdr.msg_type & rmw_uds::SHM_PAYLOAD_FLAG) {
+      // Descriptor into the service's shm ring; swap it for the payload bytes.
+      // A failed fetch (service gone, or it lapped the ring) drops the response.
+      if (!rmw_uds::shm_fetch_payload(
+          cli_data->shm_cache, cli_data->context->domain_id, payload))
+      {
+        payload.clear();
+        continue;
+      }
+      hdr.msg_type &= ~rmw_uds::SHM_PAYLOAD_FLAG;
+      hdr.payload_size = static_cast<uint32_t>(payload.size());
+    }
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
     msg.payload = std::move(payload);
