@@ -139,9 +139,11 @@ struct ShmReaderCache
 // TRANSIENT_LOCAL cached messages. Unlike the cycling ShmRingWriter, this
 // segment is written once and never reused, so a late-joining subscriber can
 // map and replay it at any time until the cache entry is evicted. Owns its
-// mapping and shm name; the destructor unmaps and unlinks. Move-only, so a
-// CachedMessage holding one can be shuffled through the replay deque without
-// double-freeing the segment.
+// mapping and shm name; the destructor unmaps and unlinks. Non-copyable, and
+// (with a user-declared destructor and no move ops) never moved directly — it
+// is always held through a std::unique_ptr in the owning CachedMessage, and
+// that unique_ptr is what lets the cache entry move through the replay deque
+// without double-freeing or leaking the segment.
 struct DurableShmSegment
 {
   uint8_t * base = nullptr;

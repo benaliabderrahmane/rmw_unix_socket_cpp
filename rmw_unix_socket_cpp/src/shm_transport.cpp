@@ -334,8 +334,11 @@ static const ShmReaderCache::Mapping * map_segment(
   int fd = shm_open(name.c_str(), O_RDONLY, 0);
   if (fd < 0) {
     // Publisher gone (or it already replaced this segment generation and we
-    // never mapped it) — the message is lost, which is the same outcome an
-    // exiting publisher produces on the inline path.
+    // never mapped it) — the message is lost. For ring payloads that matches an
+    // exiting publisher on the inline path. For a durable TRANSIENT_LOCAL
+    // segment it is a small divergence from the pre-durable code: a 64 KiB–4 MiB
+    // latched datagram used to survive in the subscriber's socket buffer, but an
+    // unlinked durable segment can no longer be mapped after the fact.
     return nullptr;
   }
 

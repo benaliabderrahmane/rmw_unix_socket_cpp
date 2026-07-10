@@ -329,8 +329,10 @@ rmw_ret_t rmw_publish(
   // Large payloads travel through the publisher's shm ring: stage the bytes
   // once, then fan out a fixed-size descriptor instead of copying the payload
   // through every subscriber's socket buffer. Falls back to inline on any
-  // shm failure. (TRANSIENT_LOCAL returned above; its replay needs payloads
-  // that outlive the ring, so it always sends inline.)
+  // shm failure. (TRANSIENT_LOCAL returned above; because its replay must
+  // outlive the cycling ring, the TL branch stages large latched payloads into
+  // a dedicated *durable* segment via shm_stage_durable — only sub-threshold TL
+  // payloads and the shm-failure fallback send inline.)
   rmw_uds::ShmPayloadDescriptor desc;
   bool staged = false;
   if (payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
