@@ -136,11 +136,17 @@ struct UdsNode
   int32_t registry_index = -1;
 };
 
-// Cached message for TRANSIENT_LOCAL replay
+// Cached message for TRANSIENT_LOCAL replay. For large payloads, `payload`
+// holds a ShmPayloadDescriptor (header.msg_type carries SHM_PAYLOAD_FLAG) and
+// `shm_seg` owns the durable segment the descriptor points at; the segment
+// lives exactly as long as this cache entry, so it is replayable to late
+// joiners and unlinked when the entry is evicted. Small payloads keep the
+// inline bytes and leave shm_seg null.
 struct CachedMessage
 {
   WireHeader header;
   std::vector<uint8_t> payload;
+  std::unique_ptr<DurableShmSegment> shm_seg;
 };
 
 // Publisher data

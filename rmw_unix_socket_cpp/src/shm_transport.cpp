@@ -195,6 +195,111 @@ bool shm_stage_payload(
   return true;
 }
 
+std::unique_ptr<DurableShmSegment> shm_stage_durable(
+  size_t domain_id,
+  const uint8_t * payload,
+  size_t payload_size,
+  ShmPayloadDescriptor & desc_out)
+{
+  // The record header and the wire descriptor carry 32-bit lengths.
+  if (payload_size > UINT32_MAX) {
+    return nullptr;
+  }
+
+  // One record at offset 0; the segment holds nothing else and never grows.
+  const size_t record_bytes =
+    align_up(sizeof(ShmRecordHeader) + payload_size, SHM_RECORD_ALIGN);
+  const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  const size_t record_area = align_up(record_bytes, page);
+  const size_t total = sizeof(ShmRingHeader) + record_area;
+
+  // Each durable segment gets its own owner_id, so its name never collides
+  // with the publisher's ring or another cached message (and the reader's
+  // per-owner stale-mapping sweep treats each as a distinct ring). Mix in a
+  // time component for the same recycled-PID reason as create_segment.
+  const int32_t pid = getpid();
+  auto now = std::chrono::steady_clock::now().time_since_epoch();
+  uint32_t time_component = static_cast<uint32_t>(
+    std::chrono::duration_cast<std::chrono::microseconds>(now).count() & 0xFFFF);
+  const uint32_t owner_id =
+    (g_shm_owner_counter.fetch_add(1, std::memory_order_relaxed) << 16) |
+    time_component;
+  const uint64_t segment_id = 1;
+  std::string name = make_segment_name(domain_id, pid, owner_id, segment_id);
+
+  int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+  if (fd < 0 && errno == EEXIST) {
+    shm_unlink(name.c_str());
+    fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+  }
+  if (fd < 0) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "shm_open('%s') failed: %s — caching payload inline",
+      name.c_str(), std::strerror(errno));
+    return nullptr;
+  }
+
+  const int alloc_err = posix_fallocate(fd, 0, static_cast<off_t>(total));
+  if (alloc_err != 0) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "posix_fallocate('%s', %zu) failed: %s — caching payload inline",
+      name.c_str(), total, std::strerror(alloc_err));
+    close(fd);
+    shm_unlink(name.c_str());
+    return nullptr;
+  }
+
+  void * base = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);  // the mapping keeps the segment alive; the fd is not needed
+  if (base == MAP_FAILED) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "mmap('%s', %zu) failed: %s — caching payload inline",
+      name.c_str(), total, std::strerror(errno));
+    shm_unlink(name.c_str());
+    return nullptr;
+  }
+
+  auto * header = reinterpret_cast<ShmRingHeader *>(base);
+  header->magic = SHM_RING_MAGIC;
+  header->version = SHM_RING_VERSION;
+  header->ring_bytes = record_area;
+
+  // Single write-once record. No reader can reach it before the descriptor is
+  // sent, so the payload copy followed by a release store of the stable (even)
+  // seq is all the ordering the reader's acquire load needs.
+  auto * record = reinterpret_cast<ShmRecordHeader *>(
+    static_cast<uint8_t *>(base) + sizeof(ShmRingHeader));
+  const uint32_t seq_stable = 2;  // index 1 * 2; matches shm_stage_payload
+  record->payload_len = static_cast<uint32_t>(payload_size);
+  std::memcpy(record + 1, payload, payload_size);
+  record->seq.store(seq_stable, std::memory_order_release);
+
+  desc_out.segment_id = segment_id;
+  desc_out.offset = 0;
+  desc_out.seq = seq_stable;
+  desc_out.payload_size = static_cast<uint32_t>(payload_size);
+  desc_out.owner_pid = pid;
+  desc_out.owner_id = owner_id;
+
+  auto seg = std::unique_ptr<DurableShmSegment>(new DurableShmSegment());
+  seg->base = static_cast<uint8_t *>(base);
+  seg->map_size = total;
+  seg->shm_name = std::move(name);
+  return seg;
+}
+
+DurableShmSegment::~DurableShmSegment()
+{
+  if (base) {
+    munmap(base, map_size);
+    base = nullptr;
+  }
+  if (!shm_name.empty()) {
+    shm_unlink(shm_name.c_str());
+    shm_name.clear();
+  }
+}
+
 // Map (or find the cached mapping of) the segment a descriptor names.
 // Returns nullptr when the segment is gone or fails validation.
 static const ShmReaderCache::Mapping * map_segment(

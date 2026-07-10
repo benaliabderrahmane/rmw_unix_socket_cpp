@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -134,6 +135,25 @@ struct ShmReaderCache
   std::unordered_map<std::string, Mapping> mappings;
 };
 
+// A dedicated shm segment holding exactly one immutable payload record, for
+// TRANSIENT_LOCAL cached messages. Unlike the cycling ShmRingWriter, this
+// segment is written once and never reused, so a late-joining subscriber can
+// map and replay it at any time until the cache entry is evicted. Owns its
+// mapping and shm name; the destructor unmaps and unlinks. Move-only, so a
+// CachedMessage holding one can be shuffled through the replay deque without
+// double-freeing the segment.
+struct DurableShmSegment
+{
+  uint8_t * base = nullptr;
+  size_t map_size = 0;
+  std::string shm_name;
+
+  DurableShmSegment() = default;
+  ~DurableShmSegment();
+  DurableShmSegment(const DurableShmSegment &) = delete;
+  DurableShmSegment & operator=(const DurableShmSegment &) = delete;
+};
+
 // Stage a payload into the publisher's ring, creating the ring lazily and
 // recreating it larger (new segment_id, old segment unlinked) when the
 // payload outgrows it. Fills desc_out on success. Returns false when shared
@@ -141,6 +161,19 @@ struct ShmReaderCache
 // back to sending the payload inline. Caller holds UdsPublisher::shm_mutex.
 bool shm_stage_payload(
   ShmRingWriter & ring,
+  size_t domain_id,
+  const uint8_t * payload,
+  size_t payload_size,
+  ShmPayloadDescriptor & desc_out);
+
+// Stage a payload into a fresh, dedicated, immutable segment and fill desc_out.
+// The returned segment stays valid (its record never overwritten) until the
+// handle is destroyed, so a TRANSIENT_LOCAL publisher can cache the descriptor
+// and replay it to late joiners. Returns nullptr when shared memory is
+// unavailable — the caller falls back to caching the payload inline. The
+// resulting descriptor is read by the same shm_fetch_payload path as ring
+// payloads; readers cannot tell the two apart.
+std::unique_ptr<DurableShmSegment> shm_stage_durable(
   size_t domain_id,
   const uint8_t * payload,
   size_t payload_size,

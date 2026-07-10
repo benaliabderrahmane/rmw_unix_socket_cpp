@@ -272,7 +272,28 @@ rmw_ret_t rmw_publish(
 
     rmw_uds::CachedMessage cached;
     cached.header = hdr;
-    cached.payload = std::move(payload);  // last use of payload
+    // Large payloads are staged into a dedicated durable shm segment so the
+    // cache entry — and every replay of it to a late joiner — is a small
+    // descriptor rather than a multi-megabyte datagram the kernel would drop.
+    // The segment lives as long as this cache entry (unlinked on eviction).
+    // Falls back to caching the payload inline when shm is unavailable.
+    if (payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
+      rmw_uds::ShmPayloadDescriptor desc;
+      auto seg = rmw_uds::shm_stage_durable(
+        pub_data->context->domain_id, payload.data(), payload.size(), desc);
+      if (seg) {
+        cached.header.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
+        cached.header.payload_size = static_cast<uint32_t>(sizeof(desc));
+        cached.payload.assign(
+          reinterpret_cast<const uint8_t *>(&desc),
+          reinterpret_cast<const uint8_t *>(&desc) + sizeof(desc));
+        cached.shm_seg = std::move(seg);
+      } else {
+        cached.payload = std::move(payload);  // inline fallback
+      }
+    } else {
+      cached.payload = std::move(payload);  // last use of payload
+    }
     pub_data->message_cache.push_back(std::move(cached));
     while (pub_data->message_cache.size() > pub_data->qos.depth) {
       pub_data->message_cache.pop_front();

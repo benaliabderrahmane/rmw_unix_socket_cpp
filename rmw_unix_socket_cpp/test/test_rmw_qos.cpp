@@ -108,14 +108,17 @@ TEST_F(QosTest, TransientLocalLateJoiner)
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
-TEST_F(QosTest, TransientLocalLargeMessageStaysInline)
+TEST_F(QosTest, TransientLocalLargeMessageUsesDurableShm)
 {
-  // TRANSIENT_LOCAL must never use the shm ring: the replay cache has to
-  // outlive ring records, so large latched messages send inline. This pins
-  // the ordering in rmw_publish (the TL branch returns before the shm fork)
-  // — a refactor that moves the fork earlier would go unnoticed by the
-  // small-message TL tests. 100 KB: over SHM_PAYLOAD_THRESHOLD, under the
-  // stock-kernel datagram cap so the inline sends work everywhere.
+  // Large latched messages are staged into a dedicated *durable* shm segment
+  // owned by the cache entry — never the publisher's cycling ring, which would
+  // lap and corrupt a record still awaited by a late joiner. So the cached
+  // entry carries a descriptor (SHM_PAYLOAD_FLAG set), shm_ring stays untouched,
+  // and replay resolves the descriptor out of the durable segment. This also
+  // pins the ordering in rmw_publish: the TL branch must stage durably rather
+  // than fall through to the ring fork. 100 KB: over SHM_PAYLOAD_THRESHOLD,
+  // under the stock-kernel datagram cap. (See TransientLocalHugeMessageLateJoiner
+  // for the case that exceeds the cap.)
   auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
     test_msgs::msg::UnboundedSequences>();
   auto qos = make_qos(
@@ -134,10 +137,18 @@ TEST_F(QosTest, TransientLocalLargeMessageStaysInline)
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
 
   auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  {
+    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
+    ASSERT_EQ(1u, pub_data->message_cache.size());
+    const auto & cm = pub_data->message_cache.back();
+    EXPECT_NE(nullptr, cm.shm_seg)
+      << "a large TRANSIENT_LOCAL message must be cached in a durable shm segment";
+    EXPECT_TRUE(cm.header.msg_type & rmw_uds::SHM_PAYLOAD_FLAG);
+  }
   EXPECT_EQ(nullptr, pub_data->shm_ring.base)
-    << "a TRANSIENT_LOCAL publish must not create a shm ring";
+    << "TRANSIENT_LOCAL must use a durable segment, never the cycling ring";
 
-  // A late joiner must get the cached message via inline replay.
+  // A late joiner must get the cached message via durable-shm replay.
   auto sub_opts = rmw_get_default_subscription_options();
   auto * sub = rmw_create_subscription(node, seq_ts, "/latched_large", &qos, &sub_opts);
   ASSERT_NE(nullptr, sub);
@@ -152,6 +163,62 @@ TEST_F(QosTest, TransientLocalLargeMessageStaysInline)
   EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
   ASSERT_TRUE(taken);
   EXPECT_EQ(msg.uint8_values, recv.uint8_values);
+
+  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+  ASSERT_TRUE(taken);
+  EXPECT_EQ(trigger.uint8_values, recv.uint8_values);
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalHugeMessageLateJoiner)
+{
+  // Regression for the reported bug: a latched message larger than the kernel's
+  // ~4 MB single-datagram cap must still reach a late joiner. On the old inline
+  // path the 5 MB replay datagram was rejected by the kernel (EMSGSIZE without
+  // the raised sysctls, ENOBUFS with them) and silently dropped, so the late
+  // joiner got nothing. Through the durable shm segment only a ~69-byte
+  // descriptor crosses the socket, so replay works regardless of sysctl tuning.
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, seq_ts, "/latched_huge", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  // Publish a 5 MB message BEFORE any subscriber exists — it is cached durably.
+  test_msgs::msg::UnboundedSequences big;
+  big.uint8_values.resize(5 * 1024 * 1024);
+  for (size_t i = 0; i < big.uint8_values.size(); ++i) {
+    big.uint8_values[i] = static_cast<uint8_t>((i * 131 + 7) & 0xFF);
+  }
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &big, nullptr));
+
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  {
+    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
+    ASSERT_EQ(1u, pub_data->message_cache.size());
+    EXPECT_NE(nullptr, pub_data->message_cache.back().shm_seg);
+  }
+
+  // Late joiner, then a small publish to trigger replay of the cached 5 MB msg.
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, seq_ts, "/latched_huge", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  test_msgs::msg::UnboundedSequences trigger;
+  trigger.uint8_values = {9, 8, 7};
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &trigger, nullptr));
+
+  test_msgs::msg::UnboundedSequences recv;
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+  ASSERT_TRUE(taken) << "late joiner must receive the cached 5 MB message";
+  EXPECT_EQ(big.uint8_values, recv.uint8_values);
 
   EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
   ASSERT_TRUE(taken);
