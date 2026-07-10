@@ -194,6 +194,52 @@ TEST_F(ServiceClientTest, LargeRequestAndResponseViaShm)
   EXPECT_EQ(big_resp, recv_response.string_value);
 }
 
+TEST_F(ServiceClientTest, LargeRequestDeliveredThroughWaitDrain)
+{
+  // rmw_wait drains service sockets into the request queue; it must resolve a
+  // large-request shm descriptor there too, not only in rmw_take_request. Real
+  // executors always wait before taking, so if the wait drain dropped the
+  // descriptor the request would be lost before take ever ran.
+  srv = rmw_create_service(node, ts, "/large_wait_srv", &qos);
+  cli = rmw_create_client(node, ts, "/large_wait_srv", &qos);
+  ASSERT_NE(nullptr, srv);
+  ASSERT_NE(nullptr, cli);
+
+  std::string big(5 * 1024 * 1024, '\0');
+  for (size_t i = 0; i < big.size(); ++i) {
+    big[i] = static_cast<char>('A' + (i % 26));
+  }
+  test_msgs::srv::BasicTypes::Request request;
+  request.int32_value = 5;
+  request.string_value = big;
+  int64_t seq_id = 0;
+  EXPECT_EQ(RMW_RET_OK, rmw_send_request(cli, &request, &seq_id));
+
+  // Drain via rmw_wait (not a direct take) to exercise the wait-side path.
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  rmw_services_t services;
+  void * srv_array[1] = {srv->data};
+  services.services = srv_array;
+  services.service_count = 1;
+  rmw_time_t timeout;
+  timeout.sec = 1;
+  timeout.nsec = 0;
+  EXPECT_EQ(
+    RMW_RET_OK,
+    rmw_wait(nullptr, nullptr, &services, nullptr, nullptr, ws, &timeout));
+
+  test_msgs::srv::BasicTypes::Request recv_request;
+  rmw_service_info_t request_header;
+  std::memset(&request_header, 0, sizeof(request_header));
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_request(srv, &request_header, &recv_request, &taken));
+  ASSERT_TRUE(taken) << "a 5 MB request drained by rmw_wait must be delivered";
+  EXPECT_EQ(big, recv_request.string_value);
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+}
+
 TEST_F(ServiceClientTest, SendResponseToGoneClientReturnsOk)
 {
   // A service that responds after its client has shut down must NOT return an

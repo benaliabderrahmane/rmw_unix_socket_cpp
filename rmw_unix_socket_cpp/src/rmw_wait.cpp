@@ -41,17 +41,17 @@ static int64_t now_ns()
 }
 
 // Drain a socket into a message queue (subscription, service, or client).
-// shm_cache/domain_id resolve large-payload descriptors on subscription
-// sockets (only topic messages ever carry SHM_PAYLOAD_FLAG); services and
-// clients pass nullptr.
+// `shm_cache`/`domain_id` resolve large-payload descriptors: topic, request,
+// and response messages can all carry SHM_PAYLOAD_FLAG, so every caller passes
+// its own reader cache.
 static void drain_socket(
   int fd,
   std::mutex & queue_mutex,
   std::deque<rmw_uds::ReceivedMessage> & queue,
   size_t max_depth,
   uint8_t expected_msg_type,
-  rmw_uds::ShmReaderCache * shm_cache = nullptr,
-  size_t domain_id = 0)
+  rmw_uds::ShmReaderCache & shm_cache,
+  size_t domain_id)
 {
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
@@ -61,18 +61,9 @@ static void drain_socket(
       payload.clear();
       continue;
     }
-
-    if (hdr.msg_type & rmw_uds::SHM_PAYLOAD_FLAG) {
-      // Descriptor into the publisher's shm ring; swap it for the payload.
-      // A failed fetch (publisher gone or ring lapped) is a dropped message.
-      if (!shm_cache ||
-        !rmw_uds::shm_fetch_payload(*shm_cache, domain_id, payload))
-      {
-        payload.clear();
-        continue;
-      }
-      hdr.msg_type &= ~rmw_uds::SHM_PAYLOAD_FLAG;
-      hdr.payload_size = static_cast<uint32_t>(payload.size());
+    if (!rmw_uds::shm_resolve_incoming(shm_cache, domain_id, hdr, payload)) {
+      payload.clear();
+      continue;  // shm descriptor unresolvable (sender gone / ring lapped)
     }
 
     rmw_uds::ReceivedMessage msg;
@@ -169,7 +160,7 @@ rmw_ret_t rmw_wait(
       if (!subscriptions->subscribers[i]) {continue;}
       auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
       drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-        sub->queue_depth, 0, &sub->shm_cache, sub->context->domain_id);
+        sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id);
     }
   }
 
@@ -177,7 +168,8 @@ rmw_ret_t rmw_wait(
     for (size_t i = 0; i < services->service_count; ++i) {
       if (!services->services[i]) {continue;}
       auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
-      drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1);
+      drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1,
+        srv->shm_cache, srv->context->domain_id);
     }
   }
 
@@ -185,7 +177,8 @@ rmw_ret_t rmw_wait(
     for (size_t i = 0; i < clients->client_count; ++i) {
       if (!clients->clients[i]) {continue;}
       auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
-      drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2);
+      drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2,
+        cli->shm_cache, cli->context->domain_id);
     }
   }
 
@@ -435,21 +428,23 @@ rmw_ret_t rmw_wait(
         if (!subscriptions->subscribers[i]) {continue;}
         auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
         drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-          sub->queue_depth, 0, &sub->shm_cache, sub->context->domain_id);
+          sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id);
       }
     }
     if (services) {
       for (size_t i = 0; i < services->service_count; ++i) {
         if (!services->services[i]) {continue;}
         auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
-        drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1);
+        drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1,
+        srv->shm_cache, srv->context->domain_id);
       }
     }
     if (clients) {
       for (size_t i = 0; i < clients->client_count; ++i) {
         if (!clients->clients[i]) {continue;}
         auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
-        drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2);
+        drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2,
+        cli->shm_cache, cli->context->domain_id);
       }
     }
   }

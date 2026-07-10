@@ -65,18 +65,10 @@ static void drain_subscription(rmw_uds::UdsSubscription * sub)
   while (rmw_uds::recv_from(sub->socket_fd, hdr, payload)) {
     if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 0) {continue;}  // Not a topic message
 
-    if (hdr.msg_type & rmw_uds::SHM_PAYLOAD_FLAG) {
-      // The datagram carries a descriptor into the publisher's shm ring;
-      // swap it for the payload bytes. A failed fetch (publisher gone, or
-      // it lapped the ring) is a dropped message — the same outcome a
-      // socket-buffer overflow produces on the inline path.
-      if (!rmw_uds::shm_fetch_payload(
-          sub->shm_cache, sub->context->domain_id, payload))
-      {
-        continue;
-      }
-      hdr.msg_type &= ~rmw_uds::SHM_PAYLOAD_FLAG;
-      hdr.payload_size = static_cast<uint32_t>(payload.size());
+    if (!rmw_uds::shm_resolve_incoming(
+        sub->shm_cache, sub->context->domain_id, hdr, payload))
+    {
+      continue;  // shm descriptor unresolvable (publisher gone / ring lapped)
     }
 
     rmw_uds::ReceivedMessage msg;

@@ -227,29 +227,17 @@ rmw_ret_t rmw_send_request(
     service_path = cli_data->cached_service_path;
   }
 
-  // Large requests travel through the client's shm ring: stage the bytes once
-  // and send a descriptor instead of a datagram the kernel would reject. Falls
-  // back to inline on shm failure.
+  // Large requests travel through the client's shm ring: stage once, send a
+  // descriptor instead of a datagram the kernel would reject.
   rmw_uds::ShmPayloadDescriptor desc;
-  const uint8_t * wire_data = payload.data();
-  size_t wire_size = payload.size();
-  if (payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
-    std::lock_guard<std::mutex> lock(cli_data->shm_mutex);
-    if (rmw_uds::shm_stage_payload(
-        cli_data->shm_ring, cli_data->context->domain_id,
-        payload.data(), payload.size(), desc))
-    {
-      hdr.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
-      hdr.payload_size = static_cast<uint32_t>(sizeof(desc));
-      wire_data = reinterpret_cast<const uint8_t *>(&desc);
-      wire_size = sizeof(desc);
-    }
-  }
+  auto wire = rmw_uds::shm_prepare_send(
+    cli_data->shm_ring, cli_data->shm_mutex, cli_data->context->domain_id,
+    payload.data(), payload.size(), hdr, desc);
 
   if (!service_path.empty()) {
     rmw_uds::send_to(
       cli_data->context->send_socket_fd,
-      service_path, hdr, wire_data, wire_size);
+      service_path, hdr, wire.data, wire.size);
   }
   // No service found yet — still return OK (request will be sent on retry)
   return RMW_RET_OK;
@@ -277,17 +265,11 @@ rmw_ret_t rmw_take_response(
   std::vector<uint8_t> payload;
   while (rmw_uds::recv_from(cli_data->socket_fd, hdr, payload)) {
     if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 2) {payload.clear(); continue;}
-    if (hdr.msg_type & rmw_uds::SHM_PAYLOAD_FLAG) {
-      // Descriptor into the service's shm ring; swap it for the payload bytes.
-      // A failed fetch (service gone, or it lapped the ring) drops the response.
-      if (!rmw_uds::shm_fetch_payload(
-          cli_data->shm_cache, cli_data->context->domain_id, payload))
-      {
-        payload.clear();
-        continue;
-      }
-      hdr.msg_type &= ~rmw_uds::SHM_PAYLOAD_FLAG;
-      hdr.payload_size = static_cast<uint32_t>(payload.size());
+    if (!rmw_uds::shm_resolve_incoming(
+        cli_data->shm_cache, cli_data->context->domain_id, hdr, payload))
+    {
+      payload.clear();
+      continue;
     }
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;

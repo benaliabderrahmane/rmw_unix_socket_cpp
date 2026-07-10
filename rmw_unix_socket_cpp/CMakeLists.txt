@@ -148,8 +148,10 @@ if(BUILD_TESTING)
   target_link_libraries(test_serialization ${_unit_test_deps} ${_test_msg_deps})
   target_include_directories(test_serialization PRIVATE src)
 
-  # Unit test: transport
-  ament_add_gtest(test_transport test/test_transport.cpp src/transport.cpp)
+  # Unit test: transport (transport.cpp's shm_prepare_send/shm_resolve_incoming
+  # call into shm_transport.cpp, so it is compiled in too).
+  ament_add_gtest(test_transport
+    test/test_transport.cpp src/transport.cpp src/shm_transport.cpp)
   target_link_libraries(test_transport ${_unit_test_deps})
   target_include_directories(test_transport PRIVATE src)
 

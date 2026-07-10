@@ -362,21 +362,9 @@ rmw_ret_t rmw_publish(
   // a dedicated *durable* segment via shm_stage_durable — only sub-threshold TL
   // payloads and the shm-failure fallback send inline.)
   rmw_uds::ShmPayloadDescriptor desc;
-  bool staged = false;
-  if (payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
-    std::lock_guard<std::mutex> lock(pub_data->shm_mutex);
-    staged = rmw_uds::shm_stage_payload(
-      pub_data->shm_ring, pub_data->context->domain_id,
-      payload.data(), payload.size(), desc);
-  }
-  const uint8_t * wire_data = payload.data();
-  size_t wire_size = payload.size();
-  if (staged) {
-    hdr.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
-    hdr.payload_size = static_cast<uint32_t>(sizeof(desc));
-    wire_data = reinterpret_cast<const uint8_t *>(&desc);
-    wire_size = sizeof(desc);
-  }
+  auto wire = rmw_uds::shm_prepare_send(
+    pub_data->shm_ring, pub_data->shm_mutex, pub_data->context->domain_id,
+    payload.data(), payload.size(), hdr, desc);
 
   // Surface EMSGSIZE; soft drops (EAGAIN/ENOENT) are logged in send_to.
   bool config_error = false;
@@ -384,7 +372,7 @@ rmw_ret_t rmw_publish(
     for (const auto & path : *sub_paths) {
       if (rmw_uds::send_to(
           pub_data->context->send_socket_fd,
-          path, hdr, wire_data, wire_size) == rmw_uds::SendResult::ConfigError)
+          path, hdr, wire.data, wire.size) == rmw_uds::SendResult::ConfigError)
       {
         config_error = true;
       }
@@ -475,28 +463,16 @@ rmw_ret_t rmw_publish_serialized_message(
 
   // Large non-TL payloads: stage once into the cycling ring, fan out descriptors.
   rmw_uds::ShmPayloadDescriptor desc;
-  bool staged = false;
-  if (serialized_message->buffer_length >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
-    std::lock_guard<std::mutex> lock(pub_data->shm_mutex);
-    staged = rmw_uds::shm_stage_payload(
-      pub_data->shm_ring, pub_data->context->domain_id,
-      serialized_message->buffer, serialized_message->buffer_length, desc);
-  }
-  const uint8_t * wire_data = serialized_message->buffer;
-  size_t wire_size = serialized_message->buffer_length;
-  if (staged) {
-    hdr.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
-    hdr.payload_size = static_cast<uint32_t>(sizeof(desc));
-    wire_data = reinterpret_cast<const uint8_t *>(&desc);
-    wire_size = sizeof(desc);
-  }
+  auto wire = rmw_uds::shm_prepare_send(
+    pub_data->shm_ring, pub_data->shm_mutex, pub_data->context->domain_id,
+    serialized_message->buffer, serialized_message->buffer_length, hdr, desc);
 
   bool config_error = false;
   if (sub_paths) {
     for (const auto & path : *sub_paths) {
       if (rmw_uds::send_to(
           pub_data->context->send_socket_fd,
-          path, hdr, wire_data, wire_size) == rmw_uds::SendResult::ConfigError)
+          path, hdr, wire.data, wire.size) == rmw_uds::SendResult::ConfigError)
       {
         config_error = true;
       }

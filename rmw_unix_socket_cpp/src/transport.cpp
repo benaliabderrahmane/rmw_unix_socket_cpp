@@ -261,6 +261,48 @@ bool recv_from(
   return true;
 }
 
+OutboundPayload shm_prepare_send(
+  ShmRingWriter & ring,
+  std::mutex & mtx,
+  size_t domain_id,
+  const uint8_t * payload,
+  size_t payload_size,
+  WireHeader & hdr,
+  ShmPayloadDescriptor & desc)
+{
+  OutboundPayload out{payload, payload_size};
+  if (payload_size < SHM_PAYLOAD_THRESHOLD) {
+    return out;
+  }
+  std::lock_guard<std::mutex> lock(mtx);
+  if (shm_stage_payload(ring, domain_id, payload, payload_size, desc)) {
+    hdr.msg_type |= SHM_PAYLOAD_FLAG;
+    hdr.payload_size = static_cast<uint32_t>(sizeof(desc));
+    out.data = reinterpret_cast<const uint8_t *>(&desc);
+    out.size = sizeof(desc);
+  }
+  return out;
+}
+
+bool shm_resolve_incoming(
+  ShmReaderCache & cache,
+  size_t domain_id,
+  WireHeader & hdr,
+  std::vector<uint8_t> & payload)
+{
+  if (!(hdr.msg_type & SHM_PAYLOAD_FLAG)) {
+    return true;  // inline payload — nothing to resolve
+  }
+  // A failed fetch (sender gone or ring lapped) means drop the datagram, the
+  // same outcome a socket-buffer overflow produces on the inline path.
+  if (!shm_fetch_payload(cache, domain_id, payload)) {
+    return false;
+  }
+  hdr.msg_type &= ~SHM_PAYLOAD_FLAG;
+  hdr.payload_size = static_cast<uint32_t>(payload.size());
+  return true;
+}
+
 std::string make_socket_path(size_t domain_id, const char * prefix)
 {
   // Use PID + a globally unique counter to avoid path collisions.
