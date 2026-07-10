@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -45,11 +46,14 @@ namespace rmw_uds
 // inline datagram is both simpler and faster (no page faults, no seqlock).
 static constexpr size_t SHM_PAYLOAD_THRESHOLD = 64 * 1024;
 
-// Smallest ring a publisher creates. A ring is always sized to hold at least
-// four records of the largest payload staged so far, so a subscriber that is
-// one wait-wakeup behind still finds the record intact (KEEP_LAST depths
-// above that are bounded by the socket queue, not the ring).
-static constexpr size_t SHM_RING_MIN_BYTES = 8 * 1024 * 1024;
+// Smallest ring a publisher (or service/client) creates. A ring is always
+// sized to hold at least four records of the largest payload staged so far
+// (see create_segment: max(this, 4*record)), so a subscriber that is one
+// wait-wakeup behind still finds the record intact regardless of this floor;
+// this only sets the minimum for small large-payloads. posix_fallocate commits
+// the whole ring's RAM up front, and every large-message sender pays it, so the
+// floor is kept modest: 1 MiB still holds 16 records at the 64 KiB threshold.
+static constexpr size_t SHM_RING_MIN_BYTES = 1 * 1024 * 1024;
 
 static constexpr uint32_t SHM_RING_MAGIC = 0x52534455;  // "UDSR"
 static constexpr uint32_t SHM_RING_VERSION = 1;
@@ -118,11 +122,36 @@ struct ShmRingWriter
   std::string shm_name;
 };
 
-// Subscriber-side cache of mapped publisher rings, keyed by shm name. One
-// entry per (publisher ring, segment generation) seen; internally locked
-// because rmw_wait and rmw_take may drain the same subscription concurrently.
+// Subscriber-side cache of mapped publisher rings, keyed by the segment's
+// (owner_pid, owner_id, segment_id) — a 16-byte POD, so the receive hot path
+// does an integer-keyed lookup instead of rebuilding and hashing the segment
+// path string per message. domain_id is constant per cache instance, so those
+// three descriptor fields uniquely identify a segment. One entry per (ring,
+// generation) seen; internally locked because rmw_wait and rmw_take may drain
+// the same subscription concurrently.
 struct ShmReaderCache
 {
+  struct Key
+  {
+    int32_t owner_pid;
+    uint32_t owner_id;
+    uint64_t segment_id;
+    bool operator==(const Key & o) const
+    {
+      return owner_pid == o.owner_pid && owner_id == o.owner_id &&
+             segment_id == o.segment_id;
+    }
+  };
+  struct KeyHash
+  {
+    size_t operator()(const Key & k) const
+    {
+      size_t h = std::hash<uint64_t>()(k.segment_id);
+      h ^= std::hash<uint32_t>()(k.owner_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      h ^= std::hash<int32_t>()(k.owner_pid) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
   struct Mapping
   {
     uint8_t * base = nullptr;
@@ -130,9 +159,12 @@ struct ShmReaderCache
     // Ring capacity as validated at map time. Bounds checks use this
     // snapshot, never the live (owner-writable) header in the mapping.
     size_t ring_bytes = 0;
+    // Segment path, built once when mapped; reused by the liveness-probe sweep
+    // so a hit never rebuilds it.
+    std::string shm_name;
   };
   std::mutex mutex;
-  std::unordered_map<std::string, Mapping> mappings;
+  std::unordered_map<Key, Mapping, KeyHash> mappings;
 };
 
 // A dedicated shm segment holding exactly one immutable payload record, for

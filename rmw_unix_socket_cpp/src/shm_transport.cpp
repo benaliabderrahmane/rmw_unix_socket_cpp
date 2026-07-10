@@ -313,12 +313,11 @@ DurableShmSegment::~DurableShmSegment()
 static const ShmReaderCache::Mapping * map_segment(
   ShmReaderCache & cache, size_t domain_id, const ShmPayloadDescriptor & desc)
 {
-  const std::string name = make_segment_name(
-    domain_id, desc.owner_pid, desc.owner_id, desc.segment_id);
+  const ShmReaderCache::Key key{desc.owner_pid, desc.owner_id, desc.segment_id};
 
-  auto it = cache.mappings.find(name);
+  auto it = cache.mappings.find(key);
   if (it != cache.mappings.end()) {
-    return &it->second;
+    return &it->second;  // hot path: integer-keyed lookup, no string work
   }
 
   // Publisher churn accumulates mappings of rings whose names are gone
@@ -326,7 +325,7 @@ static const ShmReaderCache::Mapping * map_segment(
   // grown past a handful of publishers, so steady state pays nothing.
   if (cache.mappings.size() >= 8) {
     for (auto stale = cache.mappings.begin(); stale != cache.mappings.end(); ) {
-      int probe = shm_open(stale->first.c_str(), O_RDONLY, 0);
+      int probe = shm_open(stale->second.shm_name.c_str(), O_RDONLY, 0);
       if (probe < 0 && errno == ENOENT) {
         munmap(stale->second.base, stale->second.size);
         stale = cache.mappings.erase(stale);
@@ -339,6 +338,9 @@ static const ShmReaderCache::Mapping * map_segment(
     }
   }
 
+  // Miss: build the segment name (only here, never on the hot hit path).
+  std::string name = make_segment_name(
+    domain_id, desc.owner_pid, desc.owner_id, desc.segment_id);
   int fd = shm_open(name.c_str(), O_RDONLY, 0);
   if (fd < 0) {
     // Publisher gone (or it already replaced this segment generation and we
@@ -380,14 +382,15 @@ static const ShmReaderCache::Mapping * map_segment(
     return nullptr;
   }
 
-  // A new segment generation supersedes older ones from the same ring:
-  // drop stale mappings so a long-lived subscription doesn't accumulate one
-  // mapping per growth step of every publisher it ever listened to.
-  char prefix[96];
-  std::snprintf(prefix, sizeof(prefix), "/ros2_uds_data_%zu_%d_%u_",
-    domain_id, desc.owner_pid, desc.owner_id);
+  // A new segment generation supersedes older ones from the same ring: same
+  // (owner_pid, owner_id), different segment_id. Drop those stale mappings so a
+  // long-lived subscription doesn't accumulate one mapping per growth step of
+  // every publisher it ever listened to.
   for (auto stale = cache.mappings.begin(); stale != cache.mappings.end(); ) {
-    if (stale->first.rfind(prefix, 0) == 0) {
+    if (stale->first.owner_pid == desc.owner_pid &&
+      stale->first.owner_id == desc.owner_id &&
+      stale->first.segment_id != desc.segment_id)
+    {
       munmap(stale->second.base, stale->second.size);
       stale = cache.mappings.erase(stale);
     } else {
@@ -401,7 +404,8 @@ static const ShmReaderCache::Mapping * map_segment(
   // Snapshot the validated capacity: every later bounds check uses this
   // copy, never the live header, which the segment's owner keeps writable.
   mapping.ring_bytes = static_cast<size_t>(header->ring_bytes);
-  return &cache.mappings.emplace(name, mapping).first->second;
+  mapping.shm_name = std::move(name);  // kept for the liveness-probe sweep
+  return &cache.mappings.emplace(key, std::move(mapping)).first->second;
 }
 
 bool shm_fetch_payload(

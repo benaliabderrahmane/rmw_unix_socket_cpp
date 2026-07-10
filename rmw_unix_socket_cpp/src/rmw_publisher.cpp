@@ -205,8 +205,12 @@ static rmw_ret_t transient_local_publish(
   std::vector<uint8_t> payload,
   const std::shared_ptr<const std::vector<std::string>> & sub_paths)
 {
-  std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-
+  // Build the cache entry — including the shm_stage_durable() syscalls
+  // (shm_open/posix_fallocate/mmap, up to milliseconds) — BEFORE taking
+  // cache_mutex. Staging reads only the payload, the immutable domain id, and a
+  // global atomic counter, none of it guarded by cache_mutex, so this is
+  // data-safe and keeps the multi-ms segment create off a lock that rmw_wait's
+  // replay holds under the process-wide transient_local_pubs_mutex.
   rmw_uds::CachedMessage cached;
   cached.header = hdr;
   if (payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
@@ -226,39 +230,48 @@ static rmw_ret_t transient_local_publish(
   } else {
     cached.payload = std::move(payload);
   }
-  pub_data->message_cache.push_back(std::move(cached));
-  while (pub_data->message_cache.size() > pub_data->qos.depth) {
-    pub_data->message_cache.pop_front();
-  }
 
-  if (sub_paths) {
-    for (const auto & path : *sub_paths) {
-      if (pub_data->known_subscriber_paths.count(path) == 0) {
-        pub_data->known_subscriber_paths.insert(path);
-        for (size_t i = 0; i + 1 < pub_data->message_cache.size(); ++i) {
-          const auto & cm = pub_data->message_cache[i];
-          rmw_uds::send_to(
-            pub_data->context->send_socket_fd,
-            path, cm.header, cm.payload.data(), cm.payload.size());
+  // Entries trimmed past qos.depth destruct (munmap + shm_unlink of their
+  // durable segment) after the lock is released, keeping that syscall off
+  // cache_mutex too.
+  std::deque<rmw_uds::CachedMessage> evicted;
+  bool config_error = false;
+  {
+    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
+    pub_data->message_cache.push_back(std::move(cached));
+    while (pub_data->message_cache.size() > pub_data->qos.depth) {
+      evicted.push_back(std::move(pub_data->message_cache.front()));
+      pub_data->message_cache.pop_front();
+    }
+
+    if (sub_paths) {
+      for (const auto & path : *sub_paths) {
+        if (pub_data->known_subscriber_paths.count(path) == 0) {
+          pub_data->known_subscriber_paths.insert(path);
+          for (size_t i = 0; i + 1 < pub_data->message_cache.size(); ++i) {
+            const auto & cm = pub_data->message_cache[i];
+            rmw_uds::send_to(
+              pub_data->context->send_socket_fd,
+              path, cm.header, cm.payload.data(), cm.payload.size());
+          }
         }
       }
     }
-  }
 
-  // Send the current message, read from the cached copy since payload was
-  // moved. Trimming never disturbs back(), so it is the message just pushed.
-  // Surface EMSGSIZE the way the non-TL path does so a latched payload the
-  // kernel rejects is not reported as a successful publish.
-  const auto & current = pub_data->message_cache.back();
-  bool config_error = false;
-  if (sub_paths) {
-    for (const auto & path : *sub_paths) {
-      if (rmw_uds::send_to(
-          pub_data->context->send_socket_fd,
-          path, current.header, current.payload.data(), current.payload.size())
-        == rmw_uds::SendResult::ConfigError)
-      {
-        config_error = true;
+    // Send the current message, read from the cached copy since payload was
+    // moved. Trimming never disturbs back(), so it is the message just pushed.
+    // Surface EMSGSIZE the way the non-TL path does so a latched payload the
+    // kernel rejects is not reported as a successful publish.
+    const auto & current = pub_data->message_cache.back();
+    if (sub_paths) {
+      for (const auto & path : *sub_paths) {
+        if (rmw_uds::send_to(
+            pub_data->context->send_socket_fd,
+            path, current.header, current.payload.data(), current.payload.size())
+          == rmw_uds::SendResult::ConfigError)
+        {
+          config_error = true;
+        }
       }
     }
   }
