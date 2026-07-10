@@ -228,6 +228,156 @@ TEST_F(QosTest, TransientLocalHugeMessageLateJoiner)
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
+TEST_F(QosTest, TransientLocalPublishReturnsErrorOnEMSGSIZE)
+{
+  // A latched publish whose live send is rejected by the kernel size cap must
+  // return RMW_RET_ERROR, not a lying RMW_RET_OK. Before the fix the TL path
+  // ignored send_to's result entirely. Shrink SO_SNDBUF so a sub-threshold
+  // (inline) latched message hits EMSGSIZE deterministically, independent of
+  // the machine's net.core.wmem_max.
+  auto * ctx_impl = reinterpret_cast<rmw_uds::UdsContext *>(context.impl);
+  int small_buf = 2048;
+  ASSERT_EQ(
+    0,
+    setsockopt(
+      ctx_impl->send_socket_fd, SOL_SOCKET, SO_SNDBUF,
+      &small_buf, sizeof(small_buf)));
+
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, seq_ts, "/tl_emsgsize", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, seq_ts, "/tl_emsgsize", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  // 32 KiB: above the shrunken buffer, below SHM_PAYLOAD_THRESHOLD so it stays
+  // on the inline datagram path (a durable-staged payload would bypass the cap).
+  test_msgs::msg::UnboundedSequences msg;
+  msg.uint8_values.resize(32 * 1024);
+  EXPECT_EQ(RMW_RET_ERROR, rmw_publish(pub, &msg, nullptr));
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalLargeMessageInlineFallbackWhenShmUnavailable)
+{
+  // When shm staging is unavailable, a large latched payload falls back to
+  // caching inline (no durable segment, no SHM_PAYLOAD_FLAG) and is still
+  // delivered byte-equal to a late joiner. The test seam forces the failure.
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, seq_ts, "/tl_fallback", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  setenv("RMW_UDS_TEST_FORCE_SHM_FAILURE", "1", 1);
+  test_msgs::msg::UnboundedSequences msg;
+  msg.uint8_values.resize(100 * 1024);
+  for (size_t i = 0; i < msg.uint8_values.size(); ++i) {
+    msg.uint8_values[i] = static_cast<uint8_t>((i * 5 + 2) & 0xFF);
+  }
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+  unsetenv("RMW_UDS_TEST_FORCE_SHM_FAILURE");  // reset before it leaks to other tests
+
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  {
+    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
+    ASSERT_EQ(1u, pub_data->message_cache.size());
+    const auto & cm = pub_data->message_cache.back();
+    EXPECT_EQ(nullptr, cm.shm_seg)
+      << "shm forced unavailable — the large payload must be cached inline";
+    EXPECT_FALSE(cm.header.msg_type & rmw_uds::SHM_PAYLOAD_FLAG);
+  }
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, seq_ts, "/tl_fallback", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+  test_msgs::msg::UnboundedSequences trigger;
+  trigger.uint8_values = {5, 6, 7};
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &trigger, nullptr));
+
+  test_msgs::msg::UnboundedSequences recv;
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+  ASSERT_TRUE(taken) << "late joiner must receive the inline-fallback message";
+  EXPECT_EQ(msg.uint8_values, recv.uint8_values);
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalSerializedLargeMessageLateJoiner)
+{
+  // rmw_publish_serialized_message now feeds the TL replay cache and stages
+  // large latched payloads durably, so a >cap serialized latched message
+  // reaches a late joiner. Previously that entry point never cached, so the
+  // message was sent inline once and dropped for anyone who joined later.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/tl_serialized_huge", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  constexpr size_t big_size = 5 * 1024 * 1024;
+  rmw_serialized_message_t serialized;
+  serialized.buffer_capacity = big_size;
+  serialized.buffer_length = big_size;
+  serialized.buffer = static_cast<uint8_t *>(std::malloc(big_size));
+  ASSERT_NE(nullptr, serialized.buffer);
+  for (size_t i = 0; i < big_size; ++i) {
+    serialized.buffer[i] = static_cast<uint8_t>((i * 131 + 7) & 0xFF);
+  }
+  serialized.allocator = rcutils_get_default_allocator();
+
+  // Publish BEFORE any subscriber — must be cached in a durable segment.
+  EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &serialized, nullptr));
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  {
+    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
+    ASSERT_EQ(1u, pub_data->message_cache.size());
+    EXPECT_NE(nullptr, pub_data->message_cache.back().shm_seg);
+  }
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/tl_serialized_huge", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  uint8_t trig_bytes[] = {1, 2, 3, 4};
+  rmw_serialized_message_t trig;
+  trig.buffer = trig_bytes;
+  trig.buffer_length = sizeof(trig_bytes);
+  trig.buffer_capacity = sizeof(trig_bytes);
+  trig.allocator = rcutils_get_default_allocator();
+  EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &trig, nullptr));
+
+  rmw_serialized_message_t received = rmw_get_zero_initialized_serialized_message();
+  ASSERT_EQ(RMW_RET_OK, rmw_serialized_message_init(&received, 0, &serialized.allocator));
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_serialized_message(sub, &received, &taken, nullptr));
+  ASSERT_TRUE(taken) << "late joiner must receive the cached 5 MB serialized message";
+  ASSERT_EQ(big_size, received.buffer_length);
+  EXPECT_EQ(0, std::memcmp(serialized.buffer, received.buffer, big_size));
+
+  EXPECT_EQ(RMW_RET_OK, rmw_take_serialized_message(sub, &received, &taken, nullptr));
+  ASSERT_TRUE(taken);
+  ASSERT_EQ(sizeof(trig_bytes), received.buffer_length);
+
+  auto _f [[maybe_unused]] = rmw_serialized_message_fini(&received);
+  std::free(serialized.buffer);
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
 TEST_F(QosTest, KnownSubscriberPathsPrunedOnChurn)
 {
   // The publisher's known_subscriber_paths must not accumulate dead entries as

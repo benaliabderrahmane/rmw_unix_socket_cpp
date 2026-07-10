@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <dirent.h>
@@ -203,6 +204,12 @@ std::unique_ptr<DurableShmSegment> shm_stage_durable(
 {
   // The record header and the wire descriptor carry 32-bit lengths.
   if (payload_size > UINT32_MAX) {
+    return nullptr;
+  }
+  // Test seam (cold path, large latched publishes only): when this env var is
+  // set, behave as if shared memory were unavailable so tests can exercise the
+  // inline fallback deterministically. Never set in production.
+  if (std::getenv("RMW_UDS_TEST_FORCE_SHM_FAILURE") != nullptr) {
     return nullptr;
   }
 

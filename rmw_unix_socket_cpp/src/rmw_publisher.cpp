@@ -188,6 +188,89 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
   return RMW_RET_OK;
 }
 
+// Cache a TRANSIENT_LOCAL message for late-joiner replay and send it now.
+// Shared by rmw_publish and rmw_publish_serialized_message. Large payloads
+// (>= SHM_PAYLOAD_THRESHOLD) are staged into a dedicated durable shm segment
+// (shm_stage_durable) so the cached entry and its replays are a small
+// descriptor rather than a datagram the kernel would reject; small payloads and
+// the shm-unavailable fallback are cached inline. `payload` is taken by value:
+// callers std::move a serialized vector in, so the common path is one move, and
+// the inline branch keeps the bytes with no copy. Returns RMW_RET_ERROR if the
+// live send of the current message hits the kernel size cap (EMSGSIZE),
+// mirroring the non-TL path; replay of previously-cached messages to a new
+// subscriber is best-effort and not reflected in the return code.
+static rmw_ret_t transient_local_publish(
+  rmw_uds::UdsPublisher * pub_data,
+  rmw_uds::WireHeader hdr,
+  std::vector<uint8_t> payload,
+  const std::shared_ptr<const std::vector<std::string>> & sub_paths)
+{
+  std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
+
+  rmw_uds::CachedMessage cached;
+  cached.header = hdr;
+  if (payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
+    rmw_uds::ShmPayloadDescriptor desc;
+    auto seg = rmw_uds::shm_stage_durable(
+      pub_data->context->domain_id, payload.data(), payload.size(), desc);
+    if (seg) {
+      cached.header.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
+      cached.header.payload_size = static_cast<uint32_t>(sizeof(desc));
+      cached.payload.assign(
+        reinterpret_cast<const uint8_t *>(&desc),
+        reinterpret_cast<const uint8_t *>(&desc) + sizeof(desc));
+      cached.shm_seg = std::move(seg);
+    } else {
+      cached.payload = std::move(payload);  // inline fallback
+    }
+  } else {
+    cached.payload = std::move(payload);
+  }
+  pub_data->message_cache.push_back(std::move(cached));
+  while (pub_data->message_cache.size() > pub_data->qos.depth) {
+    pub_data->message_cache.pop_front();
+  }
+
+  if (sub_paths) {
+    for (const auto & path : *sub_paths) {
+      if (pub_data->known_subscriber_paths.count(path) == 0) {
+        pub_data->known_subscriber_paths.insert(path);
+        for (size_t i = 0; i + 1 < pub_data->message_cache.size(); ++i) {
+          const auto & cm = pub_data->message_cache[i];
+          rmw_uds::send_to(
+            pub_data->context->send_socket_fd,
+            path, cm.header, cm.payload.data(), cm.payload.size());
+        }
+      }
+    }
+  }
+
+  // Send the current message, read from the cached copy since payload was
+  // moved. Trimming never disturbs back(), so it is the message just pushed.
+  // Surface EMSGSIZE the way the non-TL path does so a latched payload the
+  // kernel rejects is not reported as a successful publish.
+  const auto & current = pub_data->message_cache.back();
+  bool config_error = false;
+  if (sub_paths) {
+    for (const auto & path : *sub_paths) {
+      if (rmw_uds::send_to(
+          pub_data->context->send_socket_fd,
+          path, current.header, current.payload.data(), current.payload.size())
+        == rmw_uds::SendResult::ConfigError)
+      {
+        config_error = true;
+      }
+    }
+  }
+  if (config_error) {
+    RMW_SET_ERROR_MSG(
+      "UDS send: TRANSIENT_LOCAL message too large for kernel send buffer "
+      "(EMSGSIZE). Raise net.core.wmem_max or reduce message size.");
+    return RMW_RET_ERROR;
+  }
+  return RMW_RET_OK;
+}
+
 rmw_ret_t rmw_publish(
   const rmw_publisher_t * publisher,
   const void * ros_message,
@@ -266,64 +349,9 @@ rmw_ret_t rmw_publish(
     sub_paths = pub_data->cached_subscriber_paths;  // refcount copy under lock
   }
 
-  // TRANSIENT_LOCAL: cache message and replay to late-joining subscribers
+  // TRANSIENT_LOCAL: cache message and replay to late-joining subscribers.
   if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-
-    rmw_uds::CachedMessage cached;
-    cached.header = hdr;
-    // Large payloads are staged into a dedicated durable shm segment so the
-    // cache entry — and every replay of it to a late joiner — is a small
-    // descriptor rather than a multi-megabyte datagram the kernel would drop.
-    // The segment lives as long as this cache entry (unlinked on eviction).
-    // Falls back to caching the payload inline when shm is unavailable.
-    if (payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
-      rmw_uds::ShmPayloadDescriptor desc;
-      auto seg = rmw_uds::shm_stage_durable(
-        pub_data->context->domain_id, payload.data(), payload.size(), desc);
-      if (seg) {
-        cached.header.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
-        cached.header.payload_size = static_cast<uint32_t>(sizeof(desc));
-        cached.payload.assign(
-          reinterpret_cast<const uint8_t *>(&desc),
-          reinterpret_cast<const uint8_t *>(&desc) + sizeof(desc));
-        cached.shm_seg = std::move(seg);
-      } else {
-        cached.payload = std::move(payload);  // inline fallback
-      }
-    } else {
-      cached.payload = std::move(payload);  // last use of payload
-    }
-    pub_data->message_cache.push_back(std::move(cached));
-    while (pub_data->message_cache.size() > pub_data->qos.depth) {
-      pub_data->message_cache.pop_front();
-    }
-
-    if (sub_paths) {
-      for (const auto & path : *sub_paths) {
-        if (pub_data->known_subscriber_paths.count(path) == 0) {
-          pub_data->known_subscriber_paths.insert(path);
-          for (size_t i = 0; i + 1 < pub_data->message_cache.size(); ++i) {
-            const auto & cm = pub_data->message_cache[i];
-            rmw_uds::send_to(
-              pub_data->context->send_socket_fd,
-              path, cm.header, cm.payload.data(), cm.payload.size());
-          }
-        }
-      }
-    }
-
-    // Send the current message, read from the cached copy since payload was
-    // moved. Trimming never disturbs back(), so it is the message just pushed.
-    const auto & current = pub_data->message_cache.back();
-    if (sub_paths) {
-      for (const auto & path : *sub_paths) {
-        rmw_uds::send_to(
-          pub_data->context->send_socket_fd,
-          path, current.header, current.payload.data(), current.payload.size());
-      }
-    }
-    return RMW_RET_OK;
+    return transient_local_publish(pub_data, hdr, std::move(payload), sub_paths);
   }
 
   // Large payloads travel through the publisher's shm ring: stage the bytes
@@ -413,18 +441,42 @@ rmw_ret_t rmw_publish_serialized_message(
       }
       pub_data->cached_generation = current_gen;
       pub_data->cached_subscriber_paths = std::move(fresh);
+
+      // TRANSIENT_LOCAL: prune known subscribers no longer present, mirroring
+      // rmw_publish (nested lock order sub_cache_mutex -> cache_mutex) so a
+      // concurrent refresh cannot make the pruning set stale.
+      if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
+        std::lock_guard<std::mutex> prune_lock(pub_data->cache_mutex);
+        std::set<std::string> current(
+          pub_data->cached_subscriber_paths->begin(),
+          pub_data->cached_subscriber_paths->end());
+        for (auto it = pub_data->known_subscriber_paths.begin();
+          it != pub_data->known_subscriber_paths.end(); )
+        {
+          it = (current.count(*it) == 0) ?
+            pub_data->known_subscriber_paths.erase(it) : std::next(it);
+        }
+      }
     }
     sub_paths = pub_data->cached_subscriber_paths;
   }
 
-  // Same large-payload fork as rmw_publish: stage once, fan out descriptors.
-  // TRANSIENT_LOCAL keeps the inline path for consistency with rmw_publish
-  // (this entry point does not feed the replay cache).
+  // TRANSIENT_LOCAL: cache + replay through the same durable-shm path as
+  // rmw_publish, so a serialized latched payload (including one above the
+  // datagram cap) reaches late joiners too.
+  if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
+    return transient_local_publish(
+      pub_data, hdr,
+      std::vector<uint8_t>(
+        serialized_message->buffer,
+        serialized_message->buffer + serialized_message->buffer_length),
+      sub_paths);
+  }
+
+  // Large non-TL payloads: stage once into the cycling ring, fan out descriptors.
   rmw_uds::ShmPayloadDescriptor desc;
   bool staged = false;
-  if (serialized_message->buffer_length >= rmw_uds::SHM_PAYLOAD_THRESHOLD &&
-    pub_data->qos.durability != RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL)
-  {
+  if (serialized_message->buffer_length >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
     std::lock_guard<std::mutex> lock(pub_data->shm_mutex);
     staged = rmw_uds::shm_stage_payload(
       pub_data->shm_ring, pub_data->context->domain_id,
