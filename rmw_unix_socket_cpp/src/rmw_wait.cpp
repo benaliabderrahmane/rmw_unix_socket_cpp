@@ -436,7 +436,7 @@ rmw_ret_t rmw_wait(
         if (!services->services[i]) {continue;}
         auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
         drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1,
-        srv->shm_cache, srv->context->domain_id);
+          srv->shm_cache, srv->context->domain_id);
       }
     }
     if (clients) {
@@ -444,7 +444,7 @@ rmw_ret_t rmw_wait(
         if (!clients->clients[i]) {continue;}
         auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
         drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2,
-        cli->shm_cache, cli->context->domain_id);
+          cli->shm_cache, cli->context->domain_id);
       }
     }
   }
