@@ -204,6 +204,12 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rmw_qos test/test_rmw_qos.cpp)
   target_link_libraries(test_rmw_qos ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_qos PRIVATE src)
+
+  # Integration: fork()-based two-process tests pushing >4 MB payloads across
+  # a real PID boundary through the shared-memory path.
+  ament_add_gtest(test_rmw_cross_process test/test_rmw_cross_process.cpp)
+  target_link_libraries(test_rmw_cross_process ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_cross_process PRIVATE src)
 endif()
 
 ament_package()
