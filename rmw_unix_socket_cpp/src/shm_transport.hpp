@@ -30,17 +30,19 @@
 namespace rmw_uds
 {
 
-// Shared-memory payload path for large topic messages.
+// Shared-memory payload path for large messages — topic payloads, service
+// requests, and service responses alike.
 //
 // A payload at or above SHM_PAYLOAD_THRESHOLD does not travel inside the UDS
-// datagram. The publisher writes the serialized bytes once into its own
-// /dev/shm ring and fans out a fixed-size ShmPayloadDescriptor instead (the
-// WireHeader msg_type gains the SHM_PAYLOAD_FLAG bit). Subscribers map the
-// ring on first use and copy the payload out under a per-record seqlock —
-// the same odd/even protocol the discovery registry uses — so a publisher
-// that laps the ring is detected as a clean drop, never delivered corrupt.
-// This removes the two kernel copies (and the net.core.wmem_max datagram
-// cap) from the large-message path; the datagram itself stays tiny.
+// datagram. The sender (publisher, client, or service) writes the serialized
+// bytes once into its own /dev/shm ring and fans out a fixed-size
+// ShmPayloadDescriptor instead (the WireHeader msg_type gains the
+// SHM_PAYLOAD_FLAG bit). Receivers map the ring on first use and copy the
+// payload out under a per-record seqlock — the same odd/even protocol the
+// discovery registry uses — so a sender that laps the ring is detected as a
+// clean drop, never delivered corrupt. This removes the two kernel copies
+// (and the net.core.wmem_max datagram cap) from the large-message path; the
+// datagram itself stays tiny.
 
 // Payloads >= this many bytes are staged in shared memory. Below it the
 // inline datagram is both simpler and faster (no page faults, no seqlock).
@@ -52,7 +54,8 @@ static constexpr size_t SHM_PAYLOAD_THRESHOLD = 64 * 1024;
 // wait-wakeup behind still finds the record intact regardless of this floor;
 // this only sets the minimum for small large-payloads. posix_fallocate commits
 // the whole ring's RAM up front, and every large-message sender pays it, so the
-// floor is kept modest: 1 MiB still holds 16 records at the 64 KiB threshold.
+// floor is kept modest: 1 MiB still holds 15 records at the 64 KiB threshold
+// (each record is align_up(8 + 65536, 64) = 65600 bytes).
 static constexpr size_t SHM_RING_MIN_BYTES = 1 * 1024 * 1024;
 
 static constexpr uint32_t SHM_RING_MAGIC = 0x52534455;  // "UDSR"
@@ -60,7 +63,8 @@ static constexpr uint32_t SHM_RING_VERSION = 1;
 
 // WireHeader::msg_type high bit: the datagram payload is a
 // ShmPayloadDescriptor, not CDR bytes. The low bits keep their meaning
-// (0 = topic message; the flag is only ever set on topic messages).
+// (0 = topic message, 1 = request, 2 = response — the flag combines with
+// all three; receivers mask it off before dispatching on the type).
 static constexpr uint8_t SHM_PAYLOAD_FLAG = 0x80;
 
 // Datagram payload when SHM_PAYLOAD_FLAG is set. Blitted onto the wire, so
