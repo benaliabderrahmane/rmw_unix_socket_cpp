@@ -160,6 +160,13 @@ uint8_t * shm_stage_reserve(
   if (max_payload_size > UINT32_MAX) {
     return nullptr;
   }
+  // Test seam (cold path, large sends only): when this env var is exactly
+  // "1", behave as if shared memory were unavailable so tests can pin the
+  // inline fallback. Same seam as shm_stage_durable; never set in production.
+  const char * force_fail = std::getenv("RMW_UDS_TEST_FORCE_SHM_FAILURE");
+  if (force_fail != nullptr && std::strcmp(force_fail, "1") == 0) {
+    return nullptr;
+  }
 
   const size_t record_bytes =
     align_up(sizeof(ShmRecordHeader) + max_payload_size, SHM_RECORD_ALIGN);

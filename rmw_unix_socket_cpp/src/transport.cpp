@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <mutex>
 
 #include <dirent.h>
@@ -327,8 +328,14 @@ bool shm_serialize_prepare_send(
   }
 
   // Inline path (small payload, or shm fallback). resize + serialize_into
-  // keeps this to the single size walk already done above.
-  payload.resize(est);
+  // keeps this to the single size walk already done above. The resize is
+  // contained like serialize()'s: bad_alloc/length_error (e.g. a huge est
+  // after a refused reservation) must not cross the extern "C" boundary.
+  try {
+    payload.resize(est);
+  } catch (const std::exception &) {
+    return false;
+  }
   size_t actual = 0;
   if (!serialize_into(ros_message, callbacks, payload.data(), est, actual)) {
     return false;

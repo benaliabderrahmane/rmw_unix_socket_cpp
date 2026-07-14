@@ -316,6 +316,48 @@ TEST_F(QosTest, TransientLocalLargeMessageInlineFallbackWhenShmUnavailable)
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
+TEST_F(QosTest, VolatileLargeMessageInlineFallbackWhenShmUnavailable)
+{
+  // Ring-path counterpart of the TL test above: when shm staging is
+  // unavailable, a large VOLATILE payload is serialized into the inline
+  // fallback (no ring, no SHM_PAYLOAD_FLAG) and still delivered byte-equal.
+  // Pins shm_serialize_prepare_send's reserve-failure branch, including the
+  // contained resize on the extern "C" boundary.
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_VOLATILE, 5);
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, seq_ts, "/vol_fallback", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, seq_ts, "/vol_fallback", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  setenv("RMW_UDS_TEST_FORCE_SHM_FAILURE", "1", 1);
+  test_msgs::msg::UnboundedSequences msg;
+  msg.uint8_values.resize(100 * 1024);  // over the threshold, under the datagram cap
+  for (size_t i = 0; i < msg.uint8_values.size(); ++i) {
+    msg.uint8_values[i] = static_cast<uint8_t>((i * 11 + 3) & 0xFF);
+  }
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+  unsetenv("RMW_UDS_TEST_FORCE_SHM_FAILURE");  // reset before it leaks to other tests
+
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  EXPECT_EQ(nullptr, pub_data->shm_ring.base)
+    << "shm forced unavailable — no ring may be created";
+
+  test_msgs::msg::UnboundedSequences recv;
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+  ASSERT_TRUE(taken) << "the inline-fallback message must be delivered";
+  EXPECT_EQ(msg.uint8_values, recv.uint8_values);
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
 TEST_F(QosTest, TransientLocalSerializedLargeMessageLateJoiner)
 {
   // rmw_publish_serialized_message now feeds the TL replay cache and stages

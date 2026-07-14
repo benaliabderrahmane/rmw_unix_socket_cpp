@@ -291,10 +291,17 @@ TEST_F(ShmTransportTest, CommitOverReservationIsRejected)
 {
   uint8_t * dst = rmw_uds::shm_stage_reserve(ring, domain_id, 64 * 1024);
   ASSERT_NE(nullptr, dst);
+  const uint64_t offset_before = ring.next_offset;
+  const uint32_t index_before = ring.next_index;
+
   rmw_uds::ShmPayloadDescriptor desc{};
   EXPECT_FALSE(rmw_uds::shm_stage_commit(ring, 65 * 1024, desc))
     << "committing more than the reservation must be rejected, not published";
-  // The ring stays usable afterwards.
+  // The rejection behaves like an abort: nothing advanced, nothing published.
+  EXPECT_EQ(offset_before, ring.next_offset);
+  EXPECT_EQ(index_before, ring.next_index);
+
+  // The ring stays usable afterwards (the slot is reused).
   const auto payload = pattern(64 * 1024, 26);
   auto wire = stage(payload);
   ASSERT_TRUE(rmw_uds::shm_fetch_payload(cache, domain_id, wire));

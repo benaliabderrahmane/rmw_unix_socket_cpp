@@ -40,6 +40,10 @@ cd rmw_unix_socket_cpp/test/perf
 RMW_IMPLEMENTATION=rmw_unix_socket_cpp python3 perf_pubsub.py
 RMW_IMPLEMENTATION=rmw_unix_socket_cpp python3 perf_services.py
 RMW_IMPLEMENTATION=rmw_unix_socket_cpp python3 scale_100_nodes.py
+
+# C++ staging benchmark: built by colcon with BUILD_TESTING=ON; links the
+# sources directly, so no RMW_IMPLEMENTATION is needed
+./build/rmw_unix_socket_cpp/bench_serialize_into_ring
 ```
 
 Each script accepts CLI overrides — see the docstring at the top of each file.
