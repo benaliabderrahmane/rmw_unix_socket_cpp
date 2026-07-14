@@ -124,6 +124,7 @@ struct ShmRingWriter
   int32_t owner_pid = -1;
   uint32_t owner_id = 0;      // assigned from a process-global counter
   std::string shm_name;
+  size_t reserved_cap = 0;    // capacity of the reserved-but-uncommitted record
 };
 
 // Subscriber-side cache of mapped publisher rings, keyed by the segment's
@@ -197,12 +198,40 @@ struct DurableShmSegment
 // payload outgrows it. Fills desc_out on success. Returns false when shared
 // memory is unavailable (shm_open/ftruncate/mmap failure) — the caller falls
 // back to sending the payload inline. Caller holds UdsPublisher::shm_mutex.
+// Implemented as reserve + memcpy + commit (below).
 bool shm_stage_payload(
   ShmRingWriter & ring,
   size_t domain_id,
   const uint8_t * payload,
   size_t payload_size,
   ShmPayloadDescriptor & desc_out);
+
+// Two-phase staging, so a serializer can write CDR bytes directly into the
+// ring record instead of through an intermediate heap buffer. The caller
+// holds the entity's shm_mutex across the whole reserve..commit/abort span.
+//
+//   uint8_t * dst = shm_stage_reserve(ring, domain, max_size);
+//   ...write up to max_size bytes into dst...
+//   shm_stage_commit(ring, actual_size, desc);   // or shm_stage_abort(ring)
+//
+// reserve marks the record's seqlock odd and returns its payload area (null
+// when shared memory is unavailable); the cursor does not advance. commit
+// publishes the record (seqlock even, cursor advanced by the ACTUAL size, so
+// a size-walk overestimate wastes nothing). abort leaves the seqlock odd and
+// the cursor unchanged: the half-written record is never observable — any
+// stale descriptor pointing at that offset fails its seqlock check — and the
+// next reserve reuses the same slot.
+uint8_t * shm_stage_reserve(
+  ShmRingWriter & ring,
+  size_t domain_id,
+  size_t max_payload_size);
+
+bool shm_stage_commit(
+  ShmRingWriter & ring,
+  size_t payload_size,
+  ShmPayloadDescriptor & desc_out);
+
+void shm_stage_abort(ShmRingWriter & ring);
 
 // Stage a payload into a fresh, dedicated, immutable segment and fill desc_out.
 // The returned segment stays valid (its record never overwritten) until the

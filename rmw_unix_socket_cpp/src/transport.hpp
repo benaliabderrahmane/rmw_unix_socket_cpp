@@ -75,6 +75,26 @@ OutboundPayload shm_prepare_send(
   WireHeader & hdr,
   ShmPayloadDescriptor & desc);
 
+// Serialize an outbound ROS message and choose its destination by size, in
+// one pass: a payload that will reach SHM_PAYLOAD_THRESHOLD is serialized
+// DIRECTLY into a reserved ring record (no intermediate heap payload, no
+// staging copy) and `wire` carries the descriptor with SHM_PAYLOAD_FLAG set
+// on `hdr`; smaller payloads — or any shm failure — are serialized into
+// `payload` for the inline datagram path. hdr.payload_size is set in both
+// modes. Returns false only when the message itself cannot be serialized
+// (`payload`/`wire` are then unusable). Used by every serializing sender:
+// non-latched rmw_publish, rmw_send_request, rmw_send_response.
+bool shm_serialize_prepare_send(
+  ShmRingWriter & ring,
+  std::mutex & mtx,
+  size_t domain_id,
+  const void * ros_message,
+  const message_type_support_callbacks_t * callbacks,
+  WireHeader & hdr,
+  ShmPayloadDescriptor & desc,
+  std::vector<uint8_t> & payload,
+  OutboundPayload & wire);
+
 // Resolve an inbound datagram whose payload may be a shm descriptor. If
 // SHM_PAYLOAD_FLAG is set on `hdr`, swap `payload` for the real bytes via
 // `cache` (clearing the flag and fixing hdr.payload_size). Returns false if the

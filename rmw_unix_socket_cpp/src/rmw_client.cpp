@@ -185,23 +185,29 @@ rmw_ret_t rmw_send_request(
 
   auto * cli_data = static_cast<rmw_uds::UdsClient *>(client->data);
 
-  // Serialize request
-  std::vector<uint8_t> payload;
-  if (!rmw_uds::serialize(ros_request, cli_data->request_callbacks, payload)) {
-    RMW_SET_ERROR_MSG("failed to serialize request");
-    return RMW_RET_ERROR;
-  }
-
   *sequence_id = cli_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
 
-  // Build wire header
+  // Build wire header (payload_size filled by the serialize step below)
   rmw_uds::WireHeader hdr;
   std::memset(&hdr, 0, sizeof(hdr));
   std::memcpy(hdr.gid, cli_data->gid.data, sizeof(hdr.gid));
   hdr.sequence_number = *sequence_id;
   hdr.source_timestamp_ns = now_ns();
-  hdr.payload_size = static_cast<uint32_t>(payload.size());
   hdr.msg_type = 1;  // request
+
+  // Serialize the request, choosing its destination by size: a large one is
+  // written directly into the client's ring record (descriptor on the wire),
+  // a small one inline.
+  std::vector<uint8_t> payload;
+  rmw_uds::ShmPayloadDescriptor desc;
+  rmw_uds::OutboundPayload wire{nullptr, 0};
+  if (!rmw_uds::shm_serialize_prepare_send(
+      cli_data->shm_ring, cli_data->shm_mutex, cli_data->context->domain_id,
+      ros_request, cli_data->request_callbacks, hdr, desc, payload, wire))
+  {
+    RMW_SET_ERROR_MSG("failed to serialize request");
+    return RMW_RET_ERROR;
+  }
 
   // PERFORMANCE: cache the service path; only re-query the registry on
   // graph generation change.
@@ -226,13 +232,6 @@ rmw_ret_t rmw_send_request(
     }
     service_path = cli_data->cached_service_path;
   }
-
-  // Large requests travel through the client's shm ring: stage once, send a
-  // descriptor instead of a datagram the kernel would reject.
-  rmw_uds::ShmPayloadDescriptor desc;
-  auto wire = rmw_uds::shm_prepare_send(
-    cli_data->shm_ring, cli_data->shm_mutex, cli_data->context->domain_id,
-    payload.data(), payload.size(), hdr, desc);
 
   if (!service_path.empty()) {
     rmw_uds::send_to(

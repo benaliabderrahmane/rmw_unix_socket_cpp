@@ -143,13 +143,33 @@ bool shm_stage_payload(
   size_t payload_size,
   ShmPayloadDescriptor & desc_out)
 {
-  // The record header and the wire descriptor carry 32-bit lengths.
-  if (payload_size > UINT32_MAX) {
+  uint8_t * dst = shm_stage_reserve(ring, domain_id, payload_size);
+  if (!dst) {
     return false;  // inline path; the send will fail loudly with EMSGSIZE
+  }
+  std::memcpy(dst, payload, payload_size);
+  return shm_stage_commit(ring, payload_size, desc_out);
+}
+
+uint8_t * shm_stage_reserve(
+  ShmRingWriter & ring,
+  size_t domain_id,
+  size_t max_payload_size)
+{
+  // The record header and the wire descriptor carry 32-bit lengths.
+  if (max_payload_size > UINT32_MAX) {
+    return nullptr;
+  }
+  // Test seam (cold path, large sends only): when this env var is exactly
+  // "1", behave as if shared memory were unavailable so tests can pin the
+  // inline fallback. Same seam as shm_stage_durable; never set in production.
+  const char * force_fail = std::getenv("RMW_UDS_TEST_FORCE_SHM_FAILURE");
+  if (force_fail != nullptr && std::strcmp(force_fail, "1") == 0) {
+    return nullptr;
   }
 
   const size_t record_bytes =
-    align_up(sizeof(ShmRecordHeader) + payload_size, SHM_RECORD_ALIGN);
+    align_up(sizeof(ShmRecordHeader) + max_payload_size, SHM_RECORD_ALIGN);
 
   // Lazily create the ring, and recreate it bigger when a payload outgrows
   // the four-records-of-the-largest guarantee. The ring only ever grows.
@@ -160,7 +180,7 @@ bool shm_stage_payload(
       area = SHM_RING_MIN_BYTES;
     }
     if (!create_segment(ring, domain_id, align_up(area, page))) {
-      return false;
+      return nullptr;
     }
   }
 
@@ -172,16 +192,34 @@ bool shm_stage_payload(
 
   auto * record = reinterpret_cast<ShmRecordHeader *>(
     ring.base + sizeof(ShmRingHeader) + ring.next_offset);
-  const uint32_t seq_stable = ring.next_index * 2;
 
   // Seqlock write, same protocol as the registry slots: odd while the bytes
-  // are in flux, even (and equal to the descriptor) once stable. exchange is
-  // an acq_rel RMW so the payload copy cannot be reordered ahead of it; the
-  // slot may hold a stale record's seq or raw payload bytes, hence an
+  // are in flux, even (and equal to the descriptor) once committed. exchange
+  // is an acq_rel RMW so the payload write cannot be reordered ahead of it;
+  // the slot may hold a stale record's seq or raw payload bytes, hence an
   // absolute exchange rather than the registry's fetch_add.
-  record->seq.exchange(seq_stable - 1, std::memory_order_acq_rel);
+  record->seq.exchange(ring.next_index * 2 - 1, std::memory_order_acq_rel);
+  ring.reserved_cap = max_payload_size;
+  return reinterpret_cast<uint8_t *>(record + 1);
+}
+
+bool shm_stage_commit(
+  ShmRingWriter & ring,
+  size_t payload_size,
+  ShmPayloadDescriptor & desc_out)
+{
+  if (payload_size > ring.reserved_cap) {
+    // Writer overran its reservation — never publish; the record stays odd.
+    shm_stage_abort(ring);
+    return false;
+  }
+  ring.reserved_cap = 0;
+
+  auto * record = reinterpret_cast<ShmRecordHeader *>(
+    ring.base + sizeof(ShmRingHeader) + ring.next_offset);
+  const uint32_t seq_stable = ring.next_index * 2;
+
   record->payload_len = static_cast<uint32_t>(payload_size);
-  std::memcpy(record + 1, payload, payload_size);
   record->seq.store(seq_stable, std::memory_order_release);
 
   desc_out.segment_id = ring.segment_id;
@@ -191,9 +229,18 @@ bool shm_stage_payload(
   desc_out.owner_pid = ring.owner_pid;
   desc_out.owner_id = ring.owner_id;
 
-  ring.next_offset += record_bytes;
+  // Advance by the actual size, not the reservation, so an overestimating
+  // size walk wastes no ring capacity.
+  ring.next_offset += align_up(sizeof(ShmRecordHeader) + payload_size, SHM_RECORD_ALIGN);
   ring.next_index += 1;
   return true;
+}
+
+void shm_stage_abort(ShmRingWriter & ring)
+{
+  // Leave the record's seqlock odd and the cursor unchanged: the half-written
+  // bytes are never observable, and the next reserve reuses this slot.
+  ring.reserved_cap = 0;
 }
 
 std::unique_ptr<DurableShmSegment> shm_stage_durable(
