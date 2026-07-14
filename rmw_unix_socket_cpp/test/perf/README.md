@@ -10,6 +10,7 @@ end-to-end latency under realistic loads. They are not run by `colcon test`.
 | `perf_pubsub.py` | Pub/sub latency, in a single process (N pairs on N topics) | 100 pairs × 200 messages |
 | `perf_services.py` | Service round-trip latency, in a single process | 50 pairs × 200 calls |
 | `scale_100_nodes.py` | Cross-process pub/sub with N **separate processes** | 100 talkers × 10s @ 50 Hz |
+| `bench_serialize_into_ring` (C++, built with the test suite) | Publish-side staging: serialize-into-ring vs serialize-then-copy, real fastCDR | 64 KiB–4 MiB × 300–1500 msgs |
 
 ## Why two flavors
 

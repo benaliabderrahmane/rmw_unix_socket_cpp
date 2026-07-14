@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include "logging.hpp"
+#include "serialization.hpp"
 
 namespace rmw_uds
 {
@@ -282,6 +283,60 @@ OutboundPayload shm_prepare_send(
     out.size = sizeof(desc);
   }
   return out;
+}
+
+bool shm_serialize_prepare_send(
+  ShmRingWriter & ring,
+  std::mutex & mtx,
+  size_t domain_id,
+  const void * ros_message,
+  const message_type_support_callbacks_t * callbacks,
+  WireHeader & hdr,
+  ShmPayloadDescriptor & desc,
+  std::vector<uint8_t> & payload,
+  OutboundPayload & wire)
+{
+  size_t est = 0;
+  if (!serialized_size(ros_message, callbacks, est)) {
+    return false;  // the size walk already rejected the message
+  }
+
+  if (est >= SHM_PAYLOAD_THRESHOLD) {
+    // Serialize straight into the reserved ring record: one write pass, no
+    // heap payload, no staging copy. The mutex covers reserve..commit — the
+    // serializer writes into the ring, so this hold is the staging work.
+    std::lock_guard<std::mutex> lock(mtx);
+    uint8_t * dst = shm_stage_reserve(ring, domain_id, est);
+    if (dst) {
+      size_t actual = 0;
+      if (serialize_into(ros_message, callbacks, dst, est, actual) &&
+        shm_stage_commit(ring, actual, desc))
+      {
+        hdr.msg_type |= SHM_PAYLOAD_FLAG;
+        hdr.payload_size = static_cast<uint32_t>(sizeof(desc));
+        wire = {reinterpret_cast<const uint8_t *>(&desc), sizeof(desc)};
+        return true;
+      }
+      // Never publish a half-written record; fall through to the inline
+      // path, which re-serializes into `payload` and fails there too if the
+      // message itself is broken.
+      shm_stage_abort(ring);
+    }
+    // dst == nullptr: shared memory unavailable — inline fallback below,
+    // where an over-cap datagram surfaces EMSGSIZE at send, as before.
+  }
+
+  // Inline path (small payload, or shm fallback). resize + serialize_into
+  // keeps this to the single size walk already done above.
+  payload.resize(est);
+  size_t actual = 0;
+  if (!serialize_into(ros_message, callbacks, payload.data(), est, actual)) {
+    return false;
+  }
+  payload.resize(actual);
+  hdr.payload_size = static_cast<uint32_t>(actual);
+  wire = {payload.data(), actual};
+  return true;
 }
 
 bool shm_resolve_incoming(

@@ -298,25 +298,14 @@ rmw_ret_t rmw_publish(
 
   auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(publisher->data);
 
-  // Serialize the message using CDR
-  std::vector<uint8_t> payload;
-  if (!rmw_uds::serialize(ros_message, pub_data->callbacks, payload)) {
-    // Throttled — a broken type/serializer would otherwise log per-publish.
-    RMW_UDS_LOG_ERROR_THROTTLE(
-      1000,
-      "rmw_publish: CDR serialization failed for topic '%s' (type '%s')",
-      pub_data->topic_name.c_str(), pub_data->type_name.c_str());
-    RMW_SET_ERROR_MSG("failed to serialize message");
-    return RMW_RET_ERROR;
-  }
-
-  // Build wire header
+  // Build wire header. payload_size is filled per-path below: serialization
+  // happens after the TRANSIENT_LOCAL fork so the non-latched path can
+  // serialize directly into the shm ring with no intermediate heap payload.
   rmw_uds::WireHeader hdr;
   std::memset(&hdr, 0, sizeof(hdr));
   std::memcpy(hdr.gid, pub_data->gid.data, sizeof(hdr.gid));
   hdr.sequence_number = pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
   hdr.source_timestamp_ns = now_ns();
-  hdr.payload_size = static_cast<uint32_t>(payload.size());
   hdr.msg_type = 0;  // topic message
 
   // PERFORMANCE: only lock the registry when the graph generation has changed
@@ -363,21 +352,43 @@ rmw_ret_t rmw_publish(
   }
 
   // TRANSIENT_LOCAL: cache message and replay to late-joining subscribers.
+  // The replay cache owns the serialized bytes, so this path serializes into
+  // a heap payload as before (the durable segment is staged from it inside
+  // transient_local_publish).
   if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
+    std::vector<uint8_t> payload;
+    if (!rmw_uds::serialize(ros_message, pub_data->callbacks, payload)) {
+      // Throttled — a broken type/serializer would otherwise log per-publish.
+      RMW_UDS_LOG_ERROR_THROTTLE(
+        1000,
+        "rmw_publish: CDR serialization failed for topic '%s' (type '%s')",
+        pub_data->topic_name.c_str(), pub_data->type_name.c_str());
+      RMW_SET_ERROR_MSG("failed to serialize message");
+      return RMW_RET_ERROR;
+    }
+    hdr.payload_size = static_cast<uint32_t>(payload.size());
     return transient_local_publish(pub_data, hdr, std::move(payload), sub_paths);
   }
 
-  // Large payloads travel through the publisher's shm ring: stage the bytes
-  // once, then fan out a fixed-size descriptor instead of copying the payload
-  // through every subscriber's socket buffer. Falls back to inline on any
-  // shm failure. (TRANSIENT_LOCAL returned above; because its replay must
-  // outlive the cycling ring, the TL branch stages large latched payloads into
-  // a dedicated *durable* segment via shm_stage_durable — only sub-threshold TL
-  // payloads and the shm-failure fallback send inline.)
+  // Non-latched path: serialize once, choosing the destination by size — a
+  // large payload is written directly into the reserved ring record (no heap
+  // payload, no staging copy) and only a descriptor crosses the socket; a
+  // small one (or any shm failure) is serialized into `payload` and sent
+  // inline.
+  std::vector<uint8_t> payload;
   rmw_uds::ShmPayloadDescriptor desc;
-  auto wire = rmw_uds::shm_prepare_send(
-    pub_data->shm_ring, pub_data->shm_mutex, pub_data->context->domain_id,
-    payload.data(), payload.size(), hdr, desc);
+  rmw_uds::OutboundPayload wire{nullptr, 0};
+  if (!rmw_uds::shm_serialize_prepare_send(
+      pub_data->shm_ring, pub_data->shm_mutex, pub_data->context->domain_id,
+      ros_message, pub_data->callbacks, hdr, desc, payload, wire))
+  {
+    RMW_UDS_LOG_ERROR_THROTTLE(
+      1000,
+      "rmw_publish: CDR serialization failed for topic '%s' (type '%s')",
+      pub_data->topic_name.c_str(), pub_data->type_name.c_str());
+    RMW_SET_ERROR_MSG("failed to serialize message");
+    return RMW_RET_ERROR;
+  }
 
   // Surface EMSGSIZE; soft drops (EAGAIN/ENOENT) are logged in send_to.
   bool config_error = false;

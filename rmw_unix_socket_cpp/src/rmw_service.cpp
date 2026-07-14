@@ -255,28 +255,27 @@ rmw_ret_t rmw_send_response(
 
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
 
-  // Serialize response
-  std::vector<uint8_t> payload;
-  if (!rmw_uds::serialize(ros_response, srv_data->response_callbacks, payload)) {
-    RMW_SET_ERROR_MSG("failed to serialize response");
-    return RMW_RET_ERROR;
-  }
-
-  // Build wire header
+  // Build wire header (payload_size filled by the serialize step below)
   rmw_uds::WireHeader hdr;
   std::memset(&hdr, 0, sizeof(hdr));
   std::memcpy(hdr.gid, request_header->writer_guid, sizeof(hdr.gid));
   hdr.sequence_number = request_header->sequence_number;
   hdr.source_timestamp_ns = now_ns();
-  hdr.payload_size = static_cast<uint32_t>(payload.size());
   hdr.msg_type = 2;  // response
 
-  // Large responses travel through the service's shm ring: stage once, send a
-  // descriptor. Staged here; both send sites below fan out the same wire span.
+  // Serialize the response, choosing its destination by size: a large one is
+  // written directly into the service's ring record (descriptor on the wire),
+  // a small one inline. Both send sites below fan out the same wire span.
+  std::vector<uint8_t> payload;
   rmw_uds::ShmPayloadDescriptor desc;
-  auto wire = rmw_uds::shm_prepare_send(
-    srv_data->shm_ring, srv_data->shm_mutex, srv_data->context->domain_id,
-    payload.data(), payload.size(), hdr, desc);
+  rmw_uds::OutboundPayload wire{nullptr, 0};
+  if (!rmw_uds::shm_serialize_prepare_send(
+      srv_data->shm_ring, srv_data->shm_mutex, srv_data->context->domain_id,
+      ros_response, srv_data->response_callbacks, hdr, desc, payload, wire))
+  {
+    RMW_SET_ERROR_MSG("failed to serialize response");
+    return RMW_RET_ERROR;
+  }
 
   // PERFORMANCE: cache the (GID -> path) client list; only refresh on graph change.
   auto * header = rmw_uds::registry_header(srv_data->context->registry_ptr);
