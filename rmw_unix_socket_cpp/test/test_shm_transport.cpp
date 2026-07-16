@@ -200,3 +200,110 @@ TEST_F(ShmTransportTest, CleanupRemovesDeadPidSegments)
     close(live);
   }
 }
+
+// --- reserve/commit/abort: the two-phase staging behind serialize-into-ring ---
+
+TEST_F(ShmTransportTest, ReserveCommitRoundTrip)
+{
+  const auto payload = pattern(100 * 1024, 21);
+  uint8_t * dst = rmw_uds::shm_stage_reserve(ring, domain_id, payload.size());
+  ASSERT_NE(nullptr, dst);
+  std::memcpy(dst, payload.data(), payload.size());
+
+  rmw_uds::ShmPayloadDescriptor desc{};
+  ASSERT_TRUE(rmw_uds::shm_stage_commit(ring, payload.size(), desc));
+
+  std::vector<uint8_t> wire(sizeof(desc));
+  std::memcpy(wire.data(), &desc, sizeof(desc));
+  ASSERT_TRUE(rmw_uds::shm_fetch_payload(cache, domain_id, wire));
+  EXPECT_EQ(payload, wire);
+}
+
+TEST_F(ShmTransportTest, CommitSmallerThanReservedPacksTight)
+{
+  // A size-walk overestimate must waste nothing: commit with the ACTUAL size
+  // advances the cursor by the actual record, and the payload round-trips at
+  // its actual length.
+  const size_t reserved = 256 * 1024;
+  const auto payload = pattern(100 * 1024, 22);  // actual << reserved
+
+  uint8_t * dst = rmw_uds::shm_stage_reserve(ring, domain_id, reserved);
+  ASSERT_NE(nullptr, dst);
+  std::memcpy(dst, payload.data(), payload.size());
+  const uint64_t offset_before = ring.next_offset;
+
+  rmw_uds::ShmPayloadDescriptor desc{};
+  ASSERT_TRUE(rmw_uds::shm_stage_commit(ring, payload.size(), desc));
+  EXPECT_EQ(payload.size(), desc.payload_size);
+  // Cursor advanced by the aligned ACTUAL record, not the reservation.
+  EXPECT_LT(ring.next_offset - offset_before, reserved);
+
+  std::vector<uint8_t> wire(sizeof(desc));
+  std::memcpy(wire.data(), &desc, sizeof(desc));
+  ASSERT_TRUE(rmw_uds::shm_fetch_payload(cache, domain_id, wire));
+  EXPECT_EQ(payload, wire);
+}
+
+TEST_F(ShmTransportTest, AbortLeavesSlotReusableAndUnobservable)
+{
+  // Publish one good record, then reserve-and-abort at the next slot, then
+  // publish again: the aborted slot is reused and the good records round-trip.
+  const auto first = pattern(64 * 1024, 23);
+  auto first_wire = stage(first);
+
+  uint8_t * dst = rmw_uds::shm_stage_reserve(ring, domain_id, 64 * 1024);
+  ASSERT_NE(nullptr, dst);
+  const uint64_t aborted_offset = ring.next_offset;
+  std::memset(dst, 0xEE, 1024);  // half-written garbage
+  rmw_uds::shm_stage_abort(ring);
+  EXPECT_EQ(aborted_offset, ring.next_offset) << "abort must not advance the cursor";
+
+  const auto second = pattern(64 * 1024, 24);
+  auto second_wire = stage(second);
+
+  ASSERT_TRUE(rmw_uds::shm_fetch_payload(cache, domain_id, first_wire));
+  EXPECT_EQ(first, first_wire);
+  ASSERT_TRUE(rmw_uds::shm_fetch_payload(cache, domain_id, second_wire));
+  EXPECT_EQ(second, second_wire);
+}
+
+TEST_F(ShmTransportTest, ReservedUncommittedSlotFailsStaleDescriptor)
+{
+  // A reader holding a descriptor for a record that was later overwritten by
+  // an in-flight (reserved, uncommitted) writer must get a clean drop: the
+  // slot's seqlock is odd for the whole reserve..commit window.
+  const auto first = pattern(3 * 1024 * 1024, 25);
+  auto first_wire = stage(first);
+
+  // Fill the ring so the next reserve lands back on the first record's slot.
+  for (int i = 0; i < 3; ++i) {
+    stage(pattern(3 * 1024 * 1024, static_cast<uint8_t>(30 + i)));
+  }
+  uint8_t * dst = rmw_uds::shm_stage_reserve(ring, domain_id, 3 * 1024 * 1024);
+  ASSERT_NE(nullptr, dst);
+
+  EXPECT_FALSE(rmw_uds::shm_fetch_payload(cache, domain_id, first_wire))
+    << "a descriptor into a reserved-but-uncommitted slot must drop cleanly";
+  rmw_uds::shm_stage_abort(ring);
+}
+
+TEST_F(ShmTransportTest, CommitOverReservationIsRejected)
+{
+  uint8_t * dst = rmw_uds::shm_stage_reserve(ring, domain_id, 64 * 1024);
+  ASSERT_NE(nullptr, dst);
+  const uint64_t offset_before = ring.next_offset;
+  const uint32_t index_before = ring.next_index;
+
+  rmw_uds::ShmPayloadDescriptor desc{};
+  EXPECT_FALSE(rmw_uds::shm_stage_commit(ring, 65 * 1024, desc))
+    << "committing more than the reservation must be rejected, not published";
+  // The rejection behaves like an abort: nothing advanced, nothing published.
+  EXPECT_EQ(offset_before, ring.next_offset);
+  EXPECT_EQ(index_before, ring.next_index);
+
+  // The ring stays usable afterwards (the slot is reused).
+  const auto payload = pattern(64 * 1024, 26);
+  auto wire = stage(payload);
+  ASSERT_TRUE(rmw_uds::shm_fetch_payload(cache, domain_id, wire));
+  EXPECT_EQ(payload, wire);
+}

@@ -158,6 +158,8 @@ rmw_ret_t rmw_destroy_client(rmw_node_t * node, rmw_client_t * client)
       rmw_uds::registry_remove(header, cli_data->registry_index);
     }
     rmw_uds::close_socket(cli_data->socket_fd, cli_data->socket_path);
+    rmw_uds::shm_writer_close(cli_data->shm_ring);
+    rmw_uds::shm_reader_close(cli_data->shm_cache);
     delete cli_data;
   }
 
@@ -183,23 +185,29 @@ rmw_ret_t rmw_send_request(
 
   auto * cli_data = static_cast<rmw_uds::UdsClient *>(client->data);
 
-  // Serialize request
-  std::vector<uint8_t> payload;
-  if (!rmw_uds::serialize(ros_request, cli_data->request_callbacks, payload)) {
-    RMW_SET_ERROR_MSG("failed to serialize request");
-    return RMW_RET_ERROR;
-  }
-
   *sequence_id = cli_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
 
-  // Build wire header
+  // Build wire header (payload_size filled by the serialize step below)
   rmw_uds::WireHeader hdr;
   std::memset(&hdr, 0, sizeof(hdr));
   std::memcpy(hdr.gid, cli_data->gid.data, sizeof(hdr.gid));
   hdr.sequence_number = *sequence_id;
   hdr.source_timestamp_ns = now_ns();
-  hdr.payload_size = static_cast<uint32_t>(payload.size());
   hdr.msg_type = 1;  // request
+
+  // Serialize the request, choosing its destination by size: a large one is
+  // written directly into the client's ring record (descriptor on the wire),
+  // a small one inline.
+  std::vector<uint8_t> payload;
+  rmw_uds::ShmPayloadDescriptor desc;
+  rmw_uds::OutboundPayload wire{nullptr, 0};
+  if (!rmw_uds::shm_serialize_prepare_send(
+      cli_data->shm_ring, cli_data->shm_mutex, cli_data->context->domain_id,
+      ros_request, cli_data->request_callbacks, hdr, desc, payload, wire))
+  {
+    RMW_SET_ERROR_MSG("failed to serialize request");
+    return RMW_RET_ERROR;
+  }
 
   // PERFORMANCE: cache the service path; only re-query the registry on
   // graph generation change.
@@ -228,7 +236,7 @@ rmw_ret_t rmw_send_request(
   if (!service_path.empty()) {
     rmw_uds::send_to(
       cli_data->context->send_socket_fd,
-      service_path, hdr, payload.data(), payload.size());
+      service_path, hdr, wire.data, wire.size);
   }
   // No service found yet — still return OK (request will be sent on retry)
   return RMW_RET_OK;
@@ -255,7 +263,13 @@ rmw_ret_t rmw_take_response(
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
   while (rmw_uds::recv_from(cli_data->socket_fd, hdr, payload)) {
-    if (hdr.msg_type != 2) {payload.clear(); continue;}
+    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 2) {payload.clear(); continue;}
+    if (!rmw_uds::shm_resolve_incoming(
+        cli_data->shm_cache, cli_data->context->domain_id, hdr, payload))
+    {
+      payload.clear();
+      continue;
+    }
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
     msg.payload = std::move(payload);

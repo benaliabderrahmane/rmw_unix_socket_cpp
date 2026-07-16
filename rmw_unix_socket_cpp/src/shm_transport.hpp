@@ -18,6 +18,8 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -28,34 +30,41 @@
 namespace rmw_uds
 {
 
-// Shared-memory payload path for large topic messages.
+// Shared-memory payload path for large messages — topic payloads, service
+// requests, and service responses alike.
 //
 // A payload at or above SHM_PAYLOAD_THRESHOLD does not travel inside the UDS
-// datagram. The publisher writes the serialized bytes once into its own
-// /dev/shm ring and fans out a fixed-size ShmPayloadDescriptor instead (the
-// WireHeader msg_type gains the SHM_PAYLOAD_FLAG bit). Subscribers map the
-// ring on first use and copy the payload out under a per-record seqlock —
-// the same odd/even protocol the discovery registry uses — so a publisher
-// that laps the ring is detected as a clean drop, never delivered corrupt.
-// This removes the two kernel copies (and the net.core.wmem_max datagram
-// cap) from the large-message path; the datagram itself stays tiny.
+// datagram. The sender (publisher, client, or service) writes the serialized
+// bytes once into its own /dev/shm ring and fans out a fixed-size
+// ShmPayloadDescriptor instead (the WireHeader msg_type gains the
+// SHM_PAYLOAD_FLAG bit). Receivers map the ring on first use and copy the
+// payload out under a per-record seqlock — the same odd/even protocol the
+// discovery registry uses — so a sender that laps the ring is detected as a
+// clean drop, never delivered corrupt. This removes the two kernel copies
+// (and the net.core.wmem_max datagram cap) from the large-message path; the
+// datagram itself stays tiny.
 
 // Payloads >= this many bytes are staged in shared memory. Below it the
 // inline datagram is both simpler and faster (no page faults, no seqlock).
 static constexpr size_t SHM_PAYLOAD_THRESHOLD = 64 * 1024;
 
-// Smallest ring a publisher creates. A ring is always sized to hold at least
-// four records of the largest payload staged so far, so a subscriber that is
-// one wait-wakeup behind still finds the record intact (KEEP_LAST depths
-// above that are bounded by the socket queue, not the ring).
-static constexpr size_t SHM_RING_MIN_BYTES = 8 * 1024 * 1024;
+// Smallest ring a publisher (or service/client) creates. A ring is always
+// sized to hold at least four records of the largest payload staged so far
+// (see create_segment: max(this, 4*record)), so a subscriber that is one
+// wait-wakeup behind still finds the record intact regardless of this floor;
+// this only sets the minimum for small large-payloads. posix_fallocate commits
+// the whole ring's RAM up front, and every large-message sender pays it, so the
+// floor is kept modest: 1 MiB still holds 15 records at the 64 KiB threshold
+// (each record is align_up(8 + 65536, 64) = 65600 bytes).
+static constexpr size_t SHM_RING_MIN_BYTES = 1 * 1024 * 1024;
 
 static constexpr uint32_t SHM_RING_MAGIC = 0x52534455;  // "UDSR"
 static constexpr uint32_t SHM_RING_VERSION = 1;
 
 // WireHeader::msg_type high bit: the datagram payload is a
 // ShmPayloadDescriptor, not CDR bytes. The low bits keep their meaning
-// (0 = topic message; the flag is only ever set on topic messages).
+// (0 = topic message, 1 = request, 2 = response — the flag combines with
+// all three; receivers mask it off before dispatching on the type).
 static constexpr uint8_t SHM_PAYLOAD_FLAG = 0x80;
 
 // Datagram payload when SHM_PAYLOAD_FLAG is set. Blitted onto the wire, so
@@ -115,13 +124,39 @@ struct ShmRingWriter
   int32_t owner_pid = -1;
   uint32_t owner_id = 0;      // assigned from a process-global counter
   std::string shm_name;
+  size_t reserved_cap = 0;    // capacity of the reserved-but-uncommitted record
 };
 
-// Subscriber-side cache of mapped publisher rings, keyed by shm name. One
-// entry per (publisher ring, segment generation) seen; internally locked
-// because rmw_wait and rmw_take may drain the same subscription concurrently.
+// Subscriber-side cache of mapped publisher rings, keyed by the segment's
+// (owner_pid, owner_id, segment_id) — a 16-byte POD, so the receive hot path
+// does an integer-keyed lookup instead of rebuilding and hashing the segment
+// path string per message. domain_id is constant per cache instance, so those
+// three descriptor fields uniquely identify a segment. One entry per (ring,
+// generation) seen; internally locked because rmw_wait and rmw_take may drain
+// the same subscription concurrently.
 struct ShmReaderCache
 {
+  struct Key
+  {
+    int32_t owner_pid;
+    uint32_t owner_id;
+    uint64_t segment_id;
+    bool operator==(const Key & o) const
+    {
+      return owner_pid == o.owner_pid && owner_id == o.owner_id &&
+             segment_id == o.segment_id;
+    }
+  };
+  struct KeyHash
+  {
+    size_t operator()(const Key & k) const
+    {
+      size_t h = std::hash<uint64_t>()(k.segment_id);
+      h ^= std::hash<uint32_t>()(k.owner_id) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      h ^= std::hash<int32_t>()(k.owner_pid) + 0x9e3779b9 + (h << 6) + (h >> 2);
+      return h;
+    }
+  };
   struct Mapping
   {
     uint8_t * base = nullptr;
@@ -129,9 +164,33 @@ struct ShmReaderCache
     // Ring capacity as validated at map time. Bounds checks use this
     // snapshot, never the live (owner-writable) header in the mapping.
     size_t ring_bytes = 0;
+    // Segment path, built once when mapped; reused by the liveness-probe sweep
+    // so a hit never rebuilds it.
+    std::string shm_name;
   };
   std::mutex mutex;
-  std::unordered_map<std::string, Mapping> mappings;
+  std::unordered_map<Key, Mapping, KeyHash> mappings;
+};
+
+// A dedicated shm segment holding exactly one immutable payload record, for
+// TRANSIENT_LOCAL cached messages. Unlike the cycling ShmRingWriter, this
+// segment is written once and never reused, so a late-joining subscriber can
+// map and replay it at any time until the cache entry is evicted. Owns its
+// mapping and shm name; the destructor unmaps and unlinks. Non-copyable, and
+// (with a user-declared destructor and no move ops) never moved directly — it
+// is always held through a std::unique_ptr in the owning CachedMessage, and
+// that unique_ptr is what lets the cache entry move through the replay deque
+// without double-freeing or leaking the segment.
+struct DurableShmSegment
+{
+  uint8_t * base = nullptr;
+  size_t map_size = 0;
+  std::string shm_name;
+
+  DurableShmSegment() = default;
+  ~DurableShmSegment();
+  DurableShmSegment(const DurableShmSegment &) = delete;
+  DurableShmSegment & operator=(const DurableShmSegment &) = delete;
 };
 
 // Stage a payload into the publisher's ring, creating the ring lazily and
@@ -139,8 +198,49 @@ struct ShmReaderCache
 // payload outgrows it. Fills desc_out on success. Returns false when shared
 // memory is unavailable (shm_open/ftruncate/mmap failure) — the caller falls
 // back to sending the payload inline. Caller holds UdsPublisher::shm_mutex.
+// Implemented as reserve + memcpy + commit (below).
 bool shm_stage_payload(
   ShmRingWriter & ring,
+  size_t domain_id,
+  const uint8_t * payload,
+  size_t payload_size,
+  ShmPayloadDescriptor & desc_out);
+
+// Two-phase staging, so a serializer can write CDR bytes directly into the
+// ring record instead of through an intermediate heap buffer. The caller
+// holds the entity's shm_mutex across the whole reserve..commit/abort span.
+//
+//   uint8_t * dst = shm_stage_reserve(ring, domain, max_size);
+//   ...write up to max_size bytes into dst...
+//   shm_stage_commit(ring, actual_size, desc);   // or shm_stage_abort(ring)
+//
+// reserve marks the record's seqlock odd and returns its payload area (null
+// when shared memory is unavailable); the cursor does not advance. commit
+// publishes the record (seqlock even, cursor advanced by the ACTUAL size, so
+// a size-walk overestimate wastes nothing). abort leaves the seqlock odd and
+// the cursor unchanged: the half-written record is never observable — any
+// stale descriptor pointing at that offset fails its seqlock check — and the
+// next reserve reuses the same slot.
+uint8_t * shm_stage_reserve(
+  ShmRingWriter & ring,
+  size_t domain_id,
+  size_t max_payload_size);
+
+bool shm_stage_commit(
+  ShmRingWriter & ring,
+  size_t payload_size,
+  ShmPayloadDescriptor & desc_out);
+
+void shm_stage_abort(ShmRingWriter & ring);
+
+// Stage a payload into a fresh, dedicated, immutable segment and fill desc_out.
+// The returned segment stays valid (its record never overwritten) until the
+// handle is destroyed, so a TRANSIENT_LOCAL publisher can cache the descriptor
+// and replay it to late joiners. Returns nullptr when shared memory is
+// unavailable — the caller falls back to caching the payload inline. The
+// resulting descriptor is read by the same shm_fetch_payload path as ring
+// payloads; readers cannot tell the two apart.
+std::unique_ptr<DurableShmSegment> shm_stage_durable(
   size_t domain_id,
   const uint8_t * payload,
   size_t payload_size,

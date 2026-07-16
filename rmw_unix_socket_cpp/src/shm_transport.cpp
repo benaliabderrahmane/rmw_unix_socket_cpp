@@ -17,6 +17,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <dirent.h>
@@ -142,13 +143,33 @@ bool shm_stage_payload(
   size_t payload_size,
   ShmPayloadDescriptor & desc_out)
 {
-  // The record header and the wire descriptor carry 32-bit lengths.
-  if (payload_size > UINT32_MAX) {
+  uint8_t * dst = shm_stage_reserve(ring, domain_id, payload_size);
+  if (!dst) {
     return false;  // inline path; the send will fail loudly with EMSGSIZE
+  }
+  std::memcpy(dst, payload, payload_size);
+  return shm_stage_commit(ring, payload_size, desc_out);
+}
+
+uint8_t * shm_stage_reserve(
+  ShmRingWriter & ring,
+  size_t domain_id,
+  size_t max_payload_size)
+{
+  // The record header and the wire descriptor carry 32-bit lengths.
+  if (max_payload_size > UINT32_MAX) {
+    return nullptr;
+  }
+  // Test seam (cold path, large sends only): when this env var is exactly
+  // "1", behave as if shared memory were unavailable so tests can pin the
+  // inline fallback. Same seam as shm_stage_durable; never set in production.
+  const char * force_fail = std::getenv("RMW_UDS_TEST_FORCE_SHM_FAILURE");
+  if (force_fail != nullptr && std::strcmp(force_fail, "1") == 0) {
+    return nullptr;
   }
 
   const size_t record_bytes =
-    align_up(sizeof(ShmRecordHeader) + payload_size, SHM_RECORD_ALIGN);
+    align_up(sizeof(ShmRecordHeader) + max_payload_size, SHM_RECORD_ALIGN);
 
   // Lazily create the ring, and recreate it bigger when a payload outgrows
   // the four-records-of-the-largest guarantee. The ring only ever grows.
@@ -159,7 +180,7 @@ bool shm_stage_payload(
       area = SHM_RING_MIN_BYTES;
     }
     if (!create_segment(ring, domain_id, align_up(area, page))) {
-      return false;
+      return nullptr;
     }
   }
 
@@ -171,16 +192,34 @@ bool shm_stage_payload(
 
   auto * record = reinterpret_cast<ShmRecordHeader *>(
     ring.base + sizeof(ShmRingHeader) + ring.next_offset);
-  const uint32_t seq_stable = ring.next_index * 2;
 
   // Seqlock write, same protocol as the registry slots: odd while the bytes
-  // are in flux, even (and equal to the descriptor) once stable. exchange is
-  // an acq_rel RMW so the payload copy cannot be reordered ahead of it; the
-  // slot may hold a stale record's seq or raw payload bytes, hence an
+  // are in flux, even (and equal to the descriptor) once committed. exchange
+  // is an acq_rel RMW so the payload write cannot be reordered ahead of it;
+  // the slot may hold a stale record's seq or raw payload bytes, hence an
   // absolute exchange rather than the registry's fetch_add.
-  record->seq.exchange(seq_stable - 1, std::memory_order_acq_rel);
+  record->seq.exchange(ring.next_index * 2 - 1, std::memory_order_acq_rel);
+  ring.reserved_cap = max_payload_size;
+  return reinterpret_cast<uint8_t *>(record + 1);
+}
+
+bool shm_stage_commit(
+  ShmRingWriter & ring,
+  size_t payload_size,
+  ShmPayloadDescriptor & desc_out)
+{
+  if (payload_size > ring.reserved_cap) {
+    // Writer overran its reservation — never publish; the record stays odd.
+    shm_stage_abort(ring);
+    return false;
+  }
+  ring.reserved_cap = 0;
+
+  auto * record = reinterpret_cast<ShmRecordHeader *>(
+    ring.base + sizeof(ShmRingHeader) + ring.next_offset);
+  const uint32_t seq_stable = ring.next_index * 2;
+
   record->payload_len = static_cast<uint32_t>(payload_size);
-  std::memcpy(record + 1, payload, payload_size);
   record->seq.store(seq_stable, std::memory_order_release);
 
   desc_out.segment_id = ring.segment_id;
@@ -190,9 +229,130 @@ bool shm_stage_payload(
   desc_out.owner_pid = ring.owner_pid;
   desc_out.owner_id = ring.owner_id;
 
-  ring.next_offset += record_bytes;
+  // Advance by the actual size, not the reservation, so an overestimating
+  // size walk wastes no ring capacity.
+  ring.next_offset += align_up(sizeof(ShmRecordHeader) + payload_size, SHM_RECORD_ALIGN);
   ring.next_index += 1;
   return true;
+}
+
+void shm_stage_abort(ShmRingWriter & ring)
+{
+  // Leave the record's seqlock odd and the cursor unchanged: the half-written
+  // bytes are never observable, and the next reserve reuses this slot.
+  ring.reserved_cap = 0;
+}
+
+std::unique_ptr<DurableShmSegment> shm_stage_durable(
+  size_t domain_id,
+  const uint8_t * payload,
+  size_t payload_size,
+  ShmPayloadDescriptor & desc_out)
+{
+  // The record header and the wire descriptor carry 32-bit lengths.
+  if (payload_size > UINT32_MAX) {
+    return nullptr;
+  }
+  // Test seam (cold path, large latched publishes only): when this env var is
+  // exactly "1", behave as if shared memory were unavailable so tests can
+  // exercise the inline fallback deterministically. Never set in production.
+  const char * force_fail = std::getenv("RMW_UDS_TEST_FORCE_SHM_FAILURE");
+  if (force_fail != nullptr && std::strcmp(force_fail, "1") == 0) {
+    return nullptr;
+  }
+
+  // One record at offset 0; the segment holds nothing else and never grows.
+  const size_t record_bytes =
+    align_up(sizeof(ShmRecordHeader) + payload_size, SHM_RECORD_ALIGN);
+  const size_t page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+  const size_t record_area = align_up(record_bytes, page);
+  const size_t total = sizeof(ShmRingHeader) + record_area;
+
+  // Each durable segment gets its own owner_id, so its name never collides
+  // with the publisher's ring or another cached message (and the reader's
+  // per-owner stale-mapping sweep treats each as a distinct ring). Mix in a
+  // time component for the same recycled-PID reason as create_segment.
+  const int32_t pid = getpid();
+  auto now = std::chrono::steady_clock::now().time_since_epoch();
+  uint32_t time_component = static_cast<uint32_t>(
+    std::chrono::duration_cast<std::chrono::microseconds>(now).count() & 0xFFFF);
+  const uint32_t owner_id =
+    (g_shm_owner_counter.fetch_add(1, std::memory_order_relaxed) << 16) |
+    time_component;
+  const uint64_t segment_id = 1;
+  std::string name = make_segment_name(domain_id, pid, owner_id, segment_id);
+
+  int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+  if (fd < 0 && errno == EEXIST) {
+    shm_unlink(name.c_str());
+    fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
+  }
+  if (fd < 0) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "shm_open('%s') failed: %s — caching payload inline",
+      name.c_str(), std::strerror(errno));
+    return nullptr;
+  }
+
+  const int alloc_err = posix_fallocate(fd, 0, static_cast<off_t>(total));
+  if (alloc_err != 0) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "posix_fallocate('%s', %zu) failed: %s — caching payload inline",
+      name.c_str(), total, std::strerror(alloc_err));
+    close(fd);
+    shm_unlink(name.c_str());
+    return nullptr;
+  }
+
+  void * base = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  close(fd);  // the mapping keeps the segment alive; the fd is not needed
+  if (base == MAP_FAILED) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "mmap('%s', %zu) failed: %s — caching payload inline",
+      name.c_str(), total, std::strerror(errno));
+    shm_unlink(name.c_str());
+    return nullptr;
+  }
+
+  auto * header = reinterpret_cast<ShmRingHeader *>(base);
+  header->magic = SHM_RING_MAGIC;
+  header->version = SHM_RING_VERSION;
+  header->ring_bytes = record_area;
+
+  // Single write-once record. No reader can reach it before the descriptor is
+  // sent, so the payload copy followed by a release store of the stable (even)
+  // seq is all the ordering the reader's acquire load needs.
+  auto * record = reinterpret_cast<ShmRecordHeader *>(
+    static_cast<uint8_t *>(base) + sizeof(ShmRingHeader));
+  const uint32_t seq_stable = 2;  // index 1 * 2; matches shm_stage_payload
+  record->payload_len = static_cast<uint32_t>(payload_size);
+  std::memcpy(record + 1, payload, payload_size);
+  record->seq.store(seq_stable, std::memory_order_release);
+
+  desc_out.segment_id = segment_id;
+  desc_out.offset = 0;
+  desc_out.seq = seq_stable;
+  desc_out.payload_size = static_cast<uint32_t>(payload_size);
+  desc_out.owner_pid = pid;
+  desc_out.owner_id = owner_id;
+
+  auto seg = std::unique_ptr<DurableShmSegment>(new DurableShmSegment());
+  seg->base = static_cast<uint8_t *>(base);
+  seg->map_size = total;
+  seg->shm_name = std::move(name);
+  return seg;
+}
+
+DurableShmSegment::~DurableShmSegment()
+{
+  if (base) {
+    munmap(base, map_size);
+    base = nullptr;
+  }
+  if (!shm_name.empty()) {
+    shm_unlink(shm_name.c_str());
+    shm_name.clear();
+  }
 }
 
 // Map (or find the cached mapping of) the segment a descriptor names.
@@ -200,12 +360,11 @@ bool shm_stage_payload(
 static const ShmReaderCache::Mapping * map_segment(
   ShmReaderCache & cache, size_t domain_id, const ShmPayloadDescriptor & desc)
 {
-  const std::string name = make_segment_name(
-    domain_id, desc.owner_pid, desc.owner_id, desc.segment_id);
+  const ShmReaderCache::Key key{desc.owner_pid, desc.owner_id, desc.segment_id};
 
-  auto it = cache.mappings.find(name);
+  auto it = cache.mappings.find(key);
   if (it != cache.mappings.end()) {
-    return &it->second;
+    return &it->second;  // hot path: integer-keyed lookup, no string work
   }
 
   // Publisher churn accumulates mappings of rings whose names are gone
@@ -213,7 +372,7 @@ static const ShmReaderCache::Mapping * map_segment(
   // grown past a handful of publishers, so steady state pays nothing.
   if (cache.mappings.size() >= 8) {
     for (auto stale = cache.mappings.begin(); stale != cache.mappings.end(); ) {
-      int probe = shm_open(stale->first.c_str(), O_RDONLY, 0);
+      int probe = shm_open(stale->second.shm_name.c_str(), O_RDONLY, 0);
       if (probe < 0 && errno == ENOENT) {
         munmap(stale->second.base, stale->second.size);
         stale = cache.mappings.erase(stale);
@@ -226,11 +385,17 @@ static const ShmReaderCache::Mapping * map_segment(
     }
   }
 
+  // Miss: build the segment name (only here, never on the hot hit path).
+  std::string name = make_segment_name(
+    domain_id, desc.owner_pid, desc.owner_id, desc.segment_id);
   int fd = shm_open(name.c_str(), O_RDONLY, 0);
   if (fd < 0) {
     // Publisher gone (or it already replaced this segment generation and we
-    // never mapped it) — the message is lost, which is the same outcome an
-    // exiting publisher produces on the inline path.
+    // never mapped it) — the message is lost. For ring payloads that matches an
+    // exiting publisher on the inline path. For a durable TRANSIENT_LOCAL
+    // segment it is a small divergence from the pre-durable code: a 64 KiB–4 MiB
+    // latched datagram used to survive in the subscriber's socket buffer, but an
+    // unlinked durable segment can no longer be mapped after the fact.
     return nullptr;
   }
 
@@ -264,14 +429,15 @@ static const ShmReaderCache::Mapping * map_segment(
     return nullptr;
   }
 
-  // A new segment generation supersedes older ones from the same ring:
-  // drop stale mappings so a long-lived subscription doesn't accumulate one
-  // mapping per growth step of every publisher it ever listened to.
-  char prefix[96];
-  std::snprintf(prefix, sizeof(prefix), "/ros2_uds_data_%zu_%d_%u_",
-    domain_id, desc.owner_pid, desc.owner_id);
+  // A new segment generation supersedes older ones from the same ring: same
+  // (owner_pid, owner_id), different segment_id. Drop those stale mappings so a
+  // long-lived subscription doesn't accumulate one mapping per growth step of
+  // every publisher it ever listened to.
   for (auto stale = cache.mappings.begin(); stale != cache.mappings.end(); ) {
-    if (stale->first.rfind(prefix, 0) == 0) {
+    if (stale->first.owner_pid == desc.owner_pid &&
+      stale->first.owner_id == desc.owner_id &&
+      stale->first.segment_id != desc.segment_id)
+    {
       munmap(stale->second.base, stale->second.size);
       stale = cache.mappings.erase(stale);
     } else {
@@ -285,7 +451,8 @@ static const ShmReaderCache::Mapping * map_segment(
   // Snapshot the validated capacity: every later bounds check uses this
   // copy, never the live header, which the segment's owner keeps writable.
   mapping.ring_bytes = static_cast<size_t>(header->ring_bytes);
-  return &cache.mappings.emplace(name, mapping).first->second;
+  mapping.shm_name = std::move(name);  // kept for the liveness-probe sweep
+  return &cache.mappings.emplace(key, std::move(mapping)).first->second;
 }
 
 bool shm_fetch_payload(

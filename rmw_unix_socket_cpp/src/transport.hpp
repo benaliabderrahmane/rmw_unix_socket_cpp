@@ -16,6 +16,7 @@
 #define RMW_UNIX_SOCKET_CPP__TRANSPORT_HPP_
 
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -53,6 +54,58 @@ bool recv_from(
   int socket_fd,
   WireHeader & header_out,
   std::vector<uint8_t> & payload_out);
+
+// Bytes to put on the wire for an outbound message: either the inline payload
+// or a staged shm descriptor. Returned by shm_prepare_send.
+struct OutboundPayload { const uint8_t * data; size_t size; };
+
+// Choose inline vs shared memory for an outbound message. If payload_size is at
+// or above SHM_PAYLOAD_THRESHOLD, stage the bytes into `ring` (guarded by
+// `mtx`) and, on success, set SHM_PAYLOAD_FLAG on `hdr`, rewrite
+// hdr.payload_size, and return a span over `desc` (which must outlive the
+// send). Otherwise — small payload, or shm unavailable — return a span over the
+// inline bytes and leave `hdr` unchanged. Shared by every large-payload sender
+// (topic publish, service response, client request).
+OutboundPayload shm_prepare_send(
+  ShmRingWriter & ring,
+  std::mutex & mtx,
+  size_t domain_id,
+  const uint8_t * payload,
+  size_t payload_size,
+  WireHeader & hdr,
+  ShmPayloadDescriptor & desc);
+
+// Serialize an outbound ROS message and choose its destination by size, in
+// one pass: a payload that will reach SHM_PAYLOAD_THRESHOLD is serialized
+// DIRECTLY into a reserved ring record (no intermediate heap payload, no
+// staging copy) and `wire` carries the descriptor with SHM_PAYLOAD_FLAG set
+// on `hdr`; smaller payloads — or any shm failure — are serialized into
+// `payload` for the inline datagram path. hdr.payload_size is set in both
+// modes. Returns false only when the message itself cannot be serialized
+// (`payload`/`wire` are then unusable). Used by every serializing sender:
+// non-latched rmw_publish, rmw_send_request, rmw_send_response.
+bool shm_serialize_prepare_send(
+  ShmRingWriter & ring,
+  std::mutex & mtx,
+  size_t domain_id,
+  const void * ros_message,
+  const message_type_support_callbacks_t * callbacks,
+  WireHeader & hdr,
+  ShmPayloadDescriptor & desc,
+  std::vector<uint8_t> & payload,
+  OutboundPayload & wire);
+
+// Resolve an inbound datagram whose payload may be a shm descriptor. If
+// SHM_PAYLOAD_FLAG is set on `hdr`, swap `payload` for the real bytes via
+// `cache` (clearing the flag and fixing hdr.payload_size). Returns false if the
+// datagram must be dropped (descriptor unresolvable — sender gone or ring
+// lapped), true otherwise, including the plain inline case. Shared by every
+// receiver (subscription drain, wait drain, service/client take).
+bool shm_resolve_incoming(
+  ShmReaderCache & cache,
+  size_t domain_id,
+  WireHeader & hdr,
+  std::vector<uint8_t> & payload);
 
 // Generate a unique socket path for the given prefix and domain_id.
 std::string make_socket_path(size_t domain_id, const char * prefix);

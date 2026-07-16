@@ -148,8 +148,12 @@ if(BUILD_TESTING)
   target_link_libraries(test_serialization ${_unit_test_deps} ${_test_msg_deps})
   target_include_directories(test_serialization PRIVATE src)
 
-  # Unit test: transport
-  ament_add_gtest(test_transport test/test_transport.cpp src/transport.cpp)
+  # Unit test: transport (transport.cpp's shm helpers call into
+  # shm_transport.cpp and, for serialize-into-ring, serialization.cpp —
+  # both are compiled in too).
+  ament_add_gtest(test_transport
+    test/test_transport.cpp src/transport.cpp src/shm_transport.cpp
+    src/serialization.cpp)
   target_link_libraries(test_transport ${_unit_test_deps})
   target_include_directories(test_transport PRIVATE src)
 
@@ -202,6 +206,21 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rmw_qos test/test_rmw_qos.cpp)
   target_link_libraries(test_rmw_qos ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_qos PRIVATE src)
+
+  # Integration: fork()-based two-process tests pushing >4 MB payloads across
+  # a real PID boundary through the shared-memory path.
+  ament_add_gtest(test_rmw_cross_process test/test_rmw_cross_process.cpp)
+  target_link_libraries(test_rmw_cross_process ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_cross_process PRIVATE src)
+
+  # Benchmark (standalone, not a ctest — run manually; see test/perf/README):
+  # publish-side staging cost of serialize-into-ring vs serialize-then-copy.
+  add_executable(bench_serialize_into_ring
+    test/perf/bench_serialize_into_ring.cpp
+    src/serialization.cpp src/transport.cpp src/shm_transport.cpp)
+  target_link_libraries(bench_serialize_into_ring
+    ${_unit_test_deps} ${_test_msg_deps})
+  target_include_directories(bench_serialize_into_ring PRIVATE src)
 endif()
 
 ament_package()
