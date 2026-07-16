@@ -142,6 +142,47 @@ bool serialize(
   return true;
 }
 
+bool serialized_size(
+  const void * ros_message,
+  const message_type_support_callbacks_t * callbacks,
+  size_t & size_out)
+{
+  try {
+    size_out = size_t{4} + callbacks->get_serialized_size(ros_message);
+  } catch (const std::exception &) {
+    return false;  // string/sequence overflow in the size walk
+  }
+  return true;
+}
+
+bool serialize_into(
+  const void * ros_message,
+  const message_type_support_callbacks_t * callbacks,
+  uint8_t * buffer,
+  size_t capacity,
+  size_t & actual_out)
+{
+  try {
+    eprosima::fastcdr::FastBuffer fastbuffer(
+      reinterpret_cast<char *>(buffer), capacity);
+    eprosima::fastcdr::Cdr ser(
+      fastbuffer,
+      eprosima::fastcdr::Cdr::DEFAULT_ENDIAN,
+      eprosima::fastcdr::CdrVersion::DDS_CDR);
+
+    ser.serialize_encapsulation();
+    if (!callbacks->cdr_serialize(ros_message, ser)) {
+      return false;
+    }
+    actual_out = ser.get_serialized_data_length();
+  } catch (const eprosima::fastcdr::exception::Exception &) {
+    return false;  // includes NotEnoughMemory when capacity is too small
+  } catch (const std::exception &) {
+    return false;
+  }
+  return true;
+}
+
 bool deserialize(
   const uint8_t * data,
   size_t length,

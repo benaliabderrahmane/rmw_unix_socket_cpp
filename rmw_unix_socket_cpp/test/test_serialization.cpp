@@ -212,3 +212,72 @@ TEST(SerializationTest, MultiNested)
     input.unbounded_sequence_of_unbounded_sequences[1].string_values,
     output.unbounded_sequence_of_unbounded_sequences[1].string_values);
 }
+
+// --- serialize_into: the direct-into-ring variant of serialize() ---
+
+// serialize_into must be wire-equivalent to serialize(): same length, and the
+// bytes decode to an equal message. Not byte-identical — fastCDR skips CDR
+// alignment padding rather than writing it, so padding bytes carry whatever
+// the destination held (zeros in serialize()'s fresh vector, stale ring bytes
+// in a reused record). Decoders skip those same bytes, so receivers cannot
+// tell which path a message took. The 0xCD poison makes any NON-padding byte
+// the writer failed to produce show up as a decode mismatch.
+template<typename T>
+void expect_into_equivalent(const T & input)
+{
+  auto * cb = get_test_callbacks<T>();
+  ASSERT_NE(nullptr, cb);
+
+  std::vector<uint8_t> reference;
+  ASSERT_TRUE(rmw_uds::serialize(&input, cb, reference));
+
+  size_t est = 0;
+  ASSERT_TRUE(rmw_uds::serialized_size(&input, cb, est));
+  ASSERT_GE(est, reference.size()) << "size walk must be exact or an upper bound";
+
+  std::vector<uint8_t> direct(est, 0xCD);  // poison: unwritten bytes are visible
+  size_t actual = 0;
+  ASSERT_TRUE(rmw_uds::serialize_into(&input, cb, direct.data(), est, actual));
+  ASSERT_EQ(reference.size(), actual);
+
+  T decoded{};
+  ASSERT_TRUE(rmw_uds::deserialize(direct.data(), actual, cb, &decoded));
+  EXPECT_EQ(input, decoded);
+}
+
+TEST(SerializationTest, SerializeIntoMatchesSerializeBasicTypes)
+{
+  test_msgs::msg::BasicTypes msg;
+  msg.int32_value = 1234;
+  msg.float64_value = 3.14;
+  expect_into_equivalent(msg);
+}
+
+TEST(SerializationTest, SerializeIntoMatchesSerializeLargeSequence)
+{
+  test_msgs::msg::UnboundedSequences msg;
+  msg.uint8_values.resize(5 * 1024 * 1024);
+  for (size_t i = 0; i < msg.uint8_values.size(); ++i) {
+    msg.uint8_values[i] = static_cast<uint8_t>((i * 131 + 7) & 0xFF);
+  }
+  expect_into_equivalent(msg);
+}
+
+TEST(SerializationTest, SerializeIntoMatchesSerializeMultiNested)
+{
+  test_msgs::msg::MultiNested msg;  // field-heavy type, exercises alignment
+  expect_into_equivalent(msg);
+}
+
+TEST(SerializationTest, SerializeIntoRejectsTooSmallCapacity)
+{
+  test_msgs::msg::UnboundedSequences msg;
+  msg.uint8_values.resize(64 * 1024);
+  auto * cb = get_test_callbacks<test_msgs::msg::UnboundedSequences>();
+  ASSERT_NE(nullptr, cb);
+
+  std::vector<uint8_t> buf(1024);  // far too small
+  size_t actual = 0;
+  EXPECT_FALSE(rmw_uds::serialize_into(&msg, cb, buf.data(), buf.size(), actual))
+    << "overflowing the capacity must fail, never write out of bounds";
+}

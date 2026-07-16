@@ -157,13 +157,14 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   }
 
   // Reclaim state left behind by processes that terminated ungracefully:
-  // stale registry slots (whose PIDs are gone) and orphan socket files in
-  // /tmp/ros2_uds/<domain>/. Without this, every uncleaned shutdown
-  // permanently eats registry slots.
+  // stale registry slots (whose PIDs are gone), orphan socket files in
+  // /tmp/ros2_uds/<domain>/, and orphan payload rings in /dev/shm. Without
+  // this, every uncleaned shutdown permanently eats registry slots.
   {
     auto * init_header = rmw_uds::registry_header(ctx->registry_ptr);
     rmw_uds::registry_cleanup_stale(init_header);
     rmw_uds::cleanup_orphan_socket_files(domain_id);
+    rmw_uds::shm_cleanup_orphan_segments(domain_id);
   }
 
   rmw_uds::warn_if_sysctl_buffers_undersized();

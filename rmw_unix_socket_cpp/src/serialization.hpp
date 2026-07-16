@@ -48,6 +48,26 @@ bool serialize(
   const message_type_support_callbacks_t * callbacks,
   std::vector<uint8_t> & buffer);
 
+// Serialized size of a message (4-byte CDR encapsulation included) without
+// serializing it. Exact or a small upper bound — serialize_into's actual
+// length can only be <= this. False if the size walk throws (broken message).
+bool serialized_size(
+  const void * ros_message,
+  const message_type_support_callbacks_t * callbacks,
+  size_t & size_out);
+
+// Serialize a ROS message directly into caller-provided memory of `capacity`
+// bytes (e.g. a reserved shm ring record) — same bytes as serialize(), minus
+// the intermediate heap buffer. On success `actual_out` is the real serialized
+// length (<= capacity). False on serializer failure or capacity overflow; the
+// buffer contents are then undefined and must not be published.
+bool serialize_into(
+  const void * ros_message,
+  const message_type_support_callbacks_t * callbacks,
+  uint8_t * buffer,
+  size_t capacity,
+  size_t & actual_out);
+
 // Deserialize a byte buffer into a ROS message using CDR (fastcdr).
 bool deserialize(
   const uint8_t * data,

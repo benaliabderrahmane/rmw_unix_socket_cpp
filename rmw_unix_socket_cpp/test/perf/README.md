@@ -10,6 +10,7 @@ end-to-end latency under realistic loads. They are not run by `colcon test`.
 | `perf_pubsub.py` | Pub/sub latency, in a single process (N pairs on N topics) | 100 pairs × 200 messages |
 | `perf_services.py` | Service round-trip latency, in a single process | 50 pairs × 200 calls |
 | `scale_100_nodes.py` | Cross-process pub/sub with N **separate processes** | 100 talkers × 10s @ 50 Hz |
+| `bench_serialize_into_ring` (C++, built with the test suite) | Publish-side staging: serialize-into-ring vs serialize-then-copy, real fastCDR | 64 KiB–4 MiB × 300–1500 msgs |
 
 ## Why two flavors
 
@@ -39,6 +40,10 @@ cd rmw_unix_socket_cpp/test/perf
 RMW_IMPLEMENTATION=rmw_unix_socket_cpp python3 perf_pubsub.py
 RMW_IMPLEMENTATION=rmw_unix_socket_cpp python3 perf_services.py
 RMW_IMPLEMENTATION=rmw_unix_socket_cpp python3 scale_100_nodes.py
+
+# C++ staging benchmark: built by colcon with BUILD_TESTING=ON; links the
+# sources directly, so no RMW_IMPLEMENTATION is needed
+./build/rmw_unix_socket_cpp/bench_serialize_into_ring
 ```
 
 Each script accepts CLI overrides — see the docstring at the top of each file.

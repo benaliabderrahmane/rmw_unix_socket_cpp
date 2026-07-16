@@ -32,6 +32,8 @@
 #include "rmw/types.h"
 #include "rosidl_typesupport_fastrtps_cpp/message_type_support.h"
 
+#include "shm_transport.hpp"
+
 namespace rmw_uds
 {
 
@@ -81,6 +83,8 @@ struct __attribute__((packed)) WireHeader
   int64_t source_timestamp_ns;          // 8 bytes: ns since epoch
   uint32_t payload_size;                // 4 bytes
   uint8_t msg_type;                     // 1 byte: 0=topic, 1=request, 2=response
+                                        //   high bit = SHM_PAYLOAD_FLAG
+                                        //   (see shm_transport.hpp)
 };
 
 // Wire-format guard: WireHeader is blitted onto the datagram, so its packed
@@ -132,11 +136,17 @@ struct UdsNode
   int32_t registry_index = -1;
 };
 
-// Cached message for TRANSIENT_LOCAL replay
+// Cached message for TRANSIENT_LOCAL replay. For large payloads, `payload`
+// holds a ShmPayloadDescriptor (header.msg_type carries SHM_PAYLOAD_FLAG) and
+// `shm_seg` owns the durable segment the descriptor points at; the segment
+// lives exactly as long as this cache entry, so it is replayable to late
+// joiners and unlinked when the entry is evicted. Small payloads keep the
+// inline bytes and leave shm_seg null.
 struct CachedMessage
 {
   WireHeader header;
   std::vector<uint8_t> payload;
+  std::unique_ptr<DurableShmSegment> shm_seg;
 };
 
 // Publisher data
@@ -166,6 +176,12 @@ struct UdsPublisher
   std::mutex cache_mutex;
   std::deque<CachedMessage> message_cache;
   std::set<std::string> known_subscriber_paths;  // subs we've already replayed to
+
+  // Large payloads: per-publisher /dev/shm ring (created lazily on the first
+  // payload >= SHM_PAYLOAD_THRESHOLD). shm_mutex serializes staging when
+  // several threads publish on the same publisher.
+  std::mutex shm_mutex;
+  ShmRingWriter shm_ring;
 };
 
 // Subscription data
@@ -190,6 +206,10 @@ struct UdsSubscription
   std::mutex callback_mutex;
   rmw_event_callback_t on_new_message_cb = nullptr;
   const void * on_new_message_user_data = nullptr;
+
+  // Large payloads: mapped publisher rings this subscription reads from
+  // (internally locked; see ShmReaderCache).
+  ShmReaderCache shm_cache;
 };
 
 // Cached client routing entry for service responses (path + GID)
@@ -222,6 +242,12 @@ struct UdsService
   uint64_t cached_generation = 0;
   std::vector<CachedClient> cached_clients;
 
+  // Large request/response payloads (>= SHM_PAYLOAD_THRESHOLD): shm_ring stages
+  // outgoing responses; shm_cache resolves descriptors on incoming requests.
+  std::mutex shm_mutex;
+  ShmRingWriter shm_ring;
+  ShmReaderCache shm_cache;
+
   // Callback support
   std::mutex callback_mutex;
   rmw_event_callback_t on_new_request_cb = nullptr;
@@ -252,6 +278,12 @@ struct UdsClient
   uint64_t cached_generation = 0;
   std::string cached_service_path;
   bool cached_is_available = false;
+
+  // Large request/response payloads (>= SHM_PAYLOAD_THRESHOLD): shm_ring stages
+  // outgoing requests; shm_cache resolves descriptors on incoming responses.
+  std::mutex shm_mutex;
+  ShmRingWriter shm_ring;
+  ShmReaderCache shm_cache;
 
   // Callback support
   std::mutex callback_mutex;

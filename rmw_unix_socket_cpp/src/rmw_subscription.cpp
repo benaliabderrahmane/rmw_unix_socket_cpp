@@ -63,7 +63,13 @@ static void drain_subscription(rmw_uds::UdsSubscription * sub)
   std::vector<uint8_t> payload;
 
   while (rmw_uds::recv_from(sub->socket_fd, hdr, payload)) {
-    if (hdr.msg_type != 0) {continue;}  // Not a topic message
+    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 0) {continue;}  // Not a topic message
+
+    if (!rmw_uds::shm_resolve_incoming(
+        sub->shm_cache, sub->context->domain_id, hdr, payload))
+    {
+      continue;  // shm descriptor unresolvable (publisher gone / ring lapped)
+    }
 
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
@@ -223,6 +229,7 @@ rmw_ret_t rmw_destroy_subscription(
       rmw_uds::registry_remove(header, sub_data->registry_index);
     }
     rmw_uds::close_socket(sub_data->socket_fd, sub_data->socket_path);
+    rmw_uds::shm_reader_close(sub_data->shm_cache);
     delete sub_data;
   }
 

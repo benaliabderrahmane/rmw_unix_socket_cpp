@@ -158,6 +158,8 @@ rmw_ret_t rmw_destroy_service(rmw_node_t * node, rmw_service_t * service)
       rmw_uds::registry_remove(header, srv_data->registry_index);
     }
     rmw_uds::close_socket(srv_data->socket_fd, srv_data->socket_path);
+    rmw_uds::shm_writer_close(srv_data->shm_ring);
+    rmw_uds::shm_reader_close(srv_data->shm_cache);
     delete srv_data;
   }
 
@@ -190,7 +192,13 @@ rmw_ret_t rmw_take_request(
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
   while (rmw_uds::recv_from(srv_data->socket_fd, hdr, payload)) {
-    if (hdr.msg_type != 1) {payload.clear(); continue;}
+    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 1) {payload.clear(); continue;}
+    if (!rmw_uds::shm_resolve_incoming(
+        srv_data->shm_cache, srv_data->context->domain_id, hdr, payload))
+    {
+      payload.clear();
+      continue;
+    }
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
     msg.payload = std::move(payload);
@@ -247,21 +255,27 @@ rmw_ret_t rmw_send_response(
 
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
 
-  // Serialize response
-  std::vector<uint8_t> payload;
-  if (!rmw_uds::serialize(ros_response, srv_data->response_callbacks, payload)) {
-    RMW_SET_ERROR_MSG("failed to serialize response");
-    return RMW_RET_ERROR;
-  }
-
-  // Build wire header
+  // Build wire header (payload_size filled by the serialize step below)
   rmw_uds::WireHeader hdr;
   std::memset(&hdr, 0, sizeof(hdr));
   std::memcpy(hdr.gid, request_header->writer_guid, sizeof(hdr.gid));
   hdr.sequence_number = request_header->sequence_number;
   hdr.source_timestamp_ns = now_ns();
-  hdr.payload_size = static_cast<uint32_t>(payload.size());
   hdr.msg_type = 2;  // response
+
+  // Serialize the response, choosing its destination by size: a large one is
+  // written directly into the service's ring record (descriptor on the wire),
+  // a small one inline. Both send sites below fan out the same wire span.
+  std::vector<uint8_t> payload;
+  rmw_uds::ShmPayloadDescriptor desc;
+  rmw_uds::OutboundPayload wire{nullptr, 0};
+  if (!rmw_uds::shm_serialize_prepare_send(
+      srv_data->shm_ring, srv_data->shm_mutex, srv_data->context->domain_id,
+      ros_response, srv_data->response_callbacks, hdr, desc, payload, wire))
+  {
+    RMW_SET_ERROR_MSG("failed to serialize response");
+    return RMW_RET_ERROR;
+  }
 
   // PERFORMANCE: cache the (GID -> path) client list; only refresh on graph change.
   auto * header = rmw_uds::registry_header(srv_data->context->registry_ptr);
@@ -291,7 +305,7 @@ rmw_ret_t rmw_send_response(
     if (std::memcmp(c.gid, request_header->writer_guid, sizeof(c.gid)) == 0) {
       rmw_uds::send_to(
         srv_data->context->send_socket_fd,
-        c.socket_path, hdr, payload.data(), payload.size());
+        c.socket_path, hdr, wire.data, wire.size);
       return RMW_RET_OK;
     }
   }
@@ -306,7 +320,7 @@ rmw_ret_t rmw_send_response(
     if (std::memcmp(c.gid, request_header->writer_guid, sizeof(c.gid)) == 0) {
       rmw_uds::send_to(
         srv_data->context->send_socket_fd,
-        c.socket_path, hdr, payload.data(), payload.size());
+        c.socket_path, hdr, wire.data, wire.size);
       return RMW_RET_OK;
     }
   }

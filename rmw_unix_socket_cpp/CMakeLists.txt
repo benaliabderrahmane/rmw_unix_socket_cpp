@@ -52,6 +52,7 @@ set(CMAKE_REQUIRED_INCLUDES "${_rmw_probe_saved_inc}")
 add_library(rmw_unix_socket_cpp SHARED
   src/registry.cpp
   src/serialization.cpp
+  src/shm_transport.cpp
   src/transport.cpp
   src/rmw_init.cpp
   src/rmw_node.cpp
@@ -147,10 +148,19 @@ if(BUILD_TESTING)
   target_link_libraries(test_serialization ${_unit_test_deps} ${_test_msg_deps})
   target_include_directories(test_serialization PRIVATE src)
 
-  # Unit test: transport
-  ament_add_gtest(test_transport test/test_transport.cpp src/transport.cpp)
+  # Unit test: transport (transport.cpp's shm helpers call into
+  # shm_transport.cpp and, for serialize-into-ring, serialization.cpp —
+  # both are compiled in too).
+  ament_add_gtest(test_transport
+    test/test_transport.cpp src/transport.cpp src/shm_transport.cpp
+    src/serialization.cpp)
   target_link_libraries(test_transport ${_unit_test_deps})
   target_include_directories(test_transport PRIVATE src)
+
+  # Unit test: shared-memory payload transport
+  ament_add_gtest(test_shm_transport test/test_shm_transport.cpp src/shm_transport.cpp)
+  target_link_libraries(test_shm_transport ${_unit_test_deps})
+  target_include_directories(test_shm_transport PRIVATE src)
 
   # Common link/include for all RMW API tests (they include types.hpp which
   # needs fastrtps headers; linking the shared lib pulls them in).
@@ -196,6 +206,21 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rmw_qos test/test_rmw_qos.cpp)
   target_link_libraries(test_rmw_qos ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_qos PRIVATE src)
+
+  # Integration: fork()-based two-process tests pushing >4 MB payloads across
+  # a real PID boundary through the shared-memory path.
+  ament_add_gtest(test_rmw_cross_process test/test_rmw_cross_process.cpp)
+  target_link_libraries(test_rmw_cross_process ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_cross_process PRIVATE src)
+
+  # Benchmark (standalone, not a ctest — run manually; see test/perf/README):
+  # publish-side staging cost of serialize-into-ring vs serialize-then-copy.
+  add_executable(bench_serialize_into_ring
+    test/perf/bench_serialize_into_ring.cpp
+    src/serialization.cpp src/transport.cpp src/shm_transport.cpp)
+  target_link_libraries(bench_serialize_into_ring
+    ${_unit_test_deps} ${_test_msg_deps})
+  target_include_directories(bench_serialize_into_ring PRIVATE src)
 endif()
 
 ament_package()
