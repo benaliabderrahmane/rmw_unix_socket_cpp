@@ -395,6 +395,15 @@ rmw_ret_t rmw_wait(
       }
     }
 
+    // Bound the wait so an idle executor loops and re-runs the top-of-wait
+    // TRANSIENT_LOCAL late-joiner replay: a joining subscriber only bumps the
+    // shm generation counter (no fd fires), so an unbounded wait would never
+    // replay to it. Only shortens the timeout; a non-blocking 0 stays 0.
+    constexpr int TL_REPLAY_POLL_MS = 200;
+    if (timeout_ms < 0 || timeout_ms > TL_REPLAY_POLL_MS) {
+      timeout_ms = TL_REPLAY_POLL_MS;
+    }
+
     // Block, retrying on EINTR. A finite timeout uses a steady_clock deadline
     // so a signal interruption neither returns TIMEOUT early nor busy-loops.
     struct epoll_event ready_events[64];
