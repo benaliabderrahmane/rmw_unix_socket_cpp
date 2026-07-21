@@ -395,12 +395,16 @@ rmw_ret_t rmw_wait(
       }
     }
 
-    // Bound the wait so an idle executor loops and re-runs the top-of-wait
-    // TRANSIENT_LOCAL late-joiner replay: a joining subscriber only bumps the
-    // shm generation counter (no fd fires), so an unbounded wait would never
-    // replay to it. Only shortens the timeout; a non-blocking 0 stays 0.
+    // Bound waits only when data endpoints are present, so idle executors can
+    // re-run top-of-wait and trigger TRANSIENT_LOCAL late-joiner replay.
+    // Graph-listener style waits (guard conditions only) keep infinite-wait
+    // semantics and must not surface synthetic timeouts.
     constexpr int TL_REPLAY_POLL_MS = 200;
-    if (timeout_ms < 0 || timeout_ms > TL_REPLAY_POLL_MS) {
+    const bool has_data_endpoints =
+      (subscriptions && subscriptions->subscriber_count > 0) ||
+      (services && services->service_count > 0) ||
+      (clients && clients->client_count > 0);
+    if (has_data_endpoints && (timeout_ms < 0 || timeout_ms > TL_REPLAY_POLL_MS)) {
       timeout_ms = TL_REPLAY_POLL_MS;
     }
 
