@@ -14,6 +14,7 @@
 
 #include "test_base.hpp"
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
