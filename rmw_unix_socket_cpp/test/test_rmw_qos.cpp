@@ -1065,3 +1065,73 @@ TEST_F(QosTest, TransientLocalReplayReachesLateJoinerWhileWaitBlocked)
   auto _r4 [[maybe_unused]] = rmw_destroy_guard_condition(gc);
   auto _r5 [[maybe_unused]] = rmw_destroy_service(node, srv);
 }
+
+TEST_F(QosTest, TransientLocalLateJoinerWhilePublisherProcessIdle)
+{
+  // Scenario: a latched (TRANSIENT_LOCAL) publisher lives in a process that
+  // is completely idle — its only executor thread is parked in an unbounded
+  // rmw_wait that contains no subscriptions, services, or clients. A
+  // subscriber that joins later must still receive the retained message.
+  // This is the user-visible bug: a latched topic on a quiet node never
+  // reaching late subscribers, however the process happens to be waiting.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+
+  auto * gc = rmw_create_guard_condition(&context);
+  ASSERT_NE(nullptr, gc);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/idle_replay_gc_only", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  test_msgs::msg::BasicTypes m;
+  m.int32_value = 9;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
+
+  auto * ws = rmw_create_wait_set(&context, 4);
+  ASSERT_NE(nullptr, ws);
+
+  std::atomic<bool> stop{false};
+  std::thread executor(
+    [&] {
+      while (!stop.load()) {
+        void * gc_array[1] = {gc->data};
+        rmw_guard_conditions_t gcs;
+        gcs.guard_conditions = gc_array;
+        gcs.guard_condition_count = 1;
+        auto _r [[maybe_unused]] = rmw_wait(
+          nullptr, &gcs, nullptr, nullptr, nullptr, ws, nullptr);
+      }
+    });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/idle_replay_gc_only", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  bool got = false;
+  for (int i = 0; i < 300 && !got; ++i) {
+    test_msgs::msg::BasicTypes recv;
+    bool taken = false;
+    if (rmw_take(sub, &recv, &taken, nullptr) == RMW_RET_OK && taken &&
+      recv.int32_value == 9)
+    {
+      got = true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  stop.store(true);
+  auto _t [[maybe_unused]] = rmw_trigger_guard_condition(gc);
+  executor.join();
+
+  EXPECT_TRUE(got) << "late joiner never received the latched message while the "
+    "publisher's process was idle";
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_wait_set(ws);
+  auto _r3 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+  auto _r4 [[maybe_unused]] = rmw_destroy_guard_condition(gc);
+}

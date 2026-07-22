@@ -119,7 +119,19 @@ struct UdsContext
   int send_socket_fd = -1;
   std::atomic<bool> is_shutdown{false};
   std::atomic<uint64_t> last_registry_generation{0};
-  rmw_guard_condition_t * graph_guard_condition = nullptr;
+
+  // Doorbell: a bound datagram socket other processes ring (one octet) after
+  // any registry mutation, so a blocked rmw_wait re-checks the registry
+  // without polling. Registered in the registry as ENTRY_DOORBELL; the slot's
+  // teardown unlinks the socket file (graceful or via the stale-PID reaper).
+  int doorbell_fd = -1;
+  int32_t doorbell_registry_index = -1;
+
+  // Per-node graph guard conditions (see rmw_node_get_graph_guard_condition),
+  // triggered from rmw_wait when the registry generation changes. Guarded by
+  // the mutex; rmw_destroy_node removes its entry before destroying the GC.
+  std::mutex graph_gcs_mutex;
+  std::vector<rmw_guard_condition_t *> graph_gcs;
 
   // TRANSIENT_LOCAL publishers, for wait-side cache replay on graph change.
   std::mutex transient_local_pubs_mutex;
@@ -301,6 +313,10 @@ struct UdsGuardCondition
 struct UdsWaitSet
 {
   int epoll_fd = -1;
+  // Set at rmw_create_wait_set. The top-of-wait replay/graph check needs the
+  // context even when the wait set holds only guard conditions (rclcpp's
+  // GraphListener), so it cannot be scavenged from the waited-on entities.
+  UdsContext * context = nullptr;
 };
 
 }  // namespace rmw_uds
