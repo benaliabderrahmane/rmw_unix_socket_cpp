@@ -105,6 +105,16 @@ int create_send_socket()
       SEND_BUF_SIZE, std::strerror(errno));
   }
 
+  // Test seam: override the send buffer so tests can pin kernel size-cap
+  // behavior (EMSGSIZE) deterministically. Never set in production.
+  const char * test_sndbuf = std::getenv("RMW_UDS_TEST_SNDBUF");
+  if (test_sndbuf != nullptr) {
+    int forced = std::atoi(test_sndbuf);
+    if (forced > 0) {
+      (void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &forced, sizeof(forced));
+    }
+  }
+
   return fd;
 }
 

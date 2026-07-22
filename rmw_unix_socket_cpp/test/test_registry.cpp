@@ -218,10 +218,10 @@ TEST_F(RegistryTest, MultipleEntriesSameType)
 }
 
 // The high-water bound must shrink the scan range without dropping the
-// highest-index entry. Adding sequentially from an empty (fresh SetUp)
-// registry fills slots 0..4, so high_water must equal max(idx)+1 = the count.
-// Fails on unmodified main (no high_water_slot member) and on a buggy fix
-// that scans [0, hw) with hw==idx or [0, hw-1).
+// highest-index entry. The invariant is hw >= max(live idx)+1 so a [0, hw)
+// scan covers every live slot; exact equality is a first-fit detail we
+// deliberately don't pin. Fails on unmodified main (no high_water_slot
+// member) and on a buggy fix that scans [0, hw) with hw==idx or [0, hw-1).
 TEST_F(RegistryTest, HighWaterBoundsScanWithoutLosingTopEntry)
 {
   auto * header = rmw_uds::registry_header(registry_ptr);
@@ -237,9 +237,9 @@ TEST_F(RegistryTest, HighWaterBoundsScanWithoutLosingTopEntry)
     idx.push_back(k);
   }
 
-  // high_water is the count (slots fill 0..4), i.e. max(idx)+1.
+  // hw must cover the highest live slot: scanning [0, hw) cannot lose it.
   uint32_t hw = header->high_water_slot.load();
-  EXPECT_EQ(static_cast<uint32_t>(*std::max_element(idx.begin(), idx.end())) + 1, hw);
+  EXPECT_GE(hw, static_cast<uint32_t>(*std::max_element(idx.begin(), idx.end())) + 1);
   EXPECT_LT(hw, header->max_entries);  // bound far below 32768 -> scan is cheap
 
   // The top (highest-index) entry must still be found -> guards the [0, hw) vs
@@ -407,6 +407,13 @@ TEST_F(RegistryTest, AddOverflowKeepsLivePidEntries)
 
   auto all = rmw_uds::registry_query(
     header, rmw_uds::ENTRY_NODE, nullptr, nullptr, nullptr);
+  // The live entries actually survived: exactly n_0, n_2 and extra remain.
+  EXPECT_EQ(3u, all.size());
+  for (const char * name : {"n_0", "n_2", "extra"}) {
+    auto found = rmw_uds::registry_query(
+      header, rmw_uds::ENTRY_NODE, nullptr, name, nullptr);
+    EXPECT_EQ(1u, found.size()) << "live entry '" << name << "' lost";
+  }
   // All remaining entries must have a live PID (ours) — no dead PIDs left.
   for (const auto & r : all) {
     EXPECT_NE(0, std::strncmp(r.node_name.c_str(), "n_1", 3))

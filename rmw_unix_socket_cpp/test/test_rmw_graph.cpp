@@ -122,19 +122,38 @@ TEST_F(RmwUdsNodeTest, GetTopicNamesAndTypes)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
 }
 
-TEST_F(RmwUdsNodeTest, CompareGidsEqual)
+TEST_F(RmwUdsNodeTest, CompareGidsRealPublishers)
 {
-  rmw_gid_t gid1, gid2;
-  std::memset(&gid1, 0, sizeof(gid1));
-  std::memset(&gid2, 0, sizeof(gid2));
-  gid1.data[0] = 1;
-  gid2.data[0] = 1;
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  rmw_qos_profile_t qos;
+  std::memset(&qos, 0, sizeof(qos));
+  qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+  qos.depth = 10;
+  qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+  qos.durability = RMW_QOS_POLICY_DURABILITY_VOLATILE;
 
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub1 = rmw_create_publisher(node, ts, "/gid_topic", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub1);
+  auto * pub2 = rmw_create_publisher(node, ts, "/gid_topic", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub2);
+
+  rmw_gid_t gid1, gid2;
+  ASSERT_EQ(RMW_RET_OK, rmw_get_gid_for_publisher(pub1, &gid1));
+  ASSERT_EQ(RMW_RET_OK, rmw_get_gid_for_publisher(pub2, &gid2));
+
+  // Each gid equals itself
   bool result = false;
-  EXPECT_EQ(RMW_RET_OK, rmw_compare_gids_equal(&gid1, &gid2, &result));
+  EXPECT_EQ(RMW_RET_OK, rmw_compare_gids_equal(&gid1, &gid1, &result));
+  EXPECT_TRUE(result);
+  EXPECT_EQ(RMW_RET_OK, rmw_compare_gids_equal(&gid2, &gid2, &result));
   EXPECT_TRUE(result);
 
-  gid2.data[0] = 2;
+  // Distinct publishers have distinct gids
   EXPECT_EQ(RMW_RET_OK, rmw_compare_gids_equal(&gid1, &gid2, &result));
   EXPECT_FALSE(result);
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub1));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub2));
 }

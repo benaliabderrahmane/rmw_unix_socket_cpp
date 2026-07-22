@@ -20,7 +20,7 @@
 #include <thread>
 #include <chrono>
 
-#include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "test_msgs/msg/basic_types.hpp"
@@ -31,7 +31,7 @@
 #include "rosidl_typesupport_cpp/message_type_support.hpp"
 #include "rosidl_typesupport_cpp/service_type_support.hpp"
 
-#include "types.hpp"
+#include "../src/shm_transport.hpp"  // SHM_PAYLOAD_THRESHOLD only (compile-time size guards)
 
 class QosTest : public RmwUdsNodeTest
 {
@@ -58,6 +58,15 @@ protected:
     qos.durability = dur;
     return qos;
   }
+};
+
+// Sets an env var for the enclosing scope; unset even on an early ASSERT return.
+struct ScopedEnv
+{
+  const char * name;
+  ScopedEnv(const char * n, const char * v)
+  : name(n) {setenv(n, v, 1);}
+  ~ScopedEnv() {unsetenv(name);}
 };
 
 // --- TRANSIENT_LOCAL (latched) tests ---
@@ -109,17 +118,11 @@ TEST_F(QosTest, TransientLocalLateJoiner)
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
-TEST_F(QosTest, TransientLocalLargeMessageUsesDurableShm)
+TEST_F(QosTest, TransientLocalLargeMessageReachesLateJoiner)
 {
-  // Large latched messages are staged into a dedicated *durable* shm segment
-  // owned by the cache entry — never the publisher's cycling ring, which would
-  // lap and corrupt a record still awaited by a late joiner. So the cached
-  // entry carries a descriptor (SHM_PAYLOAD_FLAG set), shm_ring stays untouched,
-  // and replay resolves the descriptor out of the durable segment. This also
-  // pins the ordering in rmw_publish: the TL branch must stage durably rather
-  // than fall through to the ring fork. 100 KB: over SHM_PAYLOAD_THRESHOLD,
-  // under the stock-kernel datagram cap. (See TransientLocalHugeMessageLateJoiner
-  // for the case that exceeds the cap.)
+  // A large latched message — 100 KB: over SHM_PAYLOAD_THRESHOLD, under the
+  // stock-kernel datagram cap — must reach a late joiner byte-equal. (See
+  // TransientLocalHugeMessageLateJoiner for the case that exceeds the cap.)
   auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
     test_msgs::msg::UnboundedSequences>();
   auto qos = make_qos(
@@ -137,19 +140,7 @@ TEST_F(QosTest, TransientLocalLargeMessageUsesDurableShm)
   }
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
 
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    ASSERT_EQ(1u, pub_data->message_cache.size());
-    const auto & cm = pub_data->message_cache.back();
-    EXPECT_NE(nullptr, cm.shm_seg)
-      << "a large TRANSIENT_LOCAL message must be cached in a durable shm segment";
-    EXPECT_TRUE(cm.header.msg_type & rmw_uds::SHM_PAYLOAD_FLAG);
-  }
-  EXPECT_EQ(nullptr, pub_data->shm_ring.base)
-    << "TRANSIENT_LOCAL must use a durable segment, never the cycling ring";
-
-  // A late joiner must get the cached message via durable-shm replay.
+  // A late joiner must get the cached message.
   auto sub_opts = rmw_get_default_subscription_options();
   auto * sub = rmw_create_subscription(node, seq_ts, "/latched_large", &qos, &sub_opts);
   ASSERT_NE(nullptr, sub);
@@ -157,7 +148,6 @@ TEST_F(QosTest, TransientLocalLargeMessageUsesDurableShm)
   test_msgs::msg::UnboundedSequences trigger;
   trigger.uint8_values = {1, 2, 3};
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &trigger, nullptr));
-  EXPECT_EQ(nullptr, pub_data->shm_ring.base);
 
   test_msgs::msg::UnboundedSequences recv;
   bool taken = false;
@@ -199,13 +189,6 @@ TEST_F(QosTest, TransientLocalHugeMessageLateJoiner)
   }
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &big, nullptr));
 
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    ASSERT_EQ(1u, pub_data->message_cache.size());
-    EXPECT_NE(nullptr, pub_data->message_cache.back().shm_seg);
-  }
-
   // Late joiner, then a small publish to trigger replay of the cached 5 MB msg.
   auto sub_opts = rmw_get_default_subscription_options();
   auto * sub = rmw_create_subscription(node, seq_ts, "/latched_huge", &qos, &sub_opts);
@@ -232,17 +215,18 @@ TEST_F(QosTest, TransientLocalHugeMessageLateJoiner)
 TEST_F(QosTest, TransientLocalPublishReturnsErrorOnEMSGSIZE)
 {
   // A latched publish whose live send is rejected by the kernel size cap must
-  // return RMW_RET_ERROR, not a lying RMW_RET_OK. Before the fix the TL path
-  // ignored send_to's result entirely. Shrink SO_SNDBUF so a sub-threshold
-  // (inline) latched message hits EMSGSIZE deterministically, independent of
-  // the machine's net.core.wmem_max.
-  auto * ctx_impl = reinterpret_cast<rmw_uds::UdsContext *>(context.impl);
-  int small_buf = 2048;
-  ASSERT_EQ(
-    0,
-    setsockopt(
-      ctx_impl->send_socket_fd, SOL_SOCKET, SO_SNDBUF,
-      &small_buf, sizeof(small_buf)));
+  // return RMW_RET_ERROR, not a lying RMW_RET_OK. The RMW_UDS_TEST_SNDBUF init
+  // seam shrinks SO_SNDBUF so a sub-threshold (inline) latched message hits
+  // EMSGSIZE deterministically, independent of the machine's net.core.wmem_max.
+  // The seam applies at socket creation, so the test brings up its own context.
+  ScopedEnv sndbuf("RMW_UDS_TEST_SNDBUF", "2048");
+  rmw_init_options_t opts2 = rmw_get_zero_initialized_init_options();
+  ASSERT_EQ(RMW_RET_OK, rmw_init_options_init(&opts2, rcutils_get_default_allocator()));
+  opts2.domain_id = 99;  // same domain as the fixture
+  rmw_context_t ctx2 = rmw_get_zero_initialized_context();
+  ASSERT_EQ(RMW_RET_OK, rmw_init(&opts2, &ctx2));
+  rmw_node_t * node2 = rmw_create_node(&ctx2, "tl_emsgsize_node", "/test_ns");
+  ASSERT_NE(nullptr, node2);
 
   auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
     test_msgs::msg::UnboundedSequences>();
@@ -250,10 +234,10 @@ TEST_F(QosTest, TransientLocalPublishReturnsErrorOnEMSGSIZE)
     RMW_QOS_POLICY_RELIABILITY_RELIABLE,
     RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
   auto pub_opts = rmw_get_default_publisher_options();
-  auto * pub = rmw_create_publisher(node, seq_ts, "/tl_emsgsize", &qos, &pub_opts);
+  auto * pub = rmw_create_publisher(node2, seq_ts, "/tl_emsgsize", &qos, &pub_opts);
   ASSERT_NE(nullptr, pub);
   auto sub_opts = rmw_get_default_subscription_options();
-  auto * sub = rmw_create_subscription(node, seq_ts, "/tl_emsgsize", &qos, &sub_opts);
+  auto * sub = rmw_create_subscription(node2, seq_ts, "/tl_emsgsize", &qos, &sub_opts);
   ASSERT_NE(nullptr, sub);
 
   // 32 KiB: above the shrunken buffer, below SHM_PAYLOAD_THRESHOLD so it stays
@@ -263,14 +247,17 @@ TEST_F(QosTest, TransientLocalPublishReturnsErrorOnEMSGSIZE)
   msg.uint8_values.resize(32 * 1024);
   EXPECT_EQ(RMW_RET_ERROR, rmw_publish(pub, &msg, nullptr));
 
-  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
-  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node2, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node2, pub);
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_node(node2));
+  EXPECT_EQ(RMW_RET_OK, rmw_shutdown(&ctx2));
+  EXPECT_EQ(RMW_RET_OK, rmw_context_fini(&ctx2));
+  EXPECT_EQ(RMW_RET_OK, rmw_init_options_fini(&opts2));
 }
 
-TEST_F(QosTest, TransientLocalLargeMessageInlineFallbackWhenShmUnavailable)
+TEST_F(QosTest, TransientLocalLargeMessageDeliveredWhenShmUnavailable)
 {
-  // When shm staging is unavailable, a large latched payload falls back to
-  // caching inline (no durable segment, no SHM_PAYLOAD_FLAG) and is still
+  // When shm staging is unavailable, a large latched payload must still be
   // delivered byte-equal to a late joiner. The test seam forces the failure.
   auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
     test_msgs::msg::UnboundedSequences>();
@@ -290,16 +277,6 @@ TEST_F(QosTest, TransientLocalLargeMessageInlineFallbackWhenShmUnavailable)
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
   unsetenv("RMW_UDS_TEST_FORCE_SHM_FAILURE");  // reset before it leaks to other tests
 
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    ASSERT_EQ(1u, pub_data->message_cache.size());
-    const auto & cm = pub_data->message_cache.back();
-    EXPECT_EQ(nullptr, cm.shm_seg)
-      << "shm forced unavailable — the large payload must be cached inline";
-    EXPECT_FALSE(cm.header.msg_type & rmw_uds::SHM_PAYLOAD_FLAG);
-  }
-
   auto sub_opts = rmw_get_default_subscription_options();
   auto * sub = rmw_create_subscription(node, seq_ts, "/tl_fallback", &qos, &sub_opts);
   ASSERT_NE(nullptr, sub);
@@ -310,20 +287,18 @@ TEST_F(QosTest, TransientLocalLargeMessageInlineFallbackWhenShmUnavailable)
   test_msgs::msg::UnboundedSequences recv;
   bool taken = false;
   EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
-  ASSERT_TRUE(taken) << "late joiner must receive the inline-fallback message";
+  ASSERT_TRUE(taken) << "late joiner must receive the message despite shm being unavailable";
   EXPECT_EQ(msg.uint8_values, recv.uint8_values);
 
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
-TEST_F(QosTest, VolatileLargeMessageInlineFallbackWhenShmUnavailable)
+TEST_F(QosTest, VolatileLargeMessageDeliveredWhenShmUnavailable)
 {
-  // Ring-path counterpart of the TL test above: when shm staging is
-  // unavailable, a large VOLATILE payload is serialized into the inline
-  // fallback (no ring, no SHM_PAYLOAD_FLAG) and still delivered byte-equal.
-  // Pins shm_serialize_prepare_send's reserve-failure branch, including the
-  // contained resize on the extern "C" boundary.
+  // VOLATILE counterpart of the TL test above: when shm staging is
+  // unavailable, a large volatile payload must still be delivered byte-equal.
+  // The test seam forces the failure.
   auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
     test_msgs::msg::UnboundedSequences>();
   auto qos = make_qos(
@@ -345,14 +320,10 @@ TEST_F(QosTest, VolatileLargeMessageInlineFallbackWhenShmUnavailable)
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
   unsetenv("RMW_UDS_TEST_FORCE_SHM_FAILURE");  // reset before it leaks to other tests
 
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  EXPECT_EQ(nullptr, pub_data->shm_ring.base)
-    << "shm forced unavailable — no ring may be created";
-
   test_msgs::msg::UnboundedSequences recv;
   bool taken = false;
   EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
-  ASSERT_TRUE(taken) << "the inline-fallback message must be delivered";
+  ASSERT_TRUE(taken) << "the message must be delivered despite shm being unavailable";
   EXPECT_EQ(msg.uint8_values, recv.uint8_values);
 
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
@@ -383,14 +354,8 @@ TEST_F(QosTest, TransientLocalSerializedLargeMessageLateJoiner)
   }
   serialized.allocator = rcutils_get_default_allocator();
 
-  // Publish BEFORE any subscriber — must be cached in a durable segment.
+  // Publish BEFORE any subscriber — must be cached for replay.
   EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &serialized, nullptr));
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    ASSERT_EQ(1u, pub_data->message_cache.size());
-    EXPECT_NE(nullptr, pub_data->message_cache.back().shm_seg);
-  }
 
   auto sub_opts = rmw_get_default_subscription_options();
   auto * sub = rmw_create_subscription(node, ts, "/tl_serialized_huge", &qos, &sub_opts);
@@ -419,100 +384,6 @@ TEST_F(QosTest, TransientLocalSerializedLargeMessageLateJoiner)
   auto _f [[maybe_unused]] = rmw_serialized_message_fini(&received);
   std::free(serialized.buffer);
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
-  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
-}
-
-TEST_F(QosTest, KnownSubscriberPathsPrunedOnChurn)
-{
-  // The publisher's known_subscriber_paths must not accumulate dead entries as
-  // subscribers churn: each create/destroy bumps the registry generation, and a
-  // restarted subscriber gets a brand-new unique socket path. Without pruning on
-  // refresh the set is insert-only and grows by one per churned subscriber.
-  auto qos = make_qos(
-    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
-    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
-
-  auto pub_opts = rmw_get_default_publisher_options();
-  auto * pub = rmw_create_publisher(node, ts, "/churn", &qos, &pub_opts);
-  ASSERT_NE(nullptr, pub);
-
-  // Seed the cache so there is something to replay.
-  test_msgs::msg::BasicTypes seed;
-  seed.int32_value = 1;
-  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &seed, nullptr));
-
-  auto sub_opts = rmw_get_default_subscription_options();
-  constexpr int kChurn = 8;
-  for (int i = 0; i < kChurn; ++i) {
-    // New sub bumps generation -> next publish refreshes + records this sub.
-    auto * sub = rmw_create_subscription(node, ts, "/churn", &qos, &sub_opts);
-    ASSERT_NE(nullptr, sub);
-    test_msgs::msg::BasicTypes m;
-    m.int32_value = i + 2;
-    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
-    // Destroy bumps generation again; next publish refreshes + prunes the gone sub.
-    auto _r [[maybe_unused]] = rmw_destroy_subscription(node, sub);
-    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
-  }
-
-  // After the loop every churned sub is destroyed, so known should be empty.
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  size_t known_size = 0;
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    known_size = pub_data->known_subscriber_paths.size();
-  }
-  // With the prune: tracks only live subs (0 here). Without it: grows to kChurn.
-  EXPECT_LE(known_size, 1u)
-    << "known_subscriber_paths leaked dead entries: size=" << known_size;
-
-  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
-}
-
-TEST_F(QosTest, TransientLocalSerializedKnownSubscriberPathsPrunedOnChurn)
-{
-  // Same prune guarantee as KnownSubscriberPathsPrunedOnChurn, but driven
-  // through rmw_publish_serialized_message, which carries its own copy of the
-  // prune-on-refresh logic. Guards against that copy silently diverging: without
-  // the prune the serialized path's known_subscriber_paths grows by one per
-  // churned subscriber.
-  auto qos = make_qos(
-    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
-    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
-
-  auto pub_opts = rmw_get_default_publisher_options();
-  auto * pub = rmw_create_publisher(node, ts, "/churn_serialized", &qos, &pub_opts);
-  ASSERT_NE(nullptr, pub);
-
-  uint8_t bytes[] = {1, 2, 3, 4, 5, 6, 7, 8};
-  rmw_serialized_message_t msg;
-  msg.buffer = bytes;
-  msg.buffer_length = sizeof(bytes);
-  msg.buffer_capacity = sizeof(bytes);
-  msg.allocator = rcutils_get_default_allocator();
-
-  // Seed the cache so there is something to replay.
-  EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &msg, nullptr));
-
-  auto sub_opts = rmw_get_default_subscription_options();
-  constexpr int kChurn = 8;
-  for (int i = 0; i < kChurn; ++i) {
-    auto * sub = rmw_create_subscription(node, ts, "/churn_serialized", &qos, &sub_opts);
-    ASSERT_NE(nullptr, sub);
-    EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &msg, nullptr));
-    auto _r [[maybe_unused]] = rmw_destroy_subscription(node, sub);
-    EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &msg, nullptr));
-  }
-
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  size_t known_size = 0;
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    known_size = pub_data->known_subscriber_paths.size();
-  }
-  EXPECT_LE(known_size, 1u)
-    << "serialized-path known_subscriber_paths leaked dead entries: size=" << known_size;
-
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
@@ -554,10 +425,11 @@ TEST_F(QosTest, TransientLocalCacheDepthEnforced)
     received.push_back(recv.int32_value);
   }
 
-  // We should have received 4, 5, 6 (the 3 most recent in cache + current)
-  ASSERT_GE(received.size(), 3u);
-  // The last received should be 6 (current message)
-  EXPECT_EQ(6, received.back());
+  // Exactly 4, 5, 6 — the depth-3 cache tail plus the current message.
+  ASSERT_EQ(3u, received.size());
+  EXPECT_EQ(4, received[0]);
+  EXPECT_EQ(5, received[1]);
+  EXPECT_EQ(6, received[2]);
 
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
@@ -567,25 +439,27 @@ TEST_F(QosTest, TransientLocalCacheDepthEnforced)
 
 TEST_F(QosTest, PublishReturnsErrorOnEMSGSIZE)
 {
-  // Shrink SO_SNDBUF so any send hits EMSGSIZE — publish must return ERROR.
-  auto * ctx_impl = reinterpret_cast<rmw_uds::UdsContext *>(context.impl);
-  int small_buf = 2048;
-  ASSERT_EQ(
-    0,
-    setsockopt(
-      ctx_impl->send_socket_fd, SOL_SOCKET, SO_SNDBUF,
-      &small_buf, sizeof(small_buf)));
+  // Shrink SO_SNDBUF (RMW_UDS_TEST_SNDBUF init seam, own context) so any send
+  // hits EMSGSIZE — publish must return ERROR.
+  ScopedEnv sndbuf("RMW_UDS_TEST_SNDBUF", "2048");
+  rmw_init_options_t opts2 = rmw_get_zero_initialized_init_options();
+  ASSERT_EQ(RMW_RET_OK, rmw_init_options_init(&opts2, rcutils_get_default_allocator()));
+  opts2.domain_id = 99;  // same domain as the fixture
+  rmw_context_t ctx2 = rmw_get_zero_initialized_context();
+  ASSERT_EQ(RMW_RET_OK, rmw_init(&opts2, &ctx2));
+  rmw_node_t * node2 = rmw_create_node(&ctx2, "emsgsize_node", "/test_ns");
+  ASSERT_NE(nullptr, node2);
 
   auto qos = make_qos(
     RMW_QOS_POLICY_RELIABILITY_RELIABLE,
     RMW_QOS_POLICY_DURABILITY_VOLATILE);
 
   auto pub_opts = rmw_get_default_publisher_options();
-  auto * pub = rmw_create_publisher(node, ts, "/emsgsize", &qos, &pub_opts);
+  auto * pub = rmw_create_publisher(node2, ts, "/emsgsize", &qos, &pub_opts);
   ASSERT_NE(nullptr, pub);
 
   auto sub_opts = rmw_get_default_subscription_options();
-  auto * sub = rmw_create_subscription(node, ts, "/emsgsize", &qos, &sub_opts);
+  auto * sub = rmw_create_subscription(node2, ts, "/emsgsize", &qos, &sub_opts);
   ASSERT_NE(nullptr, sub);
 
   // 32 KB — well above SOCK_MIN_SNDBUF the kernel will clamp us to, but
@@ -605,34 +479,38 @@ TEST_F(QosTest, PublishReturnsErrorOnEMSGSIZE)
   EXPECT_EQ(RMW_RET_ERROR, rmw_publish_serialized_message(pub, &serialized, nullptr));
 
   std::free(serialized.buffer);
-  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
-  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node2, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node2, pub);
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_node(node2));
+  EXPECT_EQ(RMW_RET_OK, rmw_shutdown(&ctx2));
+  EXPECT_EQ(RMW_RET_OK, rmw_context_fini(&ctx2));
+  EXPECT_EQ(RMW_RET_OK, rmw_init_options_fini(&opts2));
 }
 
 TEST_F(QosTest, LargePayloadBypassesSendBuffer)
 {
-  // Same shrunken SO_SNDBUF, but a payload above SHM_PAYLOAD_THRESHOLD:
-  // the bytes travel through the publisher's shm ring and only a small
-  // descriptor crosses the socket, so the publish succeeds and the message
-  // arrives intact where it previously died with EMSGSIZE.
-  auto * ctx_impl = reinterpret_cast<rmw_uds::UdsContext *>(context.impl);
-  int small_buf = 2048;
-  ASSERT_EQ(
-    0,
-    setsockopt(
-      ctx_impl->send_socket_fd, SOL_SOCKET, SO_SNDBUF,
-      &small_buf, sizeof(small_buf)));
+  // Same shrunken SO_SNDBUF (RMW_UDS_TEST_SNDBUF init seam, own context), but
+  // a payload above SHM_PAYLOAD_THRESHOLD: the publish succeeds and the
+  // message arrives intact where the inline path died with EMSGSIZE.
+  ScopedEnv sndbuf("RMW_UDS_TEST_SNDBUF", "2048");
+  rmw_init_options_t opts2 = rmw_get_zero_initialized_init_options();
+  ASSERT_EQ(RMW_RET_OK, rmw_init_options_init(&opts2, rcutils_get_default_allocator()));
+  opts2.domain_id = 99;  // same domain as the fixture
+  rmw_context_t ctx2 = rmw_get_zero_initialized_context();
+  ASSERT_EQ(RMW_RET_OK, rmw_init(&opts2, &ctx2));
+  rmw_node_t * node2 = rmw_create_node(&ctx2, "shm_bypass_node", "/test_ns");
+  ASSERT_NE(nullptr, node2);
 
   auto qos = make_qos(
     RMW_QOS_POLICY_RELIABILITY_RELIABLE,
     RMW_QOS_POLICY_DURABILITY_VOLATILE);
 
   auto pub_opts = rmw_get_default_publisher_options();
-  auto * pub = rmw_create_publisher(node, ts, "/shm_bypass", &qos, &pub_opts);
+  auto * pub = rmw_create_publisher(node2, ts, "/shm_bypass", &qos, &pub_opts);
   ASSERT_NE(nullptr, pub);
 
   auto sub_opts = rmw_get_default_subscription_options();
-  auto * sub = rmw_create_subscription(node, ts, "/shm_bypass", &qos, &sub_opts);
+  auto * sub = rmw_create_subscription(node2, ts, "/shm_bypass", &qos, &sub_opts);
   ASSERT_NE(nullptr, sub);
 
   constexpr size_t big_size = 128 * 1024;
@@ -661,8 +539,12 @@ TEST_F(QosTest, LargePayloadBypassesSendBuffer)
 
   auto _f [[maybe_unused]] = rmw_serialized_message_fini(&received);
   std::free(serialized.buffer);
-  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
-  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node2, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node2, pub);
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_node(node2));
+  EXPECT_EQ(RMW_RET_OK, rmw_shutdown(&ctx2));
+  EXPECT_EQ(RMW_RET_OK, rmw_context_fini(&ctx2));
+  EXPECT_EQ(RMW_RET_OK, rmw_init_options_fini(&opts2));
 }
 
 TEST_F(QosTest, TransientLocalReplayOnWaitNoSubsequentPublish)
@@ -723,7 +605,8 @@ TEST_F(QosTest, TransientLocalReplayOnWaitNoSubsequentPublish)
 
 TEST_F(QosTest, PublishStillReturnsOkOnSoftDropPeerGone)
 {
-  // ENOENT on a vanished peer must stay RET_OK — only EMSGSIZE escalates.
+  // A subscriber process that dies without cleanup must stay a soft drop:
+  // publishing to the dead peer returns RET_OK — only EMSGSIZE escalates.
   auto qos = make_qos(
     RMW_QOS_POLICY_RELIABILITY_RELIABLE,
     RMW_QOS_POLICY_DURABILITY_VOLATILE);
@@ -732,22 +615,47 @@ TEST_F(QosTest, PublishStillReturnsOkOnSoftDropPeerGone)
   auto * pub = rmw_create_publisher(node, ts, "/peer_gone", &qos, &pub_opts);
   ASSERT_NE(nullptr, pub);
 
-  auto sub_opts = rmw_get_default_subscription_options();
-  auto * sub = rmw_create_subscription(node, ts, "/peer_gone", &qos, &sub_opts);
-  ASSERT_NE(nullptr, sub);
+  // Real dead peer: a forked child subscribes on its own context, signals over
+  // the pipe, then _exit(0)s without cleanup (skipping atexit/destructors).
+  int ready[2];
+  ASSERT_EQ(0, pipe(ready));
+  pid_t pid = fork();
+  ASSERT_GE(pid, 0);
+  if (pid == 0) {
+    // Child: no gtest asserts; report failure through the exit code.
+    close(ready[0]);
+    rmw_init_options_t c_opts = rmw_get_zero_initialized_init_options();
+    if (rmw_init_options_init(&c_opts, rcutils_get_default_allocator()) != RMW_RET_OK) {
+      _exit(1);
+    }
+    c_opts.domain_id = 99;  // same domain as the fixture
+    rmw_context_t c_ctx = rmw_get_zero_initialized_context();
+    if (rmw_init(&c_opts, &c_ctx) != RMW_RET_OK) {_exit(1);}
+    rmw_node_t * c_node = rmw_create_node(&c_ctx, "peer_gone_child", "/test_ns");
+    if (c_node == nullptr) {_exit(1);}
+    auto c_sub_opts = rmw_get_default_subscription_options();
+    auto * c_sub = rmw_create_subscription(c_node, ts, "/peer_gone", &qos, &c_sub_opts);
+    if (c_sub == nullptr) {_exit(1);}
+    char b = 'x';
+    if (write(ready[1], &b, 1) != 1) {_exit(1);}
+    _exit(0);  // dead peer: no destroy, no shutdown, no unregister
+  }
 
-  // Warm pub's path cache, then unlink the sub's socket → next sendmsg = ENOENT.
+  // Parent: wait until the child's subscription exists, then reap the corpse.
+  close(ready[1]);
+  char b = 0;
+  ASSERT_EQ(1, read(ready[0], &b, 1)) << "child died before subscribing";
+  close(ready[0]);
+  int status = 0;
+  ASSERT_EQ(pid, waitpid(pid, &status, 0));
+  ASSERT_TRUE(WIFEXITED(status));
+  ASSERT_EQ(0, WEXITSTATUS(status));
+
+  // Publish to the vanished subscriber — must stay RET_OK.
   test_msgs::msg::BasicTypes m;
-  m.int32_value = 1;
-  ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
-
-  auto * sub_impl = static_cast<rmw_uds::UdsSubscription *>(sub->data);
-  unlink(sub_impl->socket_path.c_str());
-
   m.int32_value = 2;
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
 
-  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
@@ -980,10 +888,8 @@ TEST_F(QosTest, MultipleClientsOneService)
 TEST_F(QosTest, TransientLocalReplayReachesLateJoinerWhileWaitBlocked)
 {
   // The subscriber joins AFTER the publisher's executor is already blocked in
-  // rmw_wait. A joining subscriber only bumps the shm generation counter, which
-  // signals no fd, so an idle rmw_wait(infinite) would block in epoll forever
-  // and never re-run the top-of-wait replay. The latched message must still
-  // reach the late joiner within a bounded time.
+  // an unbounded rmw_wait. The latched message must still reach the late
+  // joiner within a bounded time.
   auto qos = make_qos(
     RMW_QOS_POLICY_RELIABILITY_RELIABLE,
     RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);

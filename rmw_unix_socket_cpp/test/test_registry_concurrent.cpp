@@ -187,14 +187,27 @@ TEST_F(RegistryConcurrentTest, ReadersNeverSeeTornEntries)
     readers.emplace_back(reader);
   }
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  // Run until a meaningful sample is collected, with a hard cap so a
+  // starved CI runner stalls the loop instead of failing the floor assert.
+  const int observation_floor = 1000;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  bool capped = false;
+  while (total_observations.load(std::memory_order_relaxed) < observation_floor) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      capped = true;
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
   stop.store(true, std::memory_order_relaxed);
   w.join();
   for (auto & r : readers) {
     r.join();
   }
 
-  EXPECT_GT(total_observations.load(), 0) << "test did not exercise the path";
+  if (!capped) {
+    EXPECT_GE(total_observations.load(), observation_floor);
+  }
   EXPECT_EQ(0, torn_observations.load())
     << "observed " << torn_observations.load()
     << " torn snapshots out of " << total_observations.load();
@@ -302,6 +315,10 @@ TEST_F(RegistryConcurrentTest, GenerationCounterMonotonicUnderChaos)
   auto * header = rmw_uds::registry_header(registry_ptr);
   std::atomic<bool> stop{false};
   std::atomic<int> regressions{0};
+  std::atomic<uint64_t> mutations{0};
+  std::atomic<uint64_t> reads{0};
+
+  uint64_t gen_before = rmw_uds::registry_generation(header);
 
   auto mutator = [&](int tid) {
       int n = 0;
@@ -314,6 +331,7 @@ TEST_F(RegistryConcurrentTest, GenerationCounterMonotonicUnderChaos)
         int32_t idx = rmw_uds::registry_add(header, e);
         if (idx >= 0) {
           rmw_uds::registry_remove(header, idx);
+          mutations.fetch_add(2, std::memory_order_relaxed);  // add + remove
         }
       }
     };
@@ -326,6 +344,7 @@ TEST_F(RegistryConcurrentTest, GenerationCounterMonotonicUnderChaos)
           regressions.fetch_add(1, std::memory_order_relaxed);
         }
         local_last = g;
+        reads.fetch_add(1, std::memory_order_relaxed);
       }
     };
 
@@ -333,10 +352,24 @@ TEST_F(RegistryConcurrentTest, GenerationCounterMonotonicUnderChaos)
   for (int i = 0; i < 8; ++i) {threads.emplace_back(mutator, i);}
   for (int i = 0; i < 4; ++i) {threads.emplace_back(observer);}
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  // Run until real work has accumulated, with a hard cap for starved runners.
+  const uint64_t progress_floor = 1000;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while ((mutations.load(std::memory_order_relaxed) < progress_floor ||
+    reads.load(std::memory_order_relaxed) < progress_floor) &&
+    std::chrono::steady_clock::now() < deadline)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
   stop.store(true, std::memory_order_relaxed);
   for (auto & t : threads) {t.join();}
 
   EXPECT_EQ(0, regressions.load())
     << "generation counter regressed " << regressions.load() << " times";
+  // Real progress, not a vacuous pass: mutations happened, observers watched,
+  // and every successful mutation bumped the counter.
+  uint64_t gen_after = rmw_uds::registry_generation(header);
+  EXPECT_GT(mutations.load(), 0u) << "no mutations performed";
+  EXPECT_GT(reads.load(), 0u) << "observer never read the counter";
+  EXPECT_GE(gen_after - gen_before, mutations.load());
 }

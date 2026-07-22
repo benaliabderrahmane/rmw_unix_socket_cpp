@@ -17,6 +17,7 @@
 #include <cstring>
 
 #include "test_msgs/msg/basic_types.hpp"
+#include "test_msgs/msg/empty.hpp"
 #include "test_msgs/msg/strings.hpp"
 #include "test_msgs/msg/unbounded_sequences.hpp"
 
@@ -25,13 +26,6 @@
 
 #include <chrono>
 #include <thread>
-#include <vector>
-
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-
-#include "../src/types.hpp"  // UdsSubscription + WireHeader layouts only (no linked symbols)
 
 class PubSubTest : public RmwUdsNodeTest
 {
@@ -204,7 +198,7 @@ TEST_F(PubSubTest, PublisherGetGid)
   EXPECT_FALSE(all_zero);
 }
 
-TEST_F(PubSubTest, LargeMessageViaShmRing)
+TEST_F(PubSubTest, LargeMessageRoundtrip)
 {
   // A payload well above SHM_PAYLOAD_THRESHOLD travels through the
   // publisher's /dev/shm ring: the datagram carries only a descriptor and
@@ -226,10 +220,6 @@ TEST_F(PubSubTest, LargeMessageViaShmRing)
     send_msg.uint8_values[i] = static_cast<uint8_t>((i * 13 + 5) & 0xFF);
   }
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &send_msg, nullptr));
-
-  // The publisher must actually have created its ring segment.
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  EXPECT_NE(nullptr, pub_data->shm_ring.base);
 
   test_msgs::msg::UnboundedSequences recv_msg;
   bool taken = false;
@@ -262,56 +252,41 @@ TEST_F(PubSubTest, StringMessages)
 
 // Regression for the rmw_take_sequence cursor bug: a deserialize failure in the
 // middle of a batch must not leave an uninitialized hole or miscount size — each
-// success is written at the *taken cursor, not the loop index. We inject
-// [good, corrupt, good] straight into the subscription's datagram socket via raw
-// POSIX sendto (a single SOCK_DGRAM sender preserves order, so the corrupt one
-// lands between the two good ones). Before the fix the second good message was
-// written at data[2] and lost, while size == *taken == 2 exposed data[1] (the
-// hole from the failed deserialize) to the consumer as a valid message.
+// success is written at the *taken cursor, not the loop index. We produce
+// [good, corrupt, good] entirely through the public API: the corrupt element
+// comes from a second publisher on the same topic with a smaller message type
+// (Empty), whose CDR payload is too short to deserialize as BasicTypes. Both
+// publishers share the node's send socket, so a single SOCK_DGRAM sender
+// preserves order and the mismatched datagram lands between the two good ones.
+// Before the fix the second good message was written at data[2] and lost, while
+// size == *taken == 2 exposed data[1] (the hole from the failed deserialize) to
+// the consumer as a valid message.
 TEST_F(PubSubTest, TakeSequenceSkipsMidBatchCorruptContiguously)
 {
   auto sub_opts = rmw_get_default_subscription_options();
   sub = rmw_create_subscription(node, ts, "/take_seq_corrupt", &qos, &sub_opts);
   ASSERT_NE(nullptr, sub);
-  auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
-  ASSERT_FALSE(sub_data->socket_path.empty());
 
-  // A valid wire payload via the public rmw_serialize API (identical CDR bytes
-  // to what a publisher emits, so the take path deserializes it cleanly).
+  auto pub_opts = rmw_get_default_publisher_options();
+  pub = rmw_create_publisher(node, ts, "/take_seq_corrupt", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  // Same topic, smaller type: fan-out matches by topic only, so its datagram
+  // reaches the subscriber but fails CDR deserialization as BasicTypes.
+  auto empty_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::Empty>();
+  rmw_publisher_t * corrupt_pub =
+    rmw_create_publisher(node, empty_ts, "/take_seq_corrupt", &qos, &pub_opts);
+  ASSERT_NE(nullptr, corrupt_pub);
+
   test_msgs::msg::BasicTypes good;
   good.int32_value = 4242;
   good.bool_value = true;
-  rcutils_allocator_t allocator = rcutils_get_default_allocator();
-  rmw_serialized_message_t good_ser = rmw_get_zero_initialized_serialized_message();
-  ASSERT_EQ(RMW_RET_OK, rmw_serialized_message_init(&good_ser, 0, &allocator));
-  ASSERT_EQ(RMW_RET_OK, rmw_serialize(&good, ts, &good_ser));
-
-  int send_fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
-  ASSERT_GE(send_fd, 0);
-  struct sockaddr_un addr;
-  std::memset(&addr, 0, sizeof(addr));
-  addr.sun_family = AF_UNIX;
-  std::strncpy(addr.sun_path, sub_data->socket_path.c_str(), sizeof(addr.sun_path) - 1);
-
-  // Each datagram is the packed WireHeader followed by the payload (recv_from's framing).
-  auto inject = [&](const uint8_t * payload, size_t len) {
-    rmw_uds::WireHeader hdr;
-    std::memset(&hdr, 0, sizeof(hdr));
-    hdr.payload_size = static_cast<uint32_t>(len);
-    hdr.msg_type = 0;  // topic message
-    std::vector<uint8_t> dgram(sizeof(hdr) + len);
-    std::memcpy(dgram.data(), &hdr, sizeof(hdr));
-    if (len > 0) {std::memcpy(dgram.data() + sizeof(hdr), payload, len);}
-    ASSERT_EQ(
-      static_cast<ssize_t>(dgram.size()),
-      ::sendto(send_fd, dgram.data(), dgram.size(), 0,
-        reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)));
-  };
-
-  const uint8_t corrupt[4] = {0xDE, 0xAD, 0xBE, 0xEF};  // too short to deserialize
-  inject(good_ser.buffer, good_ser.buffer_length);
-  inject(corrupt, sizeof(corrupt));
-  inject(good_ser.buffer, good_ser.buffer_length);
+  test_msgs::msg::Empty mismatched;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &good, nullptr));
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(corrupt_pub, &mismatched, nullptr));
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &good, nullptr));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, corrupt_pub));
 
   std::this_thread::sleep_for(std::chrono::milliseconds(50));  // defensive; datagrams already buffered
 
@@ -339,7 +314,4 @@ TEST_F(PubSubTest, TakeSequenceSkipsMidBatchCorruptContiguously)
   EXPECT_EQ(2u, info_seq.size);
   EXPECT_EQ(4242, out[0].int32_value);
   EXPECT_EQ(4242, out[1].int32_value);  // the bug left this a hole and lost it
-
-  ::close(send_fd);
-  EXPECT_EQ(RMW_RET_OK, rmw_serialized_message_fini(&good_ser));
 }

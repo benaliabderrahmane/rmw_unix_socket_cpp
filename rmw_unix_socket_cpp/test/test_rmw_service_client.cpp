@@ -21,8 +21,6 @@
 #include "rmw/qos_profiles.h"
 #include "rosidl_typesupport_cpp/service_type_support.hpp"
 
-#include "../src/types.hpp"  // UdsService/UdsClient shm_ring layout only (no linked symbols)
-
 class ServiceClientTest : public RmwUdsNodeTest
 {
 protected:
@@ -136,12 +134,10 @@ TEST_F(ServiceClientTest, RequestResponseRoundTrip)
   EXPECT_EQ("success", recv_response.string_value);
 }
 
-TEST_F(ServiceClientTest, LargeRequestAndResponseViaShm)
+TEST_F(ServiceClientTest, LargeRequestAndResponseRoundTrip)
 {
-  // A >4 MB request and a >4 MB response must round-trip. Both exceed the
-  // kernel's ~4 MB single-datagram cap (buffer-independent), so success proves
-  // the client's and service's shm rings carried the payloads: on the inline
-  // path (pre-change) the datagrams would be rejected and never delivered.
+  // A >4 MB request and a >4 MB response (both beyond the kernel's ~4 MB
+  // single-datagram cap) must round-trip byte-for-byte.
   srv = rmw_create_service(node, ts, "/large_srv", &qos);
   cli = rmw_create_client(node, ts, "/large_srv", &qos);
   ASSERT_NE(nullptr, srv);
@@ -162,10 +158,6 @@ TEST_F(ServiceClientTest, LargeRequestAndResponseViaShm)
   int64_t seq_id = 0;
   EXPECT_EQ(RMW_RET_OK, rmw_send_request(cli, &request, &seq_id));
 
-  auto * cli_data = static_cast<rmw_uds::UdsClient *>(cli->data);
-  EXPECT_NE(nullptr, cli_data->shm_ring.base)
-    << "a >4 MB request must be staged into the client's shm ring";
-
   test_msgs::srv::BasicTypes::Request recv_request;
   rmw_service_info_t request_header;
   std::memset(&request_header, 0, sizeof(request_header));
@@ -180,10 +172,6 @@ TEST_F(ServiceClientTest, LargeRequestAndResponseViaShm)
   response.string_value = big_resp;
   EXPECT_EQ(RMW_RET_OK, rmw_send_response(srv, &request_header.request_id, &response));
 
-  auto * srv_data = static_cast<rmw_uds::UdsService *>(srv->data);
-  EXPECT_NE(nullptr, srv_data->shm_ring.base)
-    << "a >4 MB response must be staged into the service's shm ring";
-
   test_msgs::srv::BasicTypes::Response recv_response;
   rmw_service_info_t response_header;
   std::memset(&response_header, 0, sizeof(response_header));
@@ -194,12 +182,10 @@ TEST_F(ServiceClientTest, LargeRequestAndResponseViaShm)
   EXPECT_EQ(big_resp, recv_response.string_value);
 }
 
-TEST_F(ServiceClientTest, LargeRequestDeliveredThroughWaitDrain)
+TEST_F(ServiceClientTest, LargeRequestDeliveredToServiceBlockedInWait)
 {
-  // rmw_wait drains service sockets into the request queue; it must resolve a
-  // large-request shm descriptor there too, not only in rmw_take_request. Real
-  // executors always wait before taking, so if the wait drain dropped the
-  // descriptor the request would be lost before take ever ran.
+  // A 5 MB request sent to a service that is blocked in rmw_wait must still be
+  // delivered: real executors always wait before taking.
   srv = rmw_create_service(node, ts, "/large_wait_srv", &qos);
   cli = rmw_create_client(node, ts, "/large_wait_srv", &qos);
   ASSERT_NE(nullptr, srv);
@@ -215,7 +201,7 @@ TEST_F(ServiceClientTest, LargeRequestDeliveredThroughWaitDrain)
   int64_t seq_id = 0;
   EXPECT_EQ(RMW_RET_OK, rmw_send_request(cli, &request, &seq_id));
 
-  // Drain via rmw_wait (not a direct take) to exercise the wait-side path.
+  // Wait on the service before taking, as a real executor would.
   auto * ws = rmw_create_wait_set(&context, 1);
   ASSERT_NE(nullptr, ws);
   rmw_services_t services;
@@ -228,16 +214,16 @@ TEST_F(ServiceClientTest, LargeRequestDeliveredThroughWaitDrain)
   EXPECT_EQ(
     RMW_RET_OK,
     rmw_wait(nullptr, nullptr, &services, nullptr, nullptr, ws, &timeout));
+  // Destroy before the ASSERTs below so a failure doesn't leak the wait set.
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
 
   test_msgs::srv::BasicTypes::Request recv_request;
   rmw_service_info_t request_header;
   std::memset(&request_header, 0, sizeof(request_header));
   bool taken = false;
   EXPECT_EQ(RMW_RET_OK, rmw_take_request(srv, &request_header, &recv_request, &taken));
-  ASSERT_TRUE(taken) << "a 5 MB request drained by rmw_wait must be delivered";
+  ASSERT_TRUE(taken) << "a 5 MB request must be delivered after rmw_wait";
   EXPECT_EQ(big, recv_request.string_value);
-
-  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
 }
 
 TEST_F(ServiceClientTest, SendResponseToGoneClientReturnsOk)

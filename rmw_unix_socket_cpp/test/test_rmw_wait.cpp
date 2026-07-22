@@ -24,8 +24,6 @@
 #include "rmw/qos_profiles.h"
 #include "rosidl_typesupport_cpp/message_type_support.hpp"
 
-#include "../src/types.hpp"
-
 TEST_F(RmwUdsTestBase, CreateDestroyWaitSet)
 {
   auto * ws = rmw_create_wait_set(&context, 10);
