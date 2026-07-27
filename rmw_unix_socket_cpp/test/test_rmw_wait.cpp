@@ -14,7 +14,9 @@
 
 #include "test_base.hpp"
 
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "test_msgs/msg/basic_types.hpp"
 
@@ -138,4 +140,44 @@ TEST_F(RmwUdsNodeTest, WaitWithSubscription)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub));
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
+}
+
+// rcl_wait(&wait_set, -1) (infinite timeout, wait_timeout == nullptr) must
+// never return RMW_RET_TIMEOUT - rclcpp's GraphListener passes exactly this
+// and treats a timeout as a fatal, unrecoverable bug. The internal
+// TL_REPLAY_POLL_MS (200ms) polling interval used to re-check TRANSIENT_LOCAL
+// late-joiner replay must only bound *finite* caller timeouts, not silently
+// truncate an infinite one.
+TEST_F(RmwUdsNodeTest, WaitWithInfiniteTimeoutNeverTimesOut)
+{
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+
+  auto * gc = rmw_create_guard_condition(&context);
+  ASSERT_NE(nullptr, gc);
+
+  rmw_guard_conditions_t guard_conditions;
+  void * gc_array[1] = {gc->data};
+  guard_conditions.guard_conditions = gc_array;
+  guard_conditions.guard_condition_count = 1;
+
+  // Trigger well after the 200ms internal polling interval, so a premature
+  // RMW_RET_TIMEOUT (the bug) would be observed before this fires.
+  std::thread trigger_thread([gc]() {
+      std::this_thread::sleep_for(std::chrono::milliseconds(400));
+      EXPECT_EQ(RMW_RET_OK, rmw_trigger_guard_condition(gc));
+    });
+
+  const auto start = std::chrono::steady_clock::now();
+  rmw_ret_t ret = rmw_wait(nullptr, &guard_conditions, nullptr, nullptr, nullptr, ws, nullptr);
+  const auto elapsed = std::chrono::steady_clock::now() - start;
+
+  trigger_thread.join();
+
+  EXPECT_EQ(RMW_RET_OK, ret);
+  EXPECT_NE(nullptr, guard_conditions.guard_conditions[0]);
+  EXPECT_GE(elapsed, std::chrono::milliseconds(350));
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(gc));
 }

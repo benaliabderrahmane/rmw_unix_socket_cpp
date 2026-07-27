@@ -182,6 +182,24 @@ rmw_ret_t rmw_wait(
     }
   }
 
+  // rcl_wait(&wait_set, -1) must never return RMW_RET_TIMEOUT (GraphListener
+  // treats that as fatal) — track the real deadline separately from the
+  // TL_REPLAY_POLL_MS polling bound below.
+  bool infinite_wait = true;
+  int64_t real_deadline_ns = 0;
+  if (wait_timeout) {
+    // Accumulate in int64_t; RMW_DURATION_INFINITE (~9.2e12 ms) overflows int.
+    int64_t ms = static_cast<int64_t>(wait_timeout->sec) * 1000 +
+      static_cast<int64_t>(wait_timeout->nsec) / 1000000;
+    if (ms <= std::numeric_limits<int>::max()) {
+      infinite_wait = false;
+      real_deadline_ns = now_ns() + ms * 1000000;
+    }
+  }
+
+  bool any_ready = false;
+
+  while (true) {
   // 2. Check graph generation changes — trigger graph guard conditions
   // We need to find the context from any available entity
   rmw_uds::UdsContext * ctx = nullptr;
@@ -379,29 +397,21 @@ rmw_ret_t rmw_wait(
 
   // 4. If nothing ready, block with epoll
   if (!something_ready) {
-    // Compute timeout. -1 means block forever (epoll_wait sentinel).
-    int timeout_ms = -1;
-    if (wait_timeout) {
-      // Accumulate in int64_t; RMW_DURATION_INFINITE (~9.2e12 ms) overflows int.
-      int64_t ms = static_cast<int64_t>(wait_timeout->sec) * 1000 +
-        static_cast<int64_t>(wait_timeout->nsec) / 1000000;
-      if (ms > std::numeric_limits<int>::max()) {
-        timeout_ms = -1;  // Infinite (or beyond epoll's range) -> block forever
-      } else {
-        timeout_ms = static_cast<int>(ms);
-        if (timeout_ms == 0 && wait_timeout->nsec > 0) {
-          timeout_ms = 1;  // At least 1ms
-        }
-      }
-    }
-
-    // Bound the wait so an idle executor loops and re-runs the top-of-wait
-    // TRANSIENT_LOCAL late-joiner replay: a joining subscriber only bumps the
-    // shm generation counter (no fd fires), so an unbounded wait would never
-    // replay to it. Only shortens the timeout; a non-blocking 0 stays 0.
+    // Bound only this polling iteration (for TL late-joiner replay above);
+    // the real deadline is tracked separately and re-checked below.
     constexpr int TL_REPLAY_POLL_MS = 200;
-    if (timeout_ms < 0 || timeout_ms > TL_REPLAY_POLL_MS) {
+    int timeout_ms;
+    if (infinite_wait) {
       timeout_ms = TL_REPLAY_POLL_MS;
+    } else {
+      const int64_t rem_ns = real_deadline_ns - now_ns();
+      if (rem_ns <= 0) {
+        timeout_ms = 0;  // Real deadline already passed; non-blocking poll only.
+      } else {
+        const int64_t rem_ms = rem_ns / 1000000;
+        timeout_ms = static_cast<int>(
+          std::min<int64_t>(TL_REPLAY_POLL_MS, rem_ms > 0 ? rem_ms : 1));
+      }
     }
 
     // Block, retrying on EINTR. A finite timeout uses a steady_clock deadline
@@ -458,17 +468,21 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  // 5. Set output: ready entities stay, non-ready set to NULL
-  bool any_ready = false;
+  // 5. Determine readiness WITHOUT mutating the caller's arrays yet - nulling
+  // a non-ready entry early would hide it from later retries' `continue`
+  // guards, so its fd never gets re-drained (busy-loops epoll). Only mutate
+  // once we're actually about to return (below).
+  any_ready = false;
 
+  std::vector<bool> subs_ready;
   if (subscriptions) {
+    subs_ready.assign(subscriptions->subscriber_count, false);
     for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
       if (!subscriptions->subscribers[i]) {continue;}
       auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
       std::lock_guard<std::mutex> lock(sub->queue_mutex);
-      if (sub->message_queue.empty()) {
-        subscriptions->subscribers[i] = nullptr;
-      } else {
+      if (!sub->message_queue.empty()) {
+        subs_ready[i] = true;
         any_ready = true;
       }
     }
@@ -483,36 +497,80 @@ rmw_ret_t rmw_wait(
       // Consume a trigger that landed during the epoll block; combine with the
       // step-3 read so a GC seen ready then stays reported without a read-back.
       ssize_t r = read(gc->eventfd_fd, &val, sizeof(val));
-      if (r == static_cast<ssize_t>(sizeof(val)) || gc_triggered[i]) {
+      if (r == static_cast<ssize_t>(sizeof(val))) {
+        gc_triggered[i] = true;
+      }
+      if (gc_triggered[i]) {
         any_ready = true;
-      } else {
-        guard_conditions->guard_conditions[i] = nullptr;
       }
     }
   }
 
+  std::vector<bool> services_ready;
   if (services) {
+    services_ready.assign(services->service_count, false);
     for (size_t i = 0; i < services->service_count; ++i) {
       if (!services->services[i]) {continue;}
       auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
       std::lock_guard<std::mutex> lock(srv->queue_mutex);
-      if (srv->request_queue.empty()) {
-        services->services[i] = nullptr;
-      } else {
+      if (!srv->request_queue.empty()) {
+        services_ready[i] = true;
         any_ready = true;
       }
     }
   }
 
+  std::vector<bool> clients_ready;
   if (clients) {
+    clients_ready.assign(clients->client_count, false);
     for (size_t i = 0; i < clients->client_count; ++i) {
       if (!clients->clients[i]) {continue;}
       auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
       std::lock_guard<std::mutex> lock(cli->queue_mutex);
-      if (cli->response_queue.empty()) {
-        clients->clients[i] = nullptr;
-      } else {
+      if (!cli->response_queue.empty()) {
+        clients_ready[i] = true;
         any_ready = true;
+      }
+    }
+  }
+
+  const bool real_deadline_passed =
+    !infinite_wait && (real_deadline_ns - now_ns()) <= 0;
+  if (!any_ready && !real_deadline_passed) {
+    // Not finalizing: leave the arrays untouched and retry.
+    continue;
+  }
+
+  // Finalizing: ready entities stay, non-ready set to NULL.
+  if (subscriptions) {
+    for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
+      if (!subscriptions->subscribers[i]) {continue;}
+      if (!subs_ready[i]) {
+        subscriptions->subscribers[i] = nullptr;
+      }
+    }
+  }
+  if (guard_conditions) {
+    for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
+      if (!guard_conditions->guard_conditions[i]) {continue;}
+      if (!gc_triggered[i]) {
+        guard_conditions->guard_conditions[i] = nullptr;
+      }
+    }
+  }
+  if (services) {
+    for (size_t i = 0; i < services->service_count; ++i) {
+      if (!services->services[i]) {continue;}
+      if (!services_ready[i]) {
+        services->services[i] = nullptr;
+      }
+    }
+  }
+  if (clients) {
+    for (size_t i = 0; i < clients->client_count; ++i) {
+      if (!clients->clients[i]) {continue;}
+      if (!clients_ready[i]) {
+        clients->clients[i] = nullptr;
       }
     }
   }
@@ -523,6 +581,9 @@ rmw_ret_t rmw_wait(
       events->events[i] = nullptr;
     }
   }
+
+  break;
+  }  // while (true)
 
   if (!any_ready) {
     return RMW_RET_TIMEOUT;
