@@ -267,17 +267,15 @@ rmw_ret_t rmw_wait(
         }
       }
 
-      // Trigger all graph guard conditions in the guard_conditions list
-      if (guard_conditions) {
-        for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
-          if (!guard_conditions->guard_conditions[i]) {continue;}
-          // We don't know which are graph GCs, so we just note the change
-          // The graph GC is triggered by the node itself
+      // Wake graph listeners: trigger every node's graph guard condition
+      // (rclcpp's GraphListener waits on these). rmw_destroy_node removes a
+      // node's GC from this list under the same mutex before destroying it,
+      // so a freed guard condition is never triggered.
+      {
+        std::lock_guard<std::mutex> gc_lock(ctx->graph_gcs_mutex);
+        for (auto * gc : ctx->graph_gcs) {
+          auto _r [[maybe_unused]] = rmw_trigger_guard_condition(gc);
         }
-      }
-      // Trigger graph guard condition on the context
-      if (ctx->graph_guard_condition) {
-        auto _r [[maybe_unused]] = rmw_trigger_guard_condition(ctx->graph_guard_condition);
       }
     }
   };

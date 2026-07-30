@@ -143,6 +143,51 @@ TEST_F(RmwUdsNodeTest, WaitWithSubscription)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
 }
 
+TEST_F(RmwUdsNodeTest, NodeGraphGuardConditionTriggersOnGraphChange)
+{
+  // Scenario: graph-change notification. rclcpp's GraphListener (and
+  // wait_for_service, on_graph_change callbacks) blocks on the node's graph
+  // guard condition and relies on it firing when the ROS graph changes.
+  // Block on that guard condition alone, then create a subscription from the
+  // main thread: the wait must wake with the guard condition ready, well
+  // before the timeout. Without this, wait_for_service can hang forever even
+  // though the service is up.
+  const rmw_guard_condition_t * graph_gc = rmw_node_get_graph_guard_condition(node);
+  ASSERT_NE(nullptr, graph_gc);
+
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+
+  std::atomic<bool> woke_ready{false};
+  std::thread waiter(
+    [&] {
+      void * gc_array[1] = {graph_gc->data};
+      rmw_guard_conditions_t gcs;
+      gcs.guard_conditions = gc_array;
+      gcs.guard_condition_count = 1;
+      rmw_time_t timeout{3, 0};
+      rmw_ret_t ret = rmw_wait(nullptr, &gcs, nullptr, nullptr, nullptr, ws, &timeout);
+      // Ready iff rmw_wait kept the entry non-null and returned OK.
+      woke_ready.store(ret == RMW_RET_OK && gcs.guard_conditions[0] != nullptr);
+    });
+
+  // Let the waiter reach epoll, then change the graph.
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  auto * ts_local = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  rmw_qos_profile_t qos = rmw_qos_profile_default;
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts_local, "/graph_gc_probe", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  waiter.join();
+  EXPECT_TRUE(woke_ready.load()) <<
+    "the node's graph guard condition was not triggered by a graph change";
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_wait_set(ws);
+}
+
 TEST_F(RmwUdsNodeTest, WaitBlocksForFullCallerTimeout)
 {
   // Scenario: the caller's timeout is a contract. Callers such as

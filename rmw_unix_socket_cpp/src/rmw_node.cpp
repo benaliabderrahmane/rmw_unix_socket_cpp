@@ -16,7 +16,9 @@
 #include "registry.hpp"
 #include "types.hpp"
 
+#include <algorithm>
 #include <cstring>
+#include <mutex>
 
 #include "rcutils/strdup.h"
 #include "rmw/allocators.h"
@@ -108,6 +110,13 @@ rmw_node_t * rmw_create_node(
     return nullptr;
   }
 
+  // Last step, so no failure path above needs to undo it: expose the graph GC
+  // to rmw_wait's generation check (triggered there on graph changes).
+  {
+    std::lock_guard<std::mutex> lock(ctx->graph_gcs_mutex);
+    ctx->graph_gcs.push_back(graph_gc);
+  }
+
   return node;
 }
 
@@ -127,6 +136,15 @@ rmw_ret_t rmw_destroy_node(rmw_node_t * node)
     }
 
     if (node_data->graph_guard_condition) {
+      // Unpublish from the context BEFORE destroying, so rmw_wait can never
+      // trigger a freed guard condition (it holds the same mutex).
+      if (node_data->context) {
+        std::lock_guard<std::mutex> lock(node_data->context->graph_gcs_mutex);
+        auto & gcs = node_data->context->graph_gcs;
+        gcs.erase(
+          std::remove(gcs.begin(), gcs.end(), node_data->graph_guard_condition),
+          gcs.end());
+      }
       auto _r [[maybe_unused]] = rmw_destroy_guard_condition(node_data->graph_guard_condition);
     }
 
