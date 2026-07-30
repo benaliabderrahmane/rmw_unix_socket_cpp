@@ -148,8 +148,8 @@ TEST_F(RmwUdsNodeTest, NodeGraphGuardConditionTriggersOnGraphChange)
   // Scenario: graph-change notification. rclcpp's GraphListener (and
   // wait_for_service, on_graph_change callbacks) blocks on the node's graph
   // guard condition and relies on it firing when the ROS graph changes.
-  // Block on that guard condition alone, then create a subscription from the
-  // main thread: the wait must wake with the guard condition ready, well
+  // Block on that guard condition alone, then create a subscription from
+  // another thread: the wait must wake with the guard condition ready, well
   // before the timeout. Without this, wait_for_service can hang forever even
   // though the service is up.
   const rmw_guard_condition_t * graph_gc = rmw_node_get_graph_guard_condition(node);
@@ -158,17 +158,39 @@ TEST_F(RmwUdsNodeTest, NodeGraphGuardConditionTriggersOnGraphChange)
   auto * ws = rmw_create_wait_set(&context, 1);
   ASSERT_NE(nullptr, ws);
 
-  std::atomic<bool> woke_ready{false};
-  std::thread waiter(
-    [&] {
+  auto wait_on_graph_gc = [&](rmw_time_t timeout) {
       void * gc_array[1] = {graph_gc->data};
       rmw_guard_conditions_t gcs;
       gcs.guard_conditions = gc_array;
       gcs.guard_condition_count = 1;
-      rmw_time_t timeout{3, 0};
       rmw_ret_t ret = rmw_wait(nullptr, &gcs, nullptr, nullptr, nullptr, ws, &timeout);
-      // Ready iff rmw_wait kept the entry non-null and returned OK.
-      woke_ready.store(ret == RMW_RET_OK && gcs.guard_conditions[0] != nullptr);
+      // Ready iff rmw_wait returned OK and kept the entry non-null.
+      return ret == RMW_RET_OK && gcs.guard_conditions[0] != nullptr;
+    };
+
+  // Settle first. The fixture's own node registration left an unconsumed
+  // registry generation edge, and a wait that starts on it reports the guard
+  // condition ready without ever blocking — which would let this test pass even
+  // with the wakeup path removed entirely. Consume pending edges until a wait
+  // genuinely blocks and times out.
+  bool settled = false;
+  for (int i = 0; i < 50 && !settled; ++i) {
+    settled = !wait_on_graph_gc(rmw_time_t{0, 20000000});  // 20 ms
+  }
+  ASSERT_TRUE(settled) <<
+    "the graph guard condition never settled, so the wait below would not block";
+
+  // From here the wait can only be satisfied by the graph change made below.
+  std::atomic<bool> woke_ready{false};
+  std::atomic<int64_t> blocked_ms{-1};
+  std::thread waiter(
+    [&] {
+      auto t0 = std::chrono::steady_clock::now();
+      bool ready = wait_on_graph_gc(rmw_time_t{3, 0});
+      blocked_ms.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - t0).count());
+      woke_ready.store(ready);
     });
 
   // Let the waiter reach epoll, then change the graph.
@@ -183,6 +205,11 @@ TEST_F(RmwUdsNodeTest, NodeGraphGuardConditionTriggersOnGraphChange)
   waiter.join();
   EXPECT_TRUE(woke_ready.load()) <<
     "the node's graph guard condition was not triggered by a graph change";
+  // Proves the wake came from the graph change rather than from an edge that
+  // was already pending when the wait started.
+  EXPECT_GE(blocked_ms.load(), 150) <<
+    "the wait did not block; it was already satisfied before the graph changed";
+  EXPECT_LT(blocked_ms.load(), 3000) << "the wait ran to its timeout instead of waking";
 
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _r2 [[maybe_unused]] = rmw_destroy_wait_set(ws);
