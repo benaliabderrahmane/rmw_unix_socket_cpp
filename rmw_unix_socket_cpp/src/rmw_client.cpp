@@ -48,10 +48,10 @@ static rmw_qos_profile_t resolve_qos(const rmw_qos_profile_t * qos)
   return resolved;
 }
 
-static int64_t now_ns()
+static int64_t system_now_ns()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
-    std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 extern "C"
@@ -192,7 +192,7 @@ rmw_ret_t rmw_send_request(
   std::memset(&hdr, 0, sizeof(hdr));
   std::memcpy(hdr.gid, cli_data->gid.data, sizeof(hdr.gid));
   hdr.sequence_number = *sequence_id;
-  hdr.source_timestamp_ns = now_ns();
+  hdr.source_timestamp_ns = system_now_ns();
   hdr.msg_type = 1;  // request
 
   // Serialize the request, choosing its destination by size: a large one is
@@ -273,7 +273,7 @@ rmw_ret_t rmw_take_response(
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
     msg.payload = std::move(payload);
-    msg.received_timestamp_ns = now_ns();
+    msg.received_timestamp_ns = system_now_ns();
     std::lock_guard<std::mutex> lock(cli_data->queue_mutex);
     cli_data->response_queue.push_back(std::move(msg));
     payload.clear();
