@@ -51,7 +51,7 @@ static rmw_qos_profile_t resolve_qos(const rmw_qos_profile_t * qos)
   return resolved;
 }
 
-static int64_t now_ns()
+static int64_t system_now_ns()
 {
   auto now = std::chrono::system_clock::now();
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -305,7 +305,7 @@ rmw_ret_t rmw_publish(
   std::memset(&hdr, 0, sizeof(hdr));
   std::memcpy(hdr.gid, pub_data->gid.data, sizeof(hdr.gid));
   hdr.sequence_number = pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
-  hdr.source_timestamp_ns = now_ns();
+  hdr.source_timestamp_ns = system_now_ns();
   hdr.msg_type = 0;  // topic message
 
   // PERFORMANCE: only lock the registry when the graph generation has changed
@@ -430,7 +430,7 @@ rmw_ret_t rmw_publish_serialized_message(
   std::memset(&hdr, 0, sizeof(hdr));
   std::memcpy(hdr.gid, pub_data->gid.data, sizeof(hdr.gid));
   hdr.sequence_number = pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
-  hdr.source_timestamp_ns = now_ns();
+  hdr.source_timestamp_ns = system_now_ns();
   hdr.payload_size = static_cast<uint32_t>(serialized_message->buffer_length);
   hdr.msg_type = 0;
 

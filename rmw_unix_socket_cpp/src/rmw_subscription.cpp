@@ -50,7 +50,7 @@ static rmw_qos_profile_t resolve_qos(const rmw_qos_profile_t * qos)
   return resolved;
 }
 
-static int64_t now_ns()
+static int64_t system_now_ns()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::system_clock::now().time_since_epoch()).count();
@@ -74,7 +74,7 @@ static void drain_subscription(rmw_uds::UdsSubscription * sub)
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
     msg.payload = std::move(payload);
-    msg.received_timestamp_ns = now_ns();
+    msg.received_timestamp_ns = system_now_ns();
 
     bool overflow = false;
     {
