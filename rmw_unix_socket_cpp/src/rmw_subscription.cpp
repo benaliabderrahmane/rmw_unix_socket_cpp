@@ -53,7 +53,7 @@ static rmw_qos_profile_t resolve_qos(const rmw_qos_profile_t * qos)
 static int64_t now_ns()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
-    std::chrono::steady_clock::now().time_since_epoch()).count();
+    std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 // Drain socket into message queue

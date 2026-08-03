@@ -34,10 +34,16 @@
 #include "rmw/error_handling.h"
 #include "rmw/rmw.h"
 
-static int64_t now_ns()
+static int64_t steady_now_ns()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static int64_t wall_now_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 // Drain a socket into a message queue (subscription, service, or client).
@@ -69,7 +75,7 @@ static void drain_socket(
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
     msg.payload = std::move(payload);
-    msg.received_timestamp_ns = now_ns();
+    msg.received_timestamp_ns = wall_now_ns();
 
     {
       std::lock_guard<std::mutex> lock(queue_mutex);
@@ -399,7 +405,7 @@ rmw_ret_t rmw_wait(
     // so a signal interruption neither returns TIMEOUT early nor busy-loops.
     struct epoll_event ready_events[64];
     const int64_t deadline_ns =
-      (timeout_ms >= 0) ? now_ns() + static_cast<int64_t>(timeout_ms) * 1000000 : 0;
+      (timeout_ms >= 0) ? steady_now_ns() + static_cast<int64_t>(timeout_ms) * 1000000 : 0;
     int remaining_ms = timeout_ms;
     while (true) {
       int n = epoll_wait(ws_data->epoll_fd, ready_events, 64, remaining_ms);
@@ -413,7 +419,7 @@ rmw_ret_t rmw_wait(
       if (timeout_ms < 0) {
         continue;  // Infinite wait: just re-block.
       }
-      const int64_t rem_ns = deadline_ns - now_ns();
+      const int64_t rem_ns = deadline_ns - steady_now_ns();
       if (rem_ns <= 0) {
         break;  // Deadline passed -> timeout; fall through to drain.
       }
