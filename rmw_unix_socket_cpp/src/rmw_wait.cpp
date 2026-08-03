@@ -36,10 +36,16 @@
 #include "rmw/error_handling.h"
 #include "rmw/rmw.h"
 
-static int64_t now_ns()
+static int64_t steady_now_ns()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static int64_t wall_now_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 // Drain a socket into a message queue (subscription, service, or client).
@@ -71,7 +77,7 @@ static void drain_socket(
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
     msg.payload = std::move(payload);
-    msg.received_timestamp_ns = now_ns();
+    msg.received_timestamp_ns = wall_now_ns();
 
     {
       std::lock_guard<std::mutex> lock(queue_mutex);
@@ -418,12 +424,12 @@ rmw_ret_t rmw_wait(
     // signal neither returns TIMEOUT early nor busy-loops.
     const bool infinite = (timeout_ms < 0);
     const int64_t caller_deadline_ns =
-      infinite ? 0 : now_ns() + static_cast<int64_t>(timeout_ms) * 1000000;
+      infinite ? 0 : steady_now_ns() + static_cast<int64_t>(timeout_ms) * 1000000;
     struct epoll_event ready_events[64];
     while (true) {
       int block_ms = -1;
       if (!infinite) {
-        const int64_t rem_ns = caller_deadline_ns - now_ns();
+        const int64_t rem_ns = caller_deadline_ns - steady_now_ns();
         const int64_t rem_ms = (rem_ns > 0) ? (rem_ns + 999999) / 1000000 : 0;  // ceil
         block_ms = static_cast<int>(
           std::min<int64_t>(rem_ms, std::numeric_limits<int>::max()));
@@ -454,7 +460,7 @@ rmw_ret_t rmw_wait(
       if (!only_doorbell) {
         break;  // Something the caller waits on fired -> fall through to drain.
       }
-      if (!infinite && now_ns() >= caller_deadline_ns) {
+      if (!infinite && steady_now_ns() >= caller_deadline_ns) {
         break;  // Doorbell-only wake at the deadline -> timeout.
       }
       // Doorbell-only wake: re-block for the caller's remaining time.
