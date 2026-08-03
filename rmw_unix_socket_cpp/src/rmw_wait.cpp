@@ -17,6 +17,7 @@
 #include "transport.hpp"
 #include "types.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
@@ -27,6 +28,7 @@
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include "rmw/allocators.h"
@@ -97,6 +99,7 @@ rmw_wait_set_t * rmw_create_wait_set(rmw_context_t * context, size_t max_conditi
     RMW_SET_ERROR_MSG("failed to allocate wait set data");
     return nullptr;
   }
+  ws_data->context = reinterpret_cast<rmw_uds::UdsContext *>(context->impl);
 
   ws_data->epoll_fd = epoll_create1(EPOLL_CLOEXEC);
   if (ws_data->epoll_fd < 0) {
@@ -182,18 +185,26 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  // 2. Check graph generation changes — trigger graph guard conditions
-  // We need to find the context from any available entity
-  rmw_uds::UdsContext * ctx = nullptr;
-  if (subscriptions && subscriptions->subscriber_count > 0 && subscriptions->subscribers[0]) {
-    ctx = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[0])->context;
-  } else if (services && services->service_count > 0 && services->services[0]) {
-    ctx = static_cast<rmw_uds::UdsService *>(services->services[0])->context;
-  } else if (clients && clients->client_count > 0 && clients->clients[0]) {
-    ctx = static_cast<rmw_uds::UdsClient *>(clients->clients[0])->context;
-  }
-
-  if (ctx && ctx->registry_ptr) {
+  // 2. Check graph generation changes — trigger graph guard conditions.
+  // The context comes from the wait set itself (set at rmw_create_wait_set):
+  // a guard-condition-only wait set (rclcpp's GraphListener) has no entity to
+  // scavenge it from, and this check must run for those waits too. Wrapped in
+  // a lambda so the step-4 loop can re-run it on each doorbell wake.
+  rmw_uds::UdsContext * ctx = ws_data->context;
+  const int doorbell_fd = ctx ? ctx->doorbell_fd : -1;
+  auto run_generation_check = [&]() {
+      // Drain the doorbell strictly BEFORE reading the generation: paired with
+      // ring_doorbells running strictly AFTER the bump, a mutation either lands
+      // in this generation read or leaves a queued datagram that keeps the
+      // level-triggered fd readable — no lost wakeup.
+      if (doorbell_fd >= 0) {
+        uint8_t buf[16];
+        while (recv(doorbell_fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
+        }
+      }
+      if (!(ctx && ctx->registry_ptr)) {
+        return;
+      }
     auto * header = rmw_uds::registry_header(ctx->registry_ptr);
     uint64_t gen = rmw_uds::registry_generation(header);
     if (gen != ctx->last_registry_generation.load(std::memory_order_relaxed)) {
@@ -256,20 +267,19 @@ rmw_ret_t rmw_wait(
         }
       }
 
-      // Trigger all graph guard conditions in the guard_conditions list
-      if (guard_conditions) {
-        for (size_t i = 0; i < guard_conditions->guard_condition_count; ++i) {
-          if (!guard_conditions->guard_conditions[i]) {continue;}
-          // We don't know which are graph GCs, so we just note the change
-          // The graph GC is triggered by the node itself
+      // Wake graph listeners: trigger every node's graph guard condition
+      // (rclcpp's GraphListener waits on these). rmw_destroy_node removes a
+      // node's GC from this list under the same mutex before destroying it,
+      // so a freed guard condition is never triggered.
+      {
+        std::lock_guard<std::mutex> gc_lock(ctx->graph_gcs_mutex);
+        for (auto * gc : ctx->graph_gcs) {
+          auto _r [[maybe_unused]] = rmw_trigger_guard_condition(gc);
         }
       }
-      // Trigger graph guard condition on the context
-      if (ctx->graph_guard_condition) {
-        auto _r [[maybe_unused]] = rmw_trigger_guard_condition(ctx->graph_guard_condition);
-      }
     }
-  }
+  };
+  run_generation_check();
 
   // Arm every entity fd with epoll on every wait. EPOLL_CTL_ADD is idempotent
   // here: a still-live fd returns EEXIST (already armed), while a fd number
@@ -319,6 +329,8 @@ rmw_ret_t rmw_wait(
         register_fd(gc->eventfd_fd);
       }
     }
+    // The context's doorbell: rung by any process after a registry mutation.
+    register_fd(doorbell_fd);
   }
 
   // 3. Check if anything is already ready
@@ -395,30 +407,57 @@ rmw_ret_t rmw_wait(
       }
     }
 
-    // Block, retrying on EINTR. A finite timeout uses a steady_clock deadline
-    // so a signal interruption neither returns TIMEOUT early nor busy-loops.
+    // Block until something the caller waits on fires, or the caller's own
+    // deadline. There is no internal poll: a registry mutation in any process
+    // rings this context's doorbell (ring_doorbells in registry.cpp), which
+    // wakes the epoll; the doorbell is drained, the registry re-checked
+    // (TRANSIENT_LOCAL late-joiner replay + graph guard conditions), and — if
+    // nothing the caller waits on became ready — the wait re-blocks.
+    // RMW_RET_TIMEOUT surfaces only at the caller's own deadline; an infinite
+    // wait never surfaces a synthetic timeout. EINTR re-enters the loop, so a
+    // signal neither returns TIMEOUT early nor busy-loops.
+    const bool infinite = (timeout_ms < 0);
+    const int64_t caller_deadline_ns =
+      infinite ? 0 : now_ns() + static_cast<int64_t>(timeout_ms) * 1000000;
     struct epoll_event ready_events[64];
-    const int64_t deadline_ns =
-      (timeout_ms >= 0) ? now_ns() + static_cast<int64_t>(timeout_ms) * 1000000 : 0;
-    int remaining_ms = timeout_ms;
     while (true) {
-      int n = epoll_wait(ws_data->epoll_fd, ready_events, 64, remaining_ms);
-      if (n >= 0) {
-        break;
+      int block_ms = -1;
+      if (!infinite) {
+        const int64_t rem_ns = caller_deadline_ns - now_ns();
+        const int64_t rem_ms = (rem_ns > 0) ? (rem_ns + 999999) / 1000000 : 0;  // ceil
+        block_ms = static_cast<int>(
+          std::min<int64_t>(rem_ms, std::numeric_limits<int>::max()));
       }
-      if (errno != EINTR) {
+      int n = epoll_wait(ws_data->epoll_fd, ready_events, 64, block_ms);
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
         RMW_SET_ERROR_MSG("epoll_wait failed");
         return RMW_RET_ERROR;
       }
-      if (timeout_ms < 0) {
-        continue;  // Infinite wait: just re-block.
+      if (n == 0) {
+        break;  // The caller's deadline passed -> timeout; fall through to drain.
       }
-      const int64_t rem_ns = deadline_ns - now_ns();
-      if (rem_ns <= 0) {
-        break;  // Deadline passed -> timeout; fall through to drain.
+      bool only_doorbell = true;
+      bool rang = false;
+      for (int e = 0; e < n; ++e) {
+        if (ready_events[e].data.fd == doorbell_fd) {
+          rang = true;
+        } else {
+          only_doorbell = false;
+        }
       }
-      const int64_t rem_ms = rem_ns / 1000000;
-      remaining_ms = (rem_ms > 0) ? static_cast<int>(rem_ms) : 1;  // >=1ms while time remains
+      if (rang) {
+        run_generation_check();  // Drains the doorbell, replays, triggers GCs.
+      }
+      if (!only_doorbell) {
+        break;  // Something the caller waits on fired -> fall through to drain.
+      }
+      if (!infinite && now_ns() >= caller_deadline_ns) {
+        break;  // Doorbell-only wake at the deadline -> timeout.
+      }
+      // Doorbell-only wake: re-block for the caller's remaining time.
     }
     // No EPOLL_CTL_DEL needed — fds stay registered across calls.
 

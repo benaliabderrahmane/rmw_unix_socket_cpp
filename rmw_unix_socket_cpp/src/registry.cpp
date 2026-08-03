@@ -21,13 +21,18 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "logging.hpp"
 
 namespace rmw_uds
 {
+
+// Defined below; called after every generation bump (see its comment).
+static void ring_doorbells(RegistryHeader * header);
 
 // Lock-free atomics in shared memory require both lock-freedom AND
 // address-freedom. On every Linux target we support these hold; assert at
@@ -276,6 +281,7 @@ static int32_t try_add_once(RegistryHeader * header, const RegistryEntry & entry
              !header->high_water_slot.compare_exchange_weak(
                cur, want, std::memory_order_relaxed, std::memory_order_relaxed)) {}
       header->generation.fetch_add(1, std::memory_order_acq_rel);
+      ring_doorbells(header);  // strictly after the bump — see ring_doorbells
       return static_cast<int32_t>(i);
     }
   }
@@ -345,6 +351,7 @@ void registry_remove(RegistryHeader * header, int32_t index)
   }
   teardown_slot(slot);
   header->generation.fetch_add(1, std::memory_order_acq_rel);
+  ring_doorbells(header);  // strictly after the bump — see ring_doorbells
 }
 
 // Best-effort: stat /proc/<pid>. ENOENT means the PID is not in our
@@ -372,13 +379,96 @@ static const char * entry_type_name(uint8_t t)
     case ENTRY_SUBSCRIPTION: return "subscription";
     case ENTRY_SERVICE: return "service";
     case ENTRY_CLIENT: return "client";
+    case ENTRY_DOORBELL: return "doorbell";
     default: return "?";
+  }
+}
+
+// Ring every registered doorbell (one octet, best-effort) so processes blocked
+// in rmw_wait re-check the registry. Called strictly AFTER a generation bump:
+// paired with rmw_wait draining its doorbell strictly BEFORE reading the
+// generation, every mutation either lands in the pre-block generation read or
+// leaves a queued datagram on a level-triggered fd — no lost wakeup. EAGAIN
+// means the peer already has a wakeup queued; other send errors mean a dead
+// peer whose slot will be reclaimed. Scans slots directly (not registry_query,
+// which calls back into cleanup and would recurse).
+static void ring_doorbells(RegistryHeader * header)
+{
+  // One ring socket per mutating thread, closed at thread exit. AF_UNIX
+  // datagrams stay charged to the SENDER's buffer until the receiver consumes
+  // them, so a peer that is slow to drain could exhaust this fd's budget and
+  // make sendto fail for every OTHER peer too; the recreate-on-EAGAIN below
+  // resets that budget. On a fresh fd, EAGAIN can only mean the destination's
+  // own queue is full — a wakeup is already pending there, so the drop is safe.
+  struct RingFd
+  {
+    int fd = -1;
+    ~RingFd() {if (fd >= 0) {close(fd);}}
+  };
+  static thread_local RingFd ring;
+  if (ring.fd < 0) {
+    ring.fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (ring.fd < 0) {
+      return;
+    }
+  }
+  auto * slots = registry_slots(header);
+  const uint32_t hi = header->high_water_slot.load(std::memory_order_acquire);
+  for (uint32_t i = 0; i < hi; ++i) {
+    if (slots[i].state.load(std::memory_order_acquire) !=
+      static_cast<uint8_t>(ENTRY_DOORBELL))
+    {
+      continue;
+    }
+    // Seqlock snapshot of the socket path, re-validating the type INSIDE the
+    // seq window: without it, a remove + re-claim of this slot by a data
+    // endpoint between the fast-skip above and the copy could land the wake
+    // octet on a real data socket. A rewrite after this re-check still bumps
+    // seq, so the s1 comparison below rejects the torn copy.
+    char path[sizeof(slots[i].socket_path)];
+    const uint32_t s1 = slots[i].seq.load(std::memory_order_acquire);
+    if (s1 & 1) {
+      continue;
+    }
+    if (slots[i].state.load(std::memory_order_acquire) !=
+      static_cast<uint8_t>(ENTRY_DOORBELL))
+    {
+      continue;
+    }
+    std::memcpy(path, slots[i].socket_path, sizeof(path));
+    if (slots[i].seq.load(std::memory_order_acquire) != s1 || path[0] == '\0') {
+      continue;
+    }
+    struct sockaddr_un addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    // memcpy of the measured length: addr is zeroed, so termination is free
+    // and -Wstringop-truncation stays quiet (path may fill all 108 bytes).
+    std::memcpy(addr.sun_path, path, strnlen(path, sizeof(addr.sun_path) - 1));
+    const uint8_t octet = 1;
+    ssize_t sent = sendto(
+      ring.fd, &octet, 1, MSG_DONTWAIT | MSG_NOSIGNAL,
+      reinterpret_cast<const struct sockaddr *>(&addr), sizeof(addr));
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      // Sender-side budget exhausted (some peer is slow to drain): reset the
+      // budget and retry once, so one undrained doorbell cannot mute rings to
+      // healthy peers. EAGAIN again on the fresh fd is the benign case.
+      close(ring.fd);
+      ring.fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+      if (ring.fd < 0) {
+        return;
+      }
+      (void)sendto(
+        ring.fd, &octet, 1, MSG_DONTWAIT | MSG_NOSIGNAL,
+        reinterpret_cast<const struct sockaddr *>(&addr), sizeof(addr));
+    }
   }
 }
 
 void registry_cleanup_stale(RegistryHeader * header)
 {
   auto * slots = registry_slots(header);
+  bool reclaimed = false;
   // Scan only [0, high_water): over-scan is safe, under-scan is impossible.
   uint32_t hw = header->high_water_slot.load(std::memory_order_acquire);
   uint32_t max = header->max_entries;
@@ -435,6 +525,10 @@ void registry_cleanup_stale(RegistryHeader * header)
 
     teardown_slot(&slots[i]);
     header->generation.fetch_add(1, std::memory_order_acq_rel);
+    reclaimed = true;
+  }
+  if (reclaimed) {
+    ring_doorbells(header);  // strictly after the bump(s) — see ring_doorbells
   }
 }
 
