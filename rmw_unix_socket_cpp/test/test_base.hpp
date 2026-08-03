@@ -17,6 +17,9 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <cstdint>
+
 #include "rmw/rmw.h"
 #include "rmw/init.h"
 #include "rmw/init_options.h"
@@ -24,6 +27,14 @@
 // Use the identifier from the shared library, not our own copy.
 // Pointer comparison requires the same address.
 inline const char * uds_id() { return rmw_get_implementation_identifier(); }
+
+// Wall clock reference for message-info timestamp checks: rmw_message_info_t
+// timestamps are ns since the Unix epoch.
+inline int64_t wall_now_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+}
 
 // Base fixture: provides a valid rmw_context_t for tests.
 class RmwUdsTestBase : public ::testing::Test

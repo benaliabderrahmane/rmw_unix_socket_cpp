@@ -87,6 +87,67 @@ TEST_F(RmwUdsNodeTest, WaitTimeoutWhenNoData)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(gc));
 }
 
+TEST_F(RmwUdsNodeTest, WaitDrainStampsReceivedTimestampWithWallClock)
+{
+  // The executor path drains sockets inside rmw_wait, so that drain stamps
+  // received_timestamp — it must be ns since the Unix epoch, same as the
+  // take-side drain.
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+
+  rmw_qos_profile_t qos;
+  std::memset(&qos, 0, sizeof(qos));
+  qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+  qos.depth = 10;
+  qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+  qos.durability = RMW_QOS_POLICY_DURABILITY_VOLATILE;
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/wait_epoch", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/wait_epoch", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+
+  const int64_t before = wall_now_ns();
+
+  test_msgs::msg::BasicTypes msg;
+  msg.int32_value = 77;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+
+  rmw_subscriptions_t subscriptions;
+  void * sub_array[1] = {sub->data};
+  subscriptions.subscribers = sub_array;
+  subscriptions.subscriber_count = 1;
+
+  rmw_time_t timeout;
+  timeout.sec = 1;
+  timeout.nsec = 0;
+  EXPECT_EQ(
+    RMW_RET_OK,
+    rmw_wait(&subscriptions, nullptr, nullptr, nullptr, nullptr, ws, &timeout));
+
+  test_msgs::msg::BasicTypes recv;
+  bool taken = false;
+  rmw_message_info_t info = rmw_get_zero_initialized_message_info();
+  EXPECT_EQ(RMW_RET_OK, rmw_take_with_info(sub, &recv, &taken, &info, nullptr));
+  ASSERT_TRUE(taken);
+
+  const int64_t after = wall_now_ns();
+
+  EXPECT_GE(info.source_timestamp, before);
+  EXPECT_LE(info.source_timestamp, after);
+  EXPECT_GE(info.received_timestamp, before);
+  EXPECT_LE(info.received_timestamp, after);
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
+}
+
 TEST_F(RmwUdsNodeTest, WaitWithSubscription)
 {
   auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<

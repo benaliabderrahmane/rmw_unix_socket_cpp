@@ -34,10 +34,19 @@
 #include "rmw/error_handling.h"
 #include "rmw/rmw.h"
 
+// Monotonic — for wait deadlines only.
 static int64_t now_ns()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Wall clock: received_timestamp_ns is ns since the Unix epoch, so the drain
+// below must not stamp it with the monotonic clock above.
+static int64_t wall_now_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 // Drain a socket into a message queue (subscription, service, or client).
@@ -69,7 +78,7 @@ static void drain_socket(
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
     msg.payload = std::move(payload);
-    msg.received_timestamp_ns = now_ns();
+    msg.received_timestamp_ns = wall_now_ns();
 
     {
       std::lock_guard<std::mutex> lock(queue_mutex);

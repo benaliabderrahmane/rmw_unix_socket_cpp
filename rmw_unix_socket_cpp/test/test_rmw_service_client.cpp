@@ -136,6 +136,52 @@ TEST_F(ServiceClientTest, RequestResponseRoundTrip)
   EXPECT_EQ("success", recv_response.string_value);
 }
 
+TEST_F(ServiceClientTest, RequestResponseTimestampsAreUnixEpoch)
+{
+  // rmw_service_info_t carries the same epoch-based timestamps as
+  // rmw_message_info_t (service introspection records them).
+  srv = rmw_create_service(node, ts, "/epoch_srv", &qos);
+  cli = rmw_create_client(node, ts, "/epoch_srv", &qos);
+  ASSERT_NE(nullptr, srv);
+  ASSERT_NE(nullptr, cli);
+
+  const int64_t before = wall_now_ns();
+
+  test_msgs::srv::BasicTypes::Request request;
+  request.int32_value = 42;
+  int64_t seq_id = 0;
+  EXPECT_EQ(RMW_RET_OK, rmw_send_request(cli, &request, &seq_id));
+
+  test_msgs::srv::BasicTypes::Request recv_request;
+  rmw_service_info_t request_header;
+  std::memset(&request_header, 0, sizeof(request_header));
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_request(srv, &request_header, &recv_request, &taken));
+  ASSERT_TRUE(taken);
+
+  test_msgs::srv::BasicTypes::Response response;
+  response.int32_value = 84;
+  EXPECT_EQ(RMW_RET_OK, rmw_send_response(srv, &request_header.request_id, &response));
+
+  test_msgs::srv::BasicTypes::Response recv_response;
+  rmw_service_info_t response_header;
+  std::memset(&response_header, 0, sizeof(response_header));
+  taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_response(cli, &response_header, &recv_response, &taken));
+  ASSERT_TRUE(taken);
+
+  const int64_t after = wall_now_ns();
+
+  EXPECT_GE(request_header.source_timestamp, before);
+  EXPECT_LE(request_header.source_timestamp, after);
+  EXPECT_GE(request_header.received_timestamp, before);
+  EXPECT_LE(request_header.received_timestamp, after);
+  EXPECT_GE(response_header.source_timestamp, before);
+  EXPECT_LE(response_header.source_timestamp, after);
+  EXPECT_GE(response_header.received_timestamp, before);
+  EXPECT_LE(response_header.received_timestamp, after);
+}
+
 TEST_F(ServiceClientTest, LargeRequestAndResponseViaShm)
 {
   // A >4 MB request and a >4 MB response must round-trip. Both exceed the

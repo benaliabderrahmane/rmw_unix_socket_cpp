@@ -131,6 +131,38 @@ TEST_F(PubSubTest, TakeWithInfo)
   EXPECT_GE(info.publication_sequence_number, 1u);
 }
 
+TEST_F(PubSubTest, TakeWithInfoTimestampsAreUnixEpoch)
+{
+  // rosbag2 (Jazzy) writes rmw_message_info timestamps into the bag verbatim,
+  // so they must be ns since the Unix epoch. A monotonic reading is a small
+  // number of ns and shows up as 1970 in the bag.
+  auto pub_opts = rmw_get_default_publisher_options();
+  pub = rmw_create_publisher(node, ts, "/epoch_topic", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub = rmw_create_subscription(node, ts, "/epoch_topic", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  const int64_t before = wall_now_ns();
+
+  test_msgs::msg::BasicTypes send_msg;
+  send_msg.int32_value = 7;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &send_msg, nullptr));
+
+  test_msgs::msg::BasicTypes recv_msg;
+  bool taken = false;
+  rmw_message_info_t info = rmw_get_zero_initialized_message_info();
+  EXPECT_EQ(RMW_RET_OK, rmw_take_with_info(sub, &recv_msg, &taken, &info, nullptr));
+  ASSERT_TRUE(taken);
+
+  const int64_t after = wall_now_ns();
+
+  EXPECT_GE(info.source_timestamp, before);
+  EXPECT_LE(info.source_timestamp, after);
+  EXPECT_GE(info.received_timestamp, before);
+  EXPECT_LE(info.received_timestamp, after);
+}
+
 TEST_F(PubSubTest, TakeEmptyReturnsFalse)
 {
   auto sub_opts = rmw_get_default_subscription_options();
