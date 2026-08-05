@@ -143,6 +143,57 @@ TEST_F(RmwUdsNodeTest, WaitWithSubscription)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
 }
 
+// drain_socket() (rmw_wait.cpp) applies the same ignore_local_publications
+// filter as drain_subscription(), so a subscription created with
+// ignore_local_publications=true must not wake a wait set for a message
+// published from within the same process/context.
+TEST_F(RmwUdsNodeTest, WaitDoesNotWakeForIgnoredLocalPublication)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+
+  rmw_qos_profile_t qos;
+  std::memset(&qos, 0, sizeof(qos));
+  qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+  qos.depth = 10;
+  qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+  qos.durability = RMW_QOS_POLICY_DURABILITY_VOLATILE;
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/wait_ignore_local", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub_opts.ignore_local_publications = true;
+  auto * sub = rmw_create_subscription(node, ts, "/wait_ignore_local", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+
+  test_msgs::msg::BasicTypes msg;
+  msg.int32_value = 77;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+
+  rmw_subscriptions_t subscriptions;
+  void * sub_array[1] = {sub->data};
+  subscriptions.subscribers = sub_array;
+  subscriptions.subscriber_count = 1;
+
+  rmw_time_t timeout;
+  timeout.sec = 0;
+  timeout.nsec = 200000000;  // 200 ms — no wakeup is expected
+
+  rmw_ret_t ret = rmw_wait(&subscriptions, nullptr, nullptr, nullptr, nullptr, ws, &timeout);
+  EXPECT_EQ(RMW_RET_TIMEOUT, ret) <<
+    "ignore_local_publications=true must not wake the wait set for a "
+    "same-context publication";
+  EXPECT_EQ(nullptr, subscriptions.subscribers[0]);
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
+}
+
 TEST_F(RmwUdsNodeTest, NodeGraphGuardConditionTriggersOnGraphChange)
 {
   // Scenario: graph-change notification. rclcpp's GraphListener (and

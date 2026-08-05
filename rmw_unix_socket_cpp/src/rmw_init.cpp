@@ -129,6 +129,13 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
     domain_id = 0;
   }
   ctx->domain_id = domain_id;
+  try {
+    ctx->context_id = rmw_uds::generate_context_id();
+  } catch (...) {
+    delete ctx;
+    RMW_SET_ERROR_MSG("failed to generate context id");
+    return RMW_RET_ERROR;
+  }
 
   // Ensure socket directory exists. ensure_socket_dir swallows mkdir errors and
   // only returns the path, so validate the directory here (in-scope) rather than

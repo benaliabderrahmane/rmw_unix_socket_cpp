@@ -51,7 +51,10 @@ static int64_t wall_now_ns()
 // Drain a socket into a message queue (subscription, service, or client).
 // `shm_cache`/`domain_id` resolve large-payload descriptors: topic, request,
 // and response messages can all carry SHM_PAYLOAD_FLAG, so every caller passes
-// its own reader cache.
+// its own reader cache. If `ignore_local` is true, `context_id` is compared
+// against the sender context id embedded in WireHeader::gid and matching
+// same-context publications are dropped (subscriptions only; services/clients
+// leave ignore_local=false to disable the check).
 static void drain_socket(
   int fd,
   std::mutex & queue_mutex,
@@ -59,7 +62,9 @@ static void drain_socket(
   size_t max_depth,
   uint8_t expected_msg_type,
   rmw_uds::ShmReaderCache & shm_cache,
-  size_t domain_id)
+  size_t domain_id,
+  bool ignore_local = false,
+  uint64_t context_id = 0)
 {
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
@@ -72,6 +77,10 @@ static void drain_socket(
     if (!rmw_uds::shm_resolve_incoming(shm_cache, domain_id, hdr, payload)) {
       payload.clear();
       continue;  // shm descriptor unresolvable (sender gone / ring lapped)
+    }
+    if (ignore_local && rmw_uds::is_same_context(hdr, context_id)) {
+      payload.clear();
+      continue;  // ignore_local_publications: drop same-context publications
     }
 
     rmw_uds::ReceivedMessage msg;
@@ -169,7 +178,8 @@ rmw_ret_t rmw_wait(
       if (!subscriptions->subscribers[i]) {continue;}
       auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
       drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-        sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id);
+        sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id,
+        sub->ignore_local_publications, sub->context->context_id);
     }
   }
 
@@ -473,7 +483,8 @@ rmw_ret_t rmw_wait(
         if (!subscriptions->subscribers[i]) {continue;}
         auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
         drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-          sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id);
+          sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id,
+          sub->ignore_local_publications, sub->context->context_id);
       }
     }
     if (services) {

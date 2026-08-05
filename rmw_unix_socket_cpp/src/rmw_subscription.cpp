@@ -71,6 +71,12 @@ static void drain_subscription(rmw_uds::UdsSubscription * sub)
       continue;  // shm descriptor unresolvable (publisher gone / ring lapped)
     }
 
+    if (sub->ignore_local_publications &&
+      rmw_uds::is_same_context(hdr, sub->context->context_id))
+    {
+      continue;  // ignore_local_publications: drop same-context publications
+    }
+
     rmw_uds::ReceivedMessage msg;
     msg.header = hdr;
     msg.payload = std::move(payload);
@@ -116,7 +122,6 @@ rmw_subscription_t * rmw_create_subscription(
   const rmw_qos_profile_t * qos_policies,
   const rmw_subscription_options_t * subscription_options)
 {
-  (void)subscription_options;
   RMW_CHECK_ARGUMENT_FOR_NULL(node, nullptr);
   RMW_CHECK_ARGUMENT_FOR_NULL(type_support, nullptr);
   RMW_CHECK_ARGUMENT_FOR_NULL(topic_name, nullptr);
@@ -140,7 +145,7 @@ rmw_subscription_t * rmw_create_subscription(
     return nullptr;
   }
 
-  sub_data->gid.generate();
+  sub_data->gid.generate(ctx->context_id);
   sub_data->topic_name = topic_name;
   sub_data->type_name = rmw_uds::make_ros_type_name(
     callbacks->message_namespace_, callbacks->message_name_);
@@ -150,6 +155,8 @@ rmw_subscription_t * rmw_create_subscription(
   sub_data->callbacks = callbacks;
   sub_data->context = ctx;
   sub_data->node = node_data;
+  sub_data->ignore_local_publications = subscription_options ?
+    subscription_options->ignore_local_publications : false;
 
   // Create and bind socket
   sub_data->socket_path = rmw_uds::make_socket_path(ctx->domain_id, "sub");

@@ -92,7 +92,7 @@ rmw_publisher_t * rmw_create_publisher(
     return nullptr;
   }
 
-  pub_data->gid.generate();
+  pub_data->gid.generate(ctx->context_id);
   pub_data->topic_name = topic_name;
   pub_data->type_name = rmw_uds::make_ros_type_name(
     callbacks->message_namespace_, callbacks->message_name_);

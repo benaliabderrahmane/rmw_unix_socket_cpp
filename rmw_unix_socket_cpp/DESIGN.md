@@ -665,9 +665,19 @@ Every entity needs a globally unique identifier in the RMW GID format, which is 
 
 - bytes 0–3: the process PID (`getpid()`)
 - bytes 4–7: a per-process atomic counter (`g_gid_counter`, incremented once per entity)
-- bytes 8–15: zero
+- bytes 8–15: the `context_id` of the `rmw_context_t` that owns the entity (`UdsContext::context_id`, see Context identity and `ignore_local_publications` below)
 
-This is unique on a single host by construction. Two different processes have different PIDs, and within one process the monotonic counter guarantees distinct GIDs across all publishers, subscriptions, services, and clients. Sixteen bytes fits the RMW storage size exactly, and the scheme has no external dependency. The GID is what the request/response routing matches on: the client stamps its GID into every request header, and the server matches that GID to choose the reply socket.
+PID plus counter is unique on a single host by construction: two different processes have different PIDs, and within one process the monotonic counter guarantees distinct GIDs across all publishers, subscriptions, services, and clients. Sixteen bytes fits the RMW storage size exactly, and the scheme has no external dependency. The GID is what the request/response routing matches on: the client stamps its GID into every request header, and the server matches that GID to choose the reply socket.
+
+### Context identity and `ignore_local_publications`
+
+`rmw_subscription_options_t::ignore_local_publications` asks the middleware not to deliver messages published from the same `rmw_context_t`, not merely the same process — a process can in principle hold more than one context, so "local" is defined at context granularity. Each context gets a `context_id`, generated once in `rmw_init()` and stored on `UdsContext`; every node created from that `rmw_context_t*` shares the same `UdsContext` instance (`rmw_create_node` reuses `context->impl` rather than allocating a new one), so by default — one process, one `rclcpp::init()`, one context — every publisher and subscription in that process shares the same `context_id` automatically, exactly like nodes share `rclcpp`'s global default context unless a caller explicitly builds a separate one.
+
+The id itself is drawn from the kernel's entropy source (`std::random_device`, two 32-bit reads combined into a `uint64_t`) rather than derived from `getpid()`. Unlike the GID's PID field, which only has to disambiguate entities within one process's own generated GIDs, the context id is compared *across* processes and potentially across containers, where PIDs are only unique within their own PID namespace — two containers on the same host (e.g. separate docker-compose services sharing `/dev/shm`) can observe the same PID at the same instant. With 64 random bits, an accidental collision between concurrently running contexts is astronomically unlikely regardless of process or container topology.
+
+Because `UdsGid::generate()` embeds the owning context's id in the trailing 8 bytes of every GID, and the GID is copied verbatim into `WireHeader::gid` on every datagram, a receiver can decide "did this come from my own context?" purely from bytes already on the wire, with no extra traffic. `is_same_context(hdr, context_id)` extracts those trailing 8 bytes and compares them; `drain_subscription()` and `drain_socket()` call it only when the subscription actually requested `ignore_local_publications`, so a subscription that leaves the option at its default (`false`) never pays for or triggers the check.
+
+
 
 ## Operational requirements
 
