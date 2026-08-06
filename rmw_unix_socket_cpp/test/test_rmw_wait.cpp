@@ -391,3 +391,129 @@ TEST_F(RmwUdsNodeTest, LatchedTopicSurvivesAnUnresponsiveParticipant)
   EXPECT_EQ(RMW_RET_OK, rmw_context_fini(&ctx2));
   EXPECT_EQ(RMW_RET_OK, rmw_init_options_fini(&opts2));
 }
+
+// A same-context publication dropped by ignore_local_publications wakes the
+// epoll but leaves nothing to take. rmw_wait may return early, but only the
+// caller's own deadline may produce RMW_RET_TIMEOUT.
+TEST_F(RmwUdsNodeTest, IgnoredLocalPublicationIsNotReportedAsTimeout)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+
+  rmw_qos_profile_t qos;
+  std::memset(&qos, 0, sizeof(qos));
+  qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+  qos.depth = 10;
+  qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+  qos.durability = RMW_QOS_POLICY_DURABILITY_VOLATILE;
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/ignore_local_no_timeout", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub_opts.ignore_local_publications = true;
+  auto * sub = rmw_create_subscription(node, ts, "/ignore_local_no_timeout", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+
+  // Publish only once the wait is already blocked, so the drop happens on the
+  // post-epoll drain rather than the pre-epoll one.
+  std::thread publisher([&]() {
+      std::this_thread::sleep_for(std::chrono::milliseconds(150));
+      test_msgs::msg::BasicTypes m;
+      m.int32_value = 42;
+      rmw_publish(pub, &m, nullptr);
+    });
+
+  rmw_subscriptions_t subscriptions;
+  void * sub_array[1] = {sub->data};
+  subscriptions.subscribers = sub_array;
+  subscriptions.subscriber_count = 1;
+
+  rmw_time_t timeout;
+  timeout.sec = 2;
+  timeout.nsec = 0;
+
+  auto t0 = std::chrono::steady_clock::now();
+  rmw_ret_t ret = rmw_wait(&subscriptions, nullptr, nullptr, nullptr, nullptr, ws, &timeout);
+  auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - t0).count();
+  publisher.join();
+
+  EXPECT_TRUE(ret != RMW_RET_TIMEOUT || elapsed_ms >= 1900) <<
+    "rmw_wait reported RMW_RET_TIMEOUT after " << elapsed_ms <<
+    " ms for a 2000 ms deadline";
+  EXPECT_EQ(nullptr, subscriptions.subscribers[0]);
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
+}
+
+// rmw_wait(..., nullptr) blocks indefinitely, so RMW_RET_TIMEOUT has no meaning
+// for it: rclcpp's GraphListener treats that code as fatal. Dropping a
+// same-context publication must not produce it.
+TEST_F(RmwUdsNodeTest, InfiniteWaitNeverTimesOutOnIgnoredLocalPublication)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+
+  rmw_qos_profile_t qos;
+  std::memset(&qos, 0, sizeof(qos));
+  qos.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+  qos.depth = 10;
+  qos.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+  qos.durability = RMW_QOS_POLICY_DURABILITY_VOLATILE;
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/ignore_local_infinite", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub_opts.ignore_local_publications = true;
+  auto * sub = rmw_create_subscription(node, ts, "/ignore_local_infinite", &qos, &sub_opts);
+  auto * gc = rmw_create_guard_condition(&context);  // unblocks the wait on teardown
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+  ASSERT_NE(nullptr, gc);
+
+  auto * ws = rmw_create_wait_set(&context, 2);
+  ASSERT_NE(nullptr, ws);
+
+  std::atomic<bool> returned{false};
+  std::atomic<int> ret{RMW_RET_OK};
+  std::thread waiter([&]() {
+      rmw_subscriptions_t subs;
+      void * sub_array[1] = {sub->data};
+      subs.subscribers = sub_array;
+      subs.subscriber_count = 1;
+      rmw_guard_conditions_t gcs;
+      void * gc_array[1] = {gc->data};
+      gcs.guard_conditions = gc_array;
+      gcs.guard_condition_count = 1;
+      ret = rmw_wait(&subs, &gcs, nullptr, nullptr, nullptr, ws, nullptr);
+      returned = true;
+    });
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  test_msgs::msg::BasicTypes m;
+  m.int32_value = 7;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
+  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+
+  // Returning early with nothing ready is allowed; returning TIMEOUT is not.
+  if (returned.load()) {
+    EXPECT_NE(RMW_RET_TIMEOUT, ret.load()) <<
+      "infinite rmw_wait returned RMW_RET_TIMEOUT after a dropped same-context "
+      "publication";
+  }
+
+  rmw_trigger_guard_condition(gc);
+  waiter.join();
+  EXPECT_NE(RMW_RET_TIMEOUT, ret.load());
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(gc));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
+}

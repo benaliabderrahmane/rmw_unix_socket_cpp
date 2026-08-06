@@ -405,36 +405,36 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  // 4. If nothing ready, block with epoll
-  if (!something_ready) {
-    // Compute timeout. -1 means block forever (epoll_wait sentinel).
-    int timeout_ms = -1;
-    if (wait_timeout) {
-      // Accumulate in int64_t; RMW_DURATION_INFINITE (~9.2e12 ms) overflows int.
-      int64_t ms = static_cast<int64_t>(wait_timeout->sec) * 1000 +
-        static_cast<int64_t>(wait_timeout->nsec) / 1000000;
-      if (ms > std::numeric_limits<int>::max()) {
-        timeout_ms = -1;  // Infinite (or beyond epoll's range) -> block forever
-      } else {
-        timeout_ms = static_cast<int>(ms);
-        if (timeout_ms == 0 && wait_timeout->nsec > 0) {
-          timeout_ms = 1;  // At least 1ms
-        }
+  // Compute timeout. -1 means block forever (epoll_wait sentinel).
+  int timeout_ms = -1;
+  if (wait_timeout) {
+    // Accumulate in int64_t; RMW_DURATION_INFINITE (~9.2e12 ms) overflows int.
+    int64_t ms = static_cast<int64_t>(wait_timeout->sec) * 1000 +
+      static_cast<int64_t>(wait_timeout->nsec) / 1000000;
+    if (ms > std::numeric_limits<int>::max()) {
+      timeout_ms = -1;  // Infinite (or beyond epoll's range) -> block forever
+    } else {
+      timeout_ms = static_cast<int>(ms);
+      if (timeout_ms == 0 && wait_timeout->nsec > 0) {
+        timeout_ms = 1;  // At least 1ms
       }
     }
+  }
 
-    // Block until something the caller waits on fires, or the caller's own
-    // deadline. There is no internal poll: a registry mutation in any process
-    // rings this context's doorbell (ring_doorbells in registry.cpp), which
-    // wakes the epoll; the doorbell is drained, the registry re-checked
-    // (TRANSIENT_LOCAL late-joiner replay + graph guard conditions), and — if
-    // nothing the caller waits on became ready — the wait re-blocks.
-    // RMW_RET_TIMEOUT surfaces only at the caller's own deadline; an infinite
-    // wait never surfaces a synthetic timeout. EINTR re-enters the loop, so a
-    // signal neither returns TIMEOUT early nor busy-loops.
-    const bool infinite = (timeout_ms < 0);
-    const int64_t caller_deadline_ns =
-      infinite ? 0 : steady_now_ns() + static_cast<int64_t>(timeout_ms) * 1000000;
+  // Block until something the caller waits on fires, or the caller's own
+  // deadline. There is no internal poll: a registry mutation in any process
+  // rings this context's doorbell (ring_doorbells in registry.cpp), which
+  // wakes the epoll; the doorbell is drained, the registry re-checked
+  // (TRANSIENT_LOCAL late-joiner replay + graph guard conditions), and — if
+  // nothing the caller waits on became ready — the wait re-blocks.
+  // RMW_RET_TIMEOUT surfaces only at the caller's own deadline; an infinite
+  // wait never surfaces a synthetic timeout. EINTR re-enters the loop, so a
+  // signal neither returns TIMEOUT early nor busy-loops.
+  const bool infinite = (timeout_ms < 0);
+  const int64_t caller_deadline_ns =
+    infinite ? 0 : steady_now_ns() + static_cast<int64_t>(timeout_ms) * 1000000;
+  // 4. If nothing ready, block with epoll
+  if (!something_ready) {
     struct epoll_event ready_events[64];
     while (true) {
       int block_ms = -1;
@@ -571,7 +571,9 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  if (!any_ready) {
+  // Only the caller's own deadline may report a timeout. Waking up and finding
+  // nothing to take is a spurious wake: report OK with every entry nulled.
+  if (!any_ready && !infinite && steady_now_ns() >= caller_deadline_ns) {
     return RMW_RET_TIMEOUT;
   }
 
