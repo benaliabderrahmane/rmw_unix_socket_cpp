@@ -51,7 +51,10 @@ static int64_t wall_now_ns()
 // Drain a socket into a message queue (subscription, service, or client).
 // `shm_cache`/`domain_id` resolve large-payload descriptors: topic, request,
 // and response messages can all carry SHM_PAYLOAD_FLAG, so every caller passes
-// its own reader cache.
+// its own reader cache. If `ignore_local` is true, `context_id` is compared
+// against the sender context id embedded in WireHeader::gid and matching
+// same-context publications are dropped (subscriptions only; services/clients
+// leave ignore_local=false to disable the check).
 static void drain_socket(
   int fd,
   std::mutex & queue_mutex,
@@ -59,7 +62,9 @@ static void drain_socket(
   size_t max_depth,
   uint8_t expected_msg_type,
   rmw_uds::ShmReaderCache & shm_cache,
-  size_t domain_id)
+  size_t domain_id,
+  bool ignore_local = false,
+  uint64_t context_id = 0)
 {
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
@@ -72,6 +77,10 @@ static void drain_socket(
     if (!rmw_uds::shm_resolve_incoming(shm_cache, domain_id, hdr, payload)) {
       payload.clear();
       continue;  // shm descriptor unresolvable (sender gone / ring lapped)
+    }
+    if (ignore_local && rmw_uds::is_same_context(hdr, context_id)) {
+      payload.clear();
+      continue;  // ignore_local_publications: drop same-context publications
     }
 
     rmw_uds::ReceivedMessage msg;
@@ -169,7 +178,8 @@ rmw_ret_t rmw_wait(
       if (!subscriptions->subscribers[i]) {continue;}
       auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
       drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-        sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id);
+        sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id,
+        sub->ignore_local_publications, sub->context->context_id);
     }
   }
 
@@ -395,36 +405,36 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  // 4. If nothing ready, block with epoll
-  if (!something_ready) {
-    // Compute timeout. -1 means block forever (epoll_wait sentinel).
-    int timeout_ms = -1;
-    if (wait_timeout) {
-      // Accumulate in int64_t; RMW_DURATION_INFINITE (~9.2e12 ms) overflows int.
-      int64_t ms = static_cast<int64_t>(wait_timeout->sec) * 1000 +
-        static_cast<int64_t>(wait_timeout->nsec) / 1000000;
-      if (ms > std::numeric_limits<int>::max()) {
-        timeout_ms = -1;  // Infinite (or beyond epoll's range) -> block forever
-      } else {
-        timeout_ms = static_cast<int>(ms);
-        if (timeout_ms == 0 && wait_timeout->nsec > 0) {
-          timeout_ms = 1;  // At least 1ms
-        }
+  // Compute timeout. -1 means block forever (epoll_wait sentinel).
+  int timeout_ms = -1;
+  if (wait_timeout) {
+    // Accumulate in int64_t; RMW_DURATION_INFINITE (~9.2e12 ms) overflows int.
+    int64_t ms = static_cast<int64_t>(wait_timeout->sec) * 1000 +
+      static_cast<int64_t>(wait_timeout->nsec) / 1000000;
+    if (ms > std::numeric_limits<int>::max()) {
+      timeout_ms = -1;  // Infinite (or beyond epoll's range) -> block forever
+    } else {
+      timeout_ms = static_cast<int>(ms);
+      if (timeout_ms == 0 && wait_timeout->nsec > 0) {
+        timeout_ms = 1;  // At least 1ms
       }
     }
+  }
 
-    // Block until something the caller waits on fires, or the caller's own
-    // deadline. There is no internal poll: a registry mutation in any process
-    // rings this context's doorbell (ring_doorbells in registry.cpp), which
-    // wakes the epoll; the doorbell is drained, the registry re-checked
-    // (TRANSIENT_LOCAL late-joiner replay + graph guard conditions), and — if
-    // nothing the caller waits on became ready — the wait re-blocks.
-    // RMW_RET_TIMEOUT surfaces only at the caller's own deadline; an infinite
-    // wait never surfaces a synthetic timeout. EINTR re-enters the loop, so a
-    // signal neither returns TIMEOUT early nor busy-loops.
-    const bool infinite = (timeout_ms < 0);
-    const int64_t caller_deadline_ns =
-      infinite ? 0 : steady_now_ns() + static_cast<int64_t>(timeout_ms) * 1000000;
+  // Block until something the caller waits on fires, or the caller's own
+  // deadline. There is no internal poll: a registry mutation in any process
+  // rings this context's doorbell (ring_doorbells in registry.cpp), which
+  // wakes the epoll; the doorbell is drained, the registry re-checked
+  // (TRANSIENT_LOCAL late-joiner replay + graph guard conditions), and — if
+  // nothing the caller waits on became ready — the wait re-blocks.
+  // RMW_RET_TIMEOUT surfaces only at the caller's own deadline; an infinite
+  // wait never surfaces a synthetic timeout. EINTR re-enters the loop, so a
+  // signal neither returns TIMEOUT early nor busy-loops.
+  const bool infinite = (timeout_ms < 0);
+  const int64_t caller_deadline_ns =
+    infinite ? 0 : steady_now_ns() + static_cast<int64_t>(timeout_ms) * 1000000;
+  // 4. If nothing ready, block with epoll
+  if (!something_ready) {
     struct epoll_event ready_events[64];
     while (true) {
       int block_ms = -1;
@@ -473,7 +483,8 @@ rmw_ret_t rmw_wait(
         if (!subscriptions->subscribers[i]) {continue;}
         auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
         drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-          sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id);
+          sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id,
+          sub->ignore_local_publications, sub->context->context_id);
       }
     }
     if (services) {
@@ -560,7 +571,9 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  if (!any_ready) {
+  // Only the caller's own deadline may report a timeout. Waking up and finding
+  // nothing to take is a spurious wake: report OK with every entry nulled.
+  if (!any_ready && !infinite && steady_now_ns() >= caller_deadline_ns) {
     return RMW_RET_TIMEOUT;
   }
 

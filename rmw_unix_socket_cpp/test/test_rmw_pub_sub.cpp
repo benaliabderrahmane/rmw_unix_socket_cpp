@@ -343,3 +343,45 @@ TEST_F(PubSubTest, TakeSequenceSkipsMidBatchCorruptContiguously)
   ::close(send_fd);
   EXPECT_EQ(RMW_RET_OK, rmw_serialized_message_fini(&good_ser));
 }
+
+// subscription_options.ignore_local_publications is enforced in
+// drain_subscription() (rmw_subscription.cpp), which drops any message whose
+// sender context id — embedded in WireHeader::gid by UdsGid::generate() —
+// matches the subscription's owning rmw_context_t, before it reaches the queue.
+TEST_F(PubSubTest, IgnoreLocalPublicationsDropsSameProcessMessage)
+{
+  auto pub_opts = rmw_get_default_publisher_options();
+  pub = rmw_create_publisher(node, ts, "/ignore_local", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  // Subscriber that wants to ignore messages from publishers in this process.
+  auto ignoring_sub_opts = rmw_get_default_subscription_options();
+  ignoring_sub_opts.ignore_local_publications = true;
+  sub = rmw_create_subscription(node, ts, "/ignore_local", &qos, &ignoring_sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  // Baseline subscriber with default options, same topic, same process: it
+  // must still receive the message so we know the publish itself worked.
+  auto default_sub_opts = rmw_get_default_subscription_options();
+  rmw_subscription_t * baseline_sub = rmw_create_subscription(
+    node, ts, "/ignore_local", &qos, &default_sub_opts);
+  ASSERT_NE(nullptr, baseline_sub);
+
+  test_msgs::msg::BasicTypes send_msg;
+  send_msg.int32_value = 123;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &send_msg, nullptr));
+
+  test_msgs::msg::BasicTypes recv_msg;
+  bool taken = false;
+
+  EXPECT_EQ(RMW_RET_OK, rmw_take(baseline_sub, &recv_msg, &taken, nullptr));
+  EXPECT_TRUE(taken) << "baseline subscriber (ignore_local_publications=false) "
+                        "should still receive the same-process publication";
+
+  taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv_msg, &taken, nullptr));
+  EXPECT_FALSE(taken) << "ignore_local_publications=true must drop messages "
+                          "published from within the same process/context";
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, baseline_sub));
+}
