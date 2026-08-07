@@ -104,7 +104,6 @@ rmw_client_t * rmw_create_client(
     return nullptr;
   }
 
-  // Register in shared memory
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
   rmw_uds::RegistryEntry entry;
   std::memset(&entry, 0, sizeof(entry));
@@ -259,7 +258,6 @@ rmw_ret_t rmw_take_response(
   *taken = false;
   auto * cli_data = static_cast<rmw_uds::UdsClient *>(client->data);
 
-  // Drain socket
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
   while (rmw_uds::recv_from(cli_data->socket_fd, hdr, payload)) {

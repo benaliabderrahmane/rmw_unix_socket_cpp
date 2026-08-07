@@ -42,7 +42,6 @@ std::string ensure_socket_dir(size_t domain_id)
   char dir[128];
   std::snprintf(dir, sizeof(dir), "/tmp/ros2_uds/%zu", domain_id);
 
-  // Create parent
   mkdir("/tmp/ros2_uds", 0777);
   mkdir(dir, 0777);
 
@@ -219,12 +218,10 @@ bool recv_from(
     return false;
   }
 
-  // Resize if needed
   if (static_cast<size_t>(n) > recv_buf.size()) {
     recv_buf.resize(static_cast<size_t>(n));
   }
 
-  // Actually receive the message
   n = recv(socket_fd, recv_buf.data(), recv_buf.size(), MSG_DONTWAIT);
   if (n < 0) {
     if (errno != EAGAIN && errno != EWOULDBLOCK) {

@@ -95,7 +95,6 @@ rmw_service_t * rmw_create_service(
   srv_data->context = ctx;
   srv_data->node = node_data;
 
-  // Create and bind socket
   srv_data->socket_path = rmw_uds::make_socket_path(ctx->domain_id, "srv");
   srv_data->socket_fd = rmw_uds::create_bound_socket(srv_data->socket_path);
   if (srv_data->socket_fd < 0) {
@@ -104,7 +103,6 @@ rmw_service_t * rmw_create_service(
     return nullptr;
   }
 
-  // Register in shared memory
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
   rmw_uds::RegistryEntry entry;
   std::memset(&entry, 0, sizeof(entry));
@@ -188,7 +186,6 @@ rmw_ret_t rmw_take_request(
   *taken = false;
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
 
-  // Drain socket
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
   while (rmw_uds::recv_from(srv_data->socket_fd, hdr, payload)) {
@@ -226,7 +223,6 @@ rmw_ret_t rmw_take_request(
       continue;
     }
 
-    // Fill request header
     std::memcpy(request_header->request_id.writer_guid, msg.header.gid,
       RMW_GID_STORAGE_SIZE);
     request_header->request_id.sequence_number = msg.header.sequence_number;

@@ -151,7 +151,6 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
     return RMW_RET_ERROR;
   }
 
-  // Open shared memory registry
   ctx->registry_fd = rmw_uds::registry_open(
     domain_id, &ctx->registry_ptr, &ctx->registry_size);
   if (ctx->registry_fd < 0) {
@@ -176,7 +175,6 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
 
   rmw_uds::warn_if_sysctl_buffers_undersized();
 
-  // Create send socket
   ctx->send_socket_fd = rmw_uds::create_send_socket();
   if (ctx->send_socket_fd < 0) {
     RMW_UDS_LOG_ERROR(
@@ -228,7 +226,6 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
     }
   }
 
-  // Read initial generation
   ctx->last_registry_generation.store(
     rmw_uds::registry_generation(header), std::memory_order_relaxed);
 

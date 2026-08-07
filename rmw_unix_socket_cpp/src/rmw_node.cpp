@@ -43,7 +43,6 @@ rmw_node_t * rmw_create_node(
 
   auto * ctx = reinterpret_cast<rmw_uds::UdsContext *>(context->impl);
 
-  // Create graph guard condition for this node
   rmw_guard_condition_t * graph_gc = rmw_create_guard_condition(context);
   if (!graph_gc) {
     return nullptr;
@@ -61,7 +60,6 @@ rmw_node_t * rmw_create_node(
   node_data->context = ctx;
   node_data->graph_guard_condition = graph_gc;
 
-  // Register node in the shared memory registry
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
   rmw_uds::RegistryEntry entry;
   std::memset(&entry, 0, sizeof(entry));
@@ -129,7 +127,6 @@ rmw_ret_t rmw_destroy_node(rmw_node_t * node)
 
   auto * node_data = static_cast<rmw_uds::UdsNode *>(node->data);
   if (node_data) {
-    // Remove from registry
     if (node_data->context && node_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(node_data->context->registry_ptr);
       rmw_uds::registry_remove(header, node_data->registry_index);

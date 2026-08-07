@@ -34,7 +34,6 @@ namespace rmw_uds
 const message_type_support_callbacks_t *
 get_callbacks(const rosidl_message_type_support_t * type_support)
 {
-  // Try C++ fastrtps type support first
   auto ts = get_message_typesupport_handle(
     type_support,
     rosidl_typesupport_fastrtps_cpp::typesupport_identifier);
@@ -43,7 +42,6 @@ get_callbacks(const rosidl_message_type_support_t * type_support)
   }
   rcutils_reset_error();
 
-  // Fall back to C fastrtps type support
   ts = get_message_typesupport_handle(
     type_support,
     rosidl_typesupport_fastrtps_c__identifier);
@@ -59,7 +57,6 @@ ServiceCallbacks get_service_callbacks(
 {
   ServiceCallbacks result;
 
-  // Try C++ first
   auto ts = get_service_typesupport_handle(
     type_support,
     rosidl_typesupport_fastrtps_cpp::typesupport_identifier);
@@ -83,7 +80,6 @@ ServiceCallbacks get_service_callbacks(
   }
   rcutils_reset_error();
 
-  // Fall back to C
   ts = get_service_typesupport_handle(
     type_support,
     rosidl_typesupport_fastrtps_c__identifier);
@@ -129,7 +125,6 @@ bool serialize(
       return false;
     }
 
-    // Trim buffer to actual serialized size
     buffer.resize(ser.get_serialized_data_length());
   } catch (const eprosima::fastcdr::exception::Exception &) {
     return false;

@@ -56,7 +56,6 @@ static int64_t system_now_ns()
     std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// Drain socket into message queue
 static void drain_subscription(rmw_uds::UdsSubscription * sub)
 {
   rmw_uds::WireHeader hdr;
@@ -102,7 +101,6 @@ static void drain_subscription(rmw_uds::UdsSubscription * sub)
         sub->topic_name.c_str(), sub->queue_depth);
     }
 
-    // Trigger callback if set
     {
       std::lock_guard<std::mutex> lock(sub->callback_mutex);
       if (sub->on_new_message_cb) {
@@ -158,7 +156,6 @@ rmw_subscription_t * rmw_create_subscription(
   sub_data->ignore_local_publications = subscription_options ?
     subscription_options->ignore_local_publications : false;
 
-  // Create and bind socket
   sub_data->socket_path = rmw_uds::make_socket_path(ctx->domain_id, "sub");
   sub_data->socket_fd = rmw_uds::create_bound_socket(sub_data->socket_path);
   if (sub_data->socket_fd < 0) {
@@ -170,7 +167,6 @@ rmw_subscription_t * rmw_create_subscription(
     return nullptr;
   }
 
-  // Register in shared memory
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
   rmw_uds::RegistryEntry entry;
   std::memset(&entry, 0, sizeof(entry));
@@ -265,7 +261,6 @@ rmw_ret_t rmw_take(
   *taken = false;
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
 
-  // Drain any pending messages
   drain_subscription(sub_data);
 
   std::lock_guard<std::mutex> lock(sub_data->queue_mutex);

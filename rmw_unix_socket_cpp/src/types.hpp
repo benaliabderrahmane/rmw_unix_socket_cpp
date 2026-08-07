@@ -37,7 +37,6 @@
 namespace rmw_uds
 {
 
-// Global atomic counter for unique GID generation
 inline std::atomic<uint32_t> g_gid_counter{1};
 
 // Convert introspection namespace to ROS type name ("pkg/msg/Name")
@@ -46,12 +45,10 @@ inline std::atomic<uint32_t> g_gid_counter{1};
 inline std::string make_ros_type_name(const char * ns, const char * name)
 {
   std::string result(ns);
-  // Replace "::" with "/" (C++ introspection)
   std::string::size_type pos = 0;
   while ((pos = result.find("::", pos)) != std::string::npos) {
     result.replace(pos, 2, "/");
   }
-  // Replace "__" with "/" (C introspection)
   pos = 0;
   while ((pos = result.find("__", pos)) != std::string::npos) {
     result.replace(pos, 2, "/");
@@ -143,10 +140,8 @@ inline bool is_same_context(const WireHeader & hdr, uint64_t context_id)
   return sender_context_id == context_id;
 }
 
-// Forward declaration: publisher type defined below.
 struct UdsPublisher;
 
-// Per-context implementation data
 struct UdsContext
 {
   size_t domain_id = 0;
@@ -178,7 +173,6 @@ struct UdsContext
   std::vector<UdsPublisher *> transient_local_pubs;
 };
 
-// Node data
 struct UdsNode
 {
   std::string name;
@@ -201,7 +195,6 @@ struct CachedMessage
   std::unique_ptr<DurableShmSegment> shm_seg;
 };
 
-// Publisher data
 struct UdsPublisher
 {
   UdsGid gid;
@@ -236,7 +229,6 @@ struct UdsPublisher
   ShmRingWriter shm_ring;
 };
 
-// Subscription data
 struct UdsSubscription
 {
   UdsGid gid;
@@ -274,7 +266,6 @@ struct CachedClient
   uint8_t gid[RMW_GID_STORAGE_SIZE];
 };
 
-// Service server data
 struct UdsService
 {
   UdsGid gid;
@@ -309,7 +300,6 @@ struct UdsService
   const void * on_new_request_user_data = nullptr;
 };
 
-// Service client data
 struct UdsClient
 {
   UdsGid gid;
@@ -346,13 +336,11 @@ struct UdsClient
   const void * on_new_response_user_data = nullptr;
 };
 
-// Guard condition data
 struct UdsGuardCondition
 {
   int eventfd_fd = -1;
 };
 
-// Wait set data
 struct UdsWaitSet
 {
   int epoll_fd = -1;
