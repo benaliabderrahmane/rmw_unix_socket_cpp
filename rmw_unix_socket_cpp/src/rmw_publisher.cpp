@@ -252,7 +252,8 @@ static rmw_ret_t transient_local_publish(
             const auto & cm = pub_data->message_cache[i];
             rmw_uds::send_to(
               pub_data->context->send_socket_fd,
-              path, cm.header, cm.payload.data(), cm.payload.size());
+              path, pub_data->topic_name.c_str(),
+              cm.header, cm.payload.data(), cm.payload.size());
           }
         }
       }
@@ -267,7 +268,8 @@ static rmw_ret_t transient_local_publish(
       for (const auto & path : *sub_paths) {
         if (rmw_uds::send_to(
             pub_data->context->send_socket_fd,
-            path, current.header, current.payload.data(), current.payload.size())
+            path, pub_data->topic_name.c_str(),
+            current.header, current.payload.data(), current.payload.size())
           == rmw_uds::SendResult::ConfigError)
         {
           config_error = true;
@@ -396,7 +398,8 @@ rmw_ret_t rmw_publish(
     for (const auto & path : *sub_paths) {
       if (rmw_uds::send_to(
           pub_data->context->send_socket_fd,
-          path, hdr, wire.data, wire.size) == rmw_uds::SendResult::ConfigError)
+          path, pub_data->topic_name.c_str(),
+          hdr, wire.data, wire.size) == rmw_uds::SendResult::ConfigError)
       {
         config_error = true;
       }
@@ -496,7 +499,8 @@ rmw_ret_t rmw_publish_serialized_message(
     for (const auto & path : *sub_paths) {
       if (rmw_uds::send_to(
           pub_data->context->send_socket_fd,
-          path, hdr, wire.data, wire.size) == rmw_uds::SendResult::ConfigError)
+          path, pub_data->topic_name.c_str(),
+          hdr, wire.data, wire.size) == rmw_uds::SendResult::ConfigError)
       {
         config_error = true;
       }

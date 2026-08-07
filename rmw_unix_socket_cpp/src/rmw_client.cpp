@@ -236,7 +236,8 @@ rmw_ret_t rmw_send_request(
   if (!service_path.empty()) {
     rmw_uds::send_to(
       cli_data->context->send_socket_fd,
-      service_path, hdr, wire.data, wire.size);
+      service_path, cli_data->service_name.c_str(),
+      hdr, wire.data, wire.size);
   }
   // No service found yet — still return OK (request will be sent on retry)
   return RMW_RET_OK;

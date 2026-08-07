@@ -257,7 +257,8 @@ rmw_ret_t rmw_wait(
           for (const auto & cm : pub->message_cache) {
             rmw_uds::send_to(
               ctx->send_socket_fd,
-              path, cm.header, cm.payload.data(), cm.payload.size());
+              path, pub->topic_name.c_str(),
+              cm.header, cm.payload.data(), cm.payload.size());
           }
         }
       }

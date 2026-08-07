@@ -305,7 +305,8 @@ rmw_ret_t rmw_send_response(
     if (std::memcmp(c.gid, request_header->writer_guid, sizeof(c.gid)) == 0) {
       rmw_uds::send_to(
         srv_data->context->send_socket_fd,
-        c.socket_path, hdr, wire.data, wire.size);
+        c.socket_path, srv_data->service_name.c_str(),
+        hdr, wire.data, wire.size);
       return RMW_RET_OK;
     }
   }
@@ -320,7 +321,8 @@ rmw_ret_t rmw_send_response(
     if (std::memcmp(c.gid, request_header->writer_guid, sizeof(c.gid)) == 0) {
       rmw_uds::send_to(
         srv_data->context->send_socket_fd,
-        c.socket_path, hdr, wire.data, wire.size);
+        c.socket_path, srv_data->service_name.c_str(),
+        hdr, wire.data, wire.size);
       return RMW_RET_OK;
     }
   }

@@ -71,7 +71,7 @@ TEST_F(TransportTest, SendAndReceive)
   ASSERT_EQ(
     rmw_uds::SendResult::Ok,
     rmw_uds::send_to(
-      send_fd, recv_path, send_hdr, payload.data(), payload.size()));
+      send_fd, recv_path, "/test_topic", send_hdr, payload.data(), payload.size()));
 
   // Receive
   rmw_uds::WireHeader recv_hdr;
@@ -118,7 +118,8 @@ TEST_F(TransportTest, MultipleMessages)
     ASSERT_EQ(
       rmw_uds::SendResult::Ok,
       rmw_uds::send_to(
-        send_fd, path, hdr, reinterpret_cast<const uint8_t *>(&i), sizeof(i)));
+        send_fd, path, "/test_topic", hdr,
+        reinterpret_cast<const uint8_t *>(&i), sizeof(i)));
   }
 
   for (int i = 0; i < N; ++i) {

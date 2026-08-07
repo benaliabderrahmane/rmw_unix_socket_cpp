@@ -40,10 +40,14 @@ int create_send_socket();
 // ConfigError = EMSGSIZE (hard, surface to caller); SoftDrop = transient.
 enum class SendResult { Ok, SoftDrop, ConfigError };
 
-// Send a datagram (header + payload) to the given socket path.
+// Send a datagram (header + payload) to the given socket path. `endpoint_name`
+// is the topic or service this send belongs to; it is used only to name the
+// endpoint in drop diagnostics, since dest_path encodes the peer's prefix and
+// pid but nothing about what is being sent.
 SendResult send_to(
   int send_fd,
   const std::string & dest_path,
+  const char * endpoint_name,
   const WireHeader & header,
   const uint8_t * payload,
   size_t payload_size);

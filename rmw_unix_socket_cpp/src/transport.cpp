@@ -111,6 +111,7 @@ int create_send_socket()
 SendResult send_to(
   int send_fd,
   const std::string & dest_path,
+  const char * endpoint_name,
   const WireHeader & header,
   const uint8_t * payload,
   size_t payload_size)
@@ -139,9 +140,11 @@ SendResult send_to(
   }
 
   // Classify the failure. Hot path — every category is throttled so a
-  // persistently-failing peer can't drown the log. The destination path
-  // encodes the peer's prefix+pid (see make_socket_path) which is enough
-  // to identify the offending subscriber from the message alone.
+  // persistently-failing peer can't drown the log. Every message names both
+  // the endpoint and the destination path: the path encodes the peer's
+  // prefix+pid (see make_socket_path) but nothing about what is being sent,
+  // and the throttle is per call site, so without the endpoint name a single
+  // line per second is not enough to identify which traffic is being dropped.
   const int err = errno;
   const size_t total = sizeof(WireHeader) + payload_size;
   SendResult result = SendResult::SoftDrop;
@@ -152,9 +155,9 @@ SendResult send_to(
       // transient backpressure — log every 5s with full size context.
       RMW_UDS_LOG_ERROR_THROTTLE(
         5000,
-        "UDS send to '%s' failed: message too big (%zu bytes incl. header). "
-        "Raise net.core.{wmem_max,rmem_max} or split the message.",
-        dest_path.c_str(), total);
+        "UDS send on '%s' to '%s' failed: message too big (%zu bytes incl. "
+        "header). Raise net.core.{wmem_max,rmem_max} or split the message.",
+        endpoint_name, dest_path.c_str(), total);
       result = SendResult::ConfigError;
       break;
     case EAGAIN:
@@ -162,14 +165,21 @@ SendResult send_to(
     case EWOULDBLOCK:
 #endif
     case ENOBUFS:
-      // Peer's receive queue is full (or our send queue, briefly). This
-      // is the classic "slow subscriber" symptom — the subscriber isn't
-      // calling rmw_take fast enough to drain its socket.
+      // Peer's receive queue is full. Two independent ceilings apply and the
+      // smaller one binds: SO_RCVBUF caps queued *bytes*, while
+      // net.unix.max_dgram_qlen caps queued *messages* (512 by default).
+      // Raising only SO_RCVBUF therefore often changes nothing — with a large
+      // receive buffer the message count is what runs out first. A peer that
+      // merely drains slowly recovers on its own; a peer that never drains
+      // this endpoint — a subscription in no waitset, never taken from — sits
+      // at the ceiling permanently and every later send to it fails.
       RMW_UDS_LOG_WARN_THROTTLE(
         1000,
-        "UDS send to '%s' dropped: subscriber recv buffer full (%zu bytes, errno=%s). "
-        "Slow subscriber or undersized SO_RCVBUF.",
-        dest_path.c_str(), total, std::strerror(err));
+        "UDS send on '%s' to '%s' dropped: peer's datagram queue is full "
+        "(%zu bytes, errno=%s). The queue is bounded by both SO_RCVBUF (bytes) "
+        "and net.unix.max_dgram_qlen (message count), whichever binds first. "
+        "If this never stops, the peer is not draining that subscription.",
+        endpoint_name, dest_path.c_str(), total, std::strerror(err));
       break;
     case ENOENT:
     case ECONNREFUSED:
@@ -178,14 +188,15 @@ SendResult send_to(
       // cached subscriber list lags one graph-generation behind reality.
       // Demote to debug to avoid scaring users at every node teardown.
       RMW_UDS_LOG_DEBUG(
-        "UDS send to '%s' skipped: peer gone (%s) — likely subscriber teardown",
-        dest_path.c_str(), std::strerror(err));
+        "UDS send on '%s' to '%s' skipped: peer gone (%s) — likely subscriber "
+        "teardown",
+        endpoint_name, dest_path.c_str(), std::strerror(err));
       break;
     default:
       RMW_UDS_LOG_WARN_THROTTLE(
         1000,
-        "UDS send to '%s' failed: %s (errno=%d, %zu bytes)",
-        dest_path.c_str(), std::strerror(err), err, total);
+        "UDS send on '%s' to '%s' failed: %s (errno=%d, %zu bytes)",
+        endpoint_name, dest_path.c_str(), std::strerror(err), err, total);
       break;
   }
   return result;
