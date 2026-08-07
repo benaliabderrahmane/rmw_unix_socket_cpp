@@ -44,10 +44,13 @@ enum RegistryEntryType : uint8_t
   ENTRY_SUBSCRIPTION,
   ENTRY_SERVICE,
   ENTRY_CLIENT,
-  // Transient claim state: a writer won the slot but has not yet committed its
-  // payload. Readers treat it like ENTRY_EMPTY so they never observe a slot
-  // before its payload is published. Never stored in a RegistryEntry; lives
-  // only in the slot's atomic state field, so it costs no struct layout.
+  // Transient claim state: someone owns the slot but its payload is not in a
+  // publishable state — either an adder has not yet committed its payload, or
+  // a remover has not yet finished erasing it. Readers treat it like
+  // ENTRY_EMPTY, and try_add_once only ever claims from ENTRY_EMPTY, so a slot
+  // parked here is neither observable nor reusable. Never stored in a
+  // RegistryEntry; lives only in the slot's atomic state field, so it costs no
+  // struct layout.
   ENTRY_RESERVED = 0xFF,
 };
 
@@ -99,11 +102,19 @@ static_assert(offsetof(RegistryEntry, qos_depth) == 1160, "RegistryEntry layout 
 //   4. s2 = seq.load(acquire); if (s1 != s2) retry (bounded retries, then skip)
 //
 // Protocol (remove):
-//   1. CAS state <current> -> EMPTY      (claims removal; loses race => abort)
+//   1. CAS state <current> -> RESERVED   (claims removal; loses race => abort)
 //   2. seq.fetch_add(1)                  -> begin payload teardown
-//   3. unlink(socket_path); memset payload
+//   3. copy out socket_path; memset payload
 //   4. seq.fetch_add(1)                  -> end teardown
-//   5. generation.fetch_add(1)
+//   5. state.store(EMPTY, release)       -> only now is the slot reusable
+//   6. generation.fetch_add(1)
+//   7. unlink(socket_path)               -> syscall, deliberately after step 5
+//
+// Step 5 must follow the teardown, not replace step 1: a slot published as
+// EMPTY while its payload is still being erased can be claimed by a concurrent
+// add, whose fresh payload the teardown then zeroes and whose live socket it
+// unlinks — leaving a slot with a valid type but an empty node_name that
+// cleanup_stale can never reclaim (it skips pid == 0).
 //
 // All atomics are lock-free + address-free (std::atomic<u8/u32>::is_always_lock_free
 // is true on every Linux target we support), so they work across process

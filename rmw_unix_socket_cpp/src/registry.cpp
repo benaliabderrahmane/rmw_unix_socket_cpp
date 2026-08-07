@@ -293,16 +293,21 @@ int32_t registry_add(RegistryHeader * header, const RegistryEntry & entry)
   return try_add_once(header, entry);
 }
 
-// Best-effort tear-down of a slot we already claimed (state already EMPTY).
-// Unlink the socket file and zero out the payload so the next reuse starts
-// from a clean state. Wrapped in a seqlock so any reader still in the middle
-// of a snapshot retries.
-static void teardown_slot(RegistryEntrySlot * slot)
+// Zero out the payload of a slot we already claimed (state already RESERVED)
+// so the next reuse starts from a clean state. Wrapped in a seqlock so any
+// reader still in the middle of a snapshot retries. The socket path is handed
+// back instead of unlinked here: the caller unlinks it only after publishing
+// ENTRY_EMPTY, which keeps that syscall out of the window where the slot is
+// claimed but not yet reusable. A process killed inside that window strands
+// the slot in RESERVED for good, so the window stays as short as the
+// equivalent one try_add_once already has.
+static void teardown_slot(
+  RegistryEntrySlot * slot,
+  char (& out_path)[sizeof(RegistryEntrySlot::socket_path)])
 {
   slot->seq.fetch_add(1, std::memory_order_acq_rel);
 
-  char path_copy[sizeof(slot->socket_path)];
-  std::memcpy(path_copy, slot->socket_path, sizeof(path_copy));
+  std::memcpy(out_path, slot->socket_path, sizeof(out_path));
 
   slot->pid = 0;
   std::memset(slot->gid, 0, sizeof(slot->gid));
@@ -317,11 +322,14 @@ static void teardown_slot(RegistryEntrySlot * slot)
   slot->qos_depth = 0;
 
   slot->seq.fetch_add(1, std::memory_order_acq_rel);
+}
 
-  // Unlink outside the seqlock — filesystem op, doesn't need to be observable
-  // by other readers atomically.
-  if (path_copy[0] != '\0') {
-    unlink(path_copy);
+// Unlink a socket path returned by teardown_slot. Filesystem op, doesn't need
+// to be observable by other readers atomically.
+static void unlink_torn_down_path(const char * path)
+{
+  if (path[0] != '\0') {
+    unlink(path);
   }
 }
 
@@ -333,18 +341,26 @@ void registry_remove(RegistryHeader * header, int32_t index)
   auto * slot = &registry_slots(header)[index];
 
   uint8_t st = slot->state.load(std::memory_order_acquire);
-  if (st == ENTRY_EMPTY) {
-    return;
+  if (st == ENTRY_EMPTY || st == ENTRY_RESERVED) {
+    return;  // already empty, or another remover/adder owns the slot
   }
-  // CAS state -> EMPTY. Winner owns the teardown.
+  // CAS state -> RESERVED. Winner owns the teardown. Parking the slot in
+  // RESERVED rather than EMPTY keeps try_add_once from claiming it while the
+  // payload is still being erased: publishing EMPTY first would let a
+  // concurrent add fill the slot and then have teardown_slot below zero the
+  // new owner's payload and unlink its live socket.
   if (!slot->state.compare_exchange_strong(
-      st, static_cast<uint8_t>(ENTRY_EMPTY),
+      st, static_cast<uint8_t>(ENTRY_RESERVED),
       std::memory_order_acq_rel, std::memory_order_relaxed))
   {
     return;  // someone else removed it
   }
-  teardown_slot(slot);
+  char path[sizeof(RegistryEntrySlot::socket_path)];
+  teardown_slot(slot, path);
+  // Payload is gone — now the slot is safe to hand out again.
+  slot->state.store(static_cast<uint8_t>(ENTRY_EMPTY), std::memory_order_release);
   header->generation.fetch_add(1, std::memory_order_acq_rel);
+  unlink_torn_down_path(path);
 }
 
 // Best-effort: stat /proc/<pid>. ENOENT means the PID is not in our
@@ -413,17 +429,29 @@ void registry_cleanup_stale(RegistryHeader * header)
       continue;  // slot was rewritten since snapshot — not the entry we vetted
     }
     // Try to claim the slot for removal. The CAS-expected value is the state
-    // we observed in the snapshot.
+    // we observed in the snapshot. Claim into RESERVED, not EMPTY, so the slot
+    // stays unclaimable until teardown_slot below has erased the payload —
+    // see registry_remove for why publishing EMPTY early corrupts live entries.
     uint8_t expected = snap.state.load(std::memory_order_relaxed);
     if (!slots[i].state.compare_exchange_strong(
-        expected, static_cast<uint8_t>(ENTRY_EMPTY),
+        expected, static_cast<uint8_t>(ENTRY_RESERVED),
         std::memory_order_acq_rel, std::memory_order_relaxed))
     {
       continue;  // raced with another remover / writer
     }
 
-    // Surface the reclaim so a crashed-node incident leaves a breadcrumb
-    // in the ROS log. WARN level — this is an ungraceful exit, not routine.
+    char path[sizeof(RegistryEntrySlot::socket_path)];
+    teardown_slot(&slots[i], path);
+    // Payload is gone — now the slot is safe to hand out again.
+    slots[i].state.store(static_cast<uint8_t>(ENTRY_EMPTY), std::memory_order_release);
+    header->generation.fetch_add(1, std::memory_order_acq_rel);
+    unlink_torn_down_path(path);
+
+    // Surface the reclaim so a crashed-node incident leaves a breadcrumb in
+    // the ROS log. WARN level — this is an ungraceful exit, not routine. Logged
+    // after the slot is released: formatting and writing a log line is orders
+    // of magnitude slower than the teardown, and the slot must not sit
+    // unclaimable for that long. Everything below is a local snapshot.
     RMW_UDS_LOG_WARN(
       "reclaimed stale registry slot %u: %s pid=%d node=%s%s topic=%s — "
       "owning process is gone (ungraceful exit)",
@@ -432,9 +460,6 @@ void registry_cleanup_stale(RegistryHeader * header)
       snap.node_namespace[0] ? snap.node_namespace : "",
       snap.node_name,
       snap.topic_name[0] ? snap.topic_name : "(none)");
-
-    teardown_slot(&slots[i]);
-    header->generation.fetch_add(1, std::memory_order_acq_rel);
   }
 }
 
