@@ -306,14 +306,17 @@ int32_t registry_add(RegistryHeader * header, const RegistryEntry & entry)
 }
 
 // Best-effort tear-down of a slot we already claimed (state already EMPTY).
-// Unlink the socket file and zero out the payload so the next reuse starts
-// from a clean state. Wrapped in a seqlock so any reader still in the middle
-// of a snapshot retries.
-static void teardown_slot(RegistryEntrySlot * slot)
+// Zero out the payload so the next reuse starts from a clean state, handing
+// the path back for the caller to unlink once the slot is released. Wrapped in
+// a seqlock so any reader still in the middle of a snapshot retries. The caller
+// must hold the slot in ENTRY_RESERVED: publishing it ENTRY_EMPTY first lets
+// try_add_once claim it and write the same payload concurrently.
+static void teardown_slot(
+  RegistryEntrySlot * slot,
+  char (& path_copy)[sizeof(RegistryEntrySlot::socket_path)])
 {
   slot->seq.fetch_add(1, std::memory_order_acq_rel);
 
-  char path_copy[sizeof(slot->socket_path)];
   std::memcpy(path_copy, slot->socket_path, sizeof(path_copy));
 
   slot->pid = 0;
@@ -329,7 +332,10 @@ static void teardown_slot(RegistryEntrySlot * slot)
   slot->qos_depth = 0;
 
   slot->seq.fetch_add(1, std::memory_order_acq_rel);
+}
 
+static void unlink_torn_down_path(const char * path_copy)
+{
   // Unlink outside the seqlock — filesystem op, doesn't need to be observable
   // by other readers atomically. A TRANSIENT_LOCAL publisher slot names its
   // latched-cache shm segment here (not a socket file), so a stale-PID reap
@@ -352,18 +358,21 @@ void registry_remove(RegistryHeader * header, int32_t index)
   auto * slot = &registry_slots(header)[index];
 
   uint8_t st = slot->state.load(std::memory_order_acquire);
-  if (st == ENTRY_EMPTY) {
+  if (st == ENTRY_EMPTY || st == ENTRY_RESERVED) {
     return;
   }
-  // CAS state -> EMPTY. Winner owns the teardown.
+  // CAS state -> RESERVED. Winner owns the teardown.
   if (!slot->state.compare_exchange_strong(
-      st, static_cast<uint8_t>(ENTRY_EMPTY),
+      st, static_cast<uint8_t>(ENTRY_RESERVED),
       std::memory_order_acq_rel, std::memory_order_relaxed))
   {
     return;  // someone else removed it
   }
-  teardown_slot(slot);
+  char path[sizeof(RegistryEntrySlot::socket_path)];
+  teardown_slot(slot, path);
+  slot->state.store(static_cast<uint8_t>(ENTRY_EMPTY), std::memory_order_release);
   header->generation.fetch_add(1, std::memory_order_acq_rel);
+  unlink_torn_down_path(path);
   if (st != ENTRY_DOORBELL) {  // doorbell slots have no wake consumers
     ring_doorbells(header);    // strictly after the bump — see ring_doorbells
   }
@@ -521,7 +530,7 @@ void registry_cleanup_stale(RegistryHeader * header)
     // we observed in the snapshot.
     uint8_t expected = snap.state.load(std::memory_order_relaxed);
     if (!slots[i].state.compare_exchange_strong(
-        expected, static_cast<uint8_t>(ENTRY_EMPTY),
+        expected, static_cast<uint8_t>(ENTRY_RESERVED),
         std::memory_order_acq_rel, std::memory_order_relaxed))
     {
       continue;  // raced with another remover / writer
@@ -538,8 +547,11 @@ void registry_cleanup_stale(RegistryHeader * header)
       snap.node_name,
       snap.topic_name[0] ? snap.topic_name : "(none)");
 
-    teardown_slot(&slots[i]);
+    char path[sizeof(RegistryEntrySlot::socket_path)];
+    teardown_slot(&slots[i], path);
+    slots[i].state.store(static_cast<uint8_t>(ENTRY_EMPTY), std::memory_order_release);
     header->generation.fetch_add(1, std::memory_order_acq_rel);
+    unlink_torn_down_path(path);
     if (expected != static_cast<uint8_t>(ENTRY_DOORBELL)) {
       reclaimed = true;  // doorbell-only reclaims ring nobody
     }
