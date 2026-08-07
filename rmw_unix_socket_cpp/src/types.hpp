@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -32,6 +33,7 @@
 #include "rmw/types.h"
 #include "rosidl_typesupport_fastrtps_cpp/message_type_support.h"
 
+#include "registry.hpp"
 #include "shm_transport.hpp"
 
 namespace rmw_uds
@@ -176,6 +178,21 @@ struct UdsContext
   // TRANSIENT_LOCAL publishers, for wait-side cache replay on graph change.
   std::mutex transient_local_pubs_mutex;
   std::vector<UdsPublisher *> transient_local_pubs;
+
+  // PERFORMANCE: graph introspection (rmw_graph.cpp) is polled — topic_tools
+  // discovery runs at 10 Hz per node — and every query scans the registry.
+  // Cache each distinct query keyed on the registry generation, exactly as the
+  // publisher and client hot paths do: unchanged generation means unchanged
+  // registry contents, so a steady-state graph costs one atomic load. The map
+  // holds one generation's worth of queries and is cleared when it advances.
+  std::mutex graph_cache_mutex;
+  uint64_t graph_cache_generation = 0;
+  std::map<std::string, std::shared_ptr<const std::vector<RegistryQueryResult>>> graph_cache;
+
+  // Reaping slots of ungracefully-exited processes costs one stat("/proc/<pid>")
+  // per live entity, so the graph read path runs it on an interval rather than
+  // on every query. 0 means "never swept by this context".
+  std::atomic<uint64_t> last_graph_cleanup_ns{0};
 };
 
 // Node data

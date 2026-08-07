@@ -16,8 +16,11 @@
 #include "registry.hpp"
 #include "types.hpp"
 
+#include <chrono>
 #include <cstring>
 #include <map>
+#include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -43,6 +46,61 @@ static rmw_uds::UdsContext * get_context(const rmw_node_t * node)
   return nd->context;
 }
 
+// How often the graph read path sweeps for slots left behind by processes that
+// died without deregistering. The sweep is O(live entities) in syscalls, so at
+// a 10 Hz discovery poll an unconditional sweep dominates every query. This
+// only bounds how long a crashed node's slots stay visible: rmw_init still
+// sweeps eagerly at startup, and registry_add still sweeps when the table fills.
+static constexpr uint64_t GRAPH_CLEANUP_INTERVAL_NS = 1000000000ull;  // 1 s
+
+static uint64_t steady_now_ns()
+{
+  return static_cast<uint64_t>(
+    std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+static void maybe_cleanup_stale(rmw_uds::UdsContext * ctx, rmw_uds::RegistryHeader * header)
+{
+  const uint64_t now = steady_now_ns();
+  uint64_t last = ctx->last_graph_cleanup_ns.load(std::memory_order_relaxed);
+  if (last != 0 && now - last < GRAPH_CLEANUP_INTERVAL_NS) {
+    return;
+  }
+  // Whoever wins the exchange sweeps; concurrent callers skip rather than pile
+  // up on the same scan.
+  if (!ctx->last_graph_cleanup_ns.compare_exchange_strong(
+      last, now, std::memory_order_relaxed, std::memory_order_relaxed))
+  {
+    return;
+  }
+  // Lock-free: cleanup_stale + query both use the per-slot seqlock protocol
+  // and may safely run concurrently with other readers/writers.
+  rmw_uds::registry_cleanup_stale(header);
+}
+
+// Key a cached query on everything that selects its result set. The leading
+// marker per field keeps a null filter distinct from an empty-string one, and
+// the unit separator cannot appear in a ROS name.
+static std::string graph_cache_key(
+  rmw_uds::RegistryEntryType type,
+  const char * topic,
+  const char * node_name,
+  const char * node_ns)
+{
+  std::string key;
+  key.reserve(96);
+  key += static_cast<char>('0' + static_cast<int>(type));
+  for (const char * field : {topic, node_name, node_ns}) {
+    key += '\x1f';
+    key += field ? '+' : '-';
+    if (field) {
+      key += field;
+    }
+  }
+  return key;
+}
+
 static std::vector<rmw_uds::RegistryQueryResult> query_all(
   rmw_uds::UdsContext * ctx,
   rmw_uds::RegistryEntryType type,
@@ -51,10 +109,36 @@ static std::vector<rmw_uds::RegistryQueryResult> query_all(
   const char * node_ns = nullptr)
 {
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
-  // Lock-free: cleanup_stale + query both use the per-slot seqlock protocol
-  // and may safely run concurrently with other readers/writers.
-  rmw_uds::registry_cleanup_stale(header);
-  return rmw_uds::registry_query(header, type, topic, node_name, node_ns);
+  maybe_cleanup_stale(ctx, header);
+
+  // Read the generation BEFORE querying. A mutation racing the scan then lands
+  // under the old generation and the next call re-queries; reading it after
+  // would let a torn result be cached as if it were current.
+  const uint64_t generation = rmw_uds::registry_generation(header);
+  const std::string key = graph_cache_key(type, topic, node_name, node_ns);
+
+  {
+    std::lock_guard<std::mutex> lock(ctx->graph_cache_mutex);
+    if (ctx->graph_cache_generation == generation) {
+      auto it = ctx->graph_cache.find(key);
+      if (it != ctx->graph_cache.end()) {
+        return *it->second;
+      }
+    }
+  }
+
+  auto results = rmw_uds::registry_query(header, type, topic, node_name, node_ns);
+
+  {
+    std::lock_guard<std::mutex> lock(ctx->graph_cache_mutex);
+    if (ctx->graph_cache_generation != generation) {
+      ctx->graph_cache.clear();
+      ctx->graph_cache_generation = generation;
+    }
+    ctx->graph_cache[key] =
+      std::make_shared<const std::vector<rmw_uds::RegistryQueryResult>>(results);
+  }
+  return results;
 }
 
 // Helper: build names_and_types from a map of topic -> set<type>

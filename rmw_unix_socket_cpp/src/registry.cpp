@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <sched.h>
+#include <unordered_map>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -474,6 +475,13 @@ void registry_cleanup_stale(RegistryHeader * header)
   uint32_t max = header->max_entries;
   if (hw < max) { max = hw; }
 
+  // One stat() per distinct pid rather than per slot. A process owns a node
+  // plus every endpoint under it, so on a large graph this is the difference
+  // between a syscall per entity and a syscall per process.
+  std::unordered_map<pid_t, bool> pid_alive;
+  // Highest occupied index seen, +1 — the bound the table could shrink to.
+  uint32_t highest_occupied = 0;
+
   for (uint32_t i = 0; i < max; ++i) {
     // Fast-skip empty slots without snapshotting, mirroring registry_query.
     // snapshot_slot would also bail on EMPTY, but only after loading seq; this
@@ -482,6 +490,12 @@ void registry_cleanup_stale(RegistryHeader * header)
     if (slots[i].state.load(std::memory_order_acquire) == ENTRY_EMPTY) {
       continue;
     }
+    // Anything not reclaimed below is still occupied and pins the bound;
+    // a successful reclaim restores the previous value since the slot is
+    // empty again.
+    const uint32_t prev_highest = highest_occupied;
+    highest_occupied = i + 1;
+
     RegistryEntrySlot snap;
     uint32_t snap_seq;
     if (!snapshot_slot(&slots[i], &snap, &snap_seq)) {
@@ -492,7 +506,11 @@ void registry_cleanup_stale(RegistryHeader * header)
       // whose payload is not yet written. Never reclaim it.
       continue;
     }
-    if (pid_is_alive_or_unreachable(snap.pid)) {
+    auto cached = pid_alive.find(snap.pid);
+    if (cached == pid_alive.end()) {
+      cached = pid_alive.emplace(snap.pid, pid_is_alive_or_unreachable(snap.pid)).first;
+    }
+    if (cached->second) {
       continue;
     }
     // ABA guard: a remove + live re-add of the same type leaves the state
@@ -526,7 +544,24 @@ void registry_cleanup_stale(RegistryHeader * header)
     teardown_slot(&slots[i]);
     header->generation.fetch_add(1, std::memory_order_acq_rel);
     reclaimed = true;
+    highest_occupied = prev_highest;
   }
+
+  // Lower the scan bound if the tail of the table drained. Without this the
+  // bound only ever grows, so a supervisor that restarts nodes ratchets every
+  // future scan towards max_entries and never recovers.
+  //
+  // Safe against a concurrent add because try_add_once widens the bound with a
+  // monotonic CAS *after* publishing its slot: an add that already widened past
+  // us makes this CAS fail, and one that has not yet widened will do so and
+  // restore the bound itself. The worst case is the same brief invisibility
+  // window any query racing an add already has.
+  if (highest_occupied < hw) {
+    uint32_t expected = hw;
+    header->high_water_slot.compare_exchange_strong(
+      expected, highest_occupied, std::memory_order_acq_rel, std::memory_order_relaxed);
+  }
+
   if (reclaimed) {
     ring_doorbells(header);  // strictly after the bump(s) — see ring_doorbells
   }
@@ -574,6 +609,18 @@ std::vector<RegistryQueryResult> registry_query(
     // the authoritative post-snapshot type re-check below, so results stay
     // seqlock-consistent. (RESERVED/EMPTY never equal a real type_filter.)
     if (type_filter != ENTRY_EMPTY && pre_state != static_cast<uint8_t>(type_filter)) {
+      continue;
+    }
+    // Topic pre-filter: skip the 1.1 kB snapshot for slots that cannot match.
+    // Querying one topic out of hundreds otherwise memcpy's every slot of the
+    // right type only to discard it. This read is not seqlock-protected, so
+    // bound it by the array size — a slot caught mid-write may not be
+    // NUL-terminated. The authoritative comparison is still the post-snapshot
+    // strcmp below; a torn read here can only lose the entry for one query,
+    // which snapshot_slot's bounded retry already permits.
+    if (topic_filter &&
+      std::strncmp(slots[i].topic_name, topic_filter, sizeof(slots[i].topic_name)) != 0)
+    {
       continue;
     }
 

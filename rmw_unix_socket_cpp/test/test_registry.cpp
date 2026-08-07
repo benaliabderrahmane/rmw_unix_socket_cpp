@@ -258,6 +258,61 @@ TEST_F(RegistryTest, HighWaterBoundsScanWithoutLosingTopEntry)
 // which is what cleanup_stale uses to decide an entry's owner is dead.
 static constexpr pid_t DEAD_PID = 2147483000;
 
+// cleanup_stale must lower high_water when the tail of the table drains,
+// otherwise a supervisor restarting nodes ratchets the bound up forever and
+// every later scan pays for slots that have long been empty. It must NOT lower
+// it past a live entry. Fails on a fix that only ever grows the bound, and on
+// one that shrinks to the reclaimed range regardless of what is still live.
+TEST_F(RegistryTest, CleanupStaleLowersHighWaterButNotPastLiveEntries)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+
+  auto add = [&](pid_t pid, const char * name) {
+      rmw_uds::RegistryEntry e;
+      std::memset(&e, 0, sizeof(e));
+      e.type = rmw_uds::ENTRY_NODE;
+      e.pid = pid;
+      std::strncpy(e.node_name, name, sizeof(e.node_name) - 1);
+      int32_t k = rmw_uds::registry_add(header, e);
+      EXPECT_GE(k, 0);
+      return k;
+    };
+
+  // Live at slot 0, dead at 1..4 -> bound is 5, tail is reclaimable.
+  int32_t live_idx = add(getpid(), "alive");
+  for (int i = 1; i < 5; ++i) {
+    char n[32];
+    std::snprintf(n, sizeof(n), "ghost_%d", i);
+    add(DEAD_PID, n);
+  }
+  ASSERT_EQ(5u, header->high_water_slot.load());
+
+  rmw_uds::registry_cleanup_stale(header);
+
+  // Only slot 0 is still occupied, so the bound must come back down to 1.
+  EXPECT_EQ(1u, header->high_water_slot.load());
+  auto remaining = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_NODE, nullptr, nullptr, nullptr);
+  ASSERT_EQ(1u, remaining.size());
+  EXPECT_EQ("alive", remaining[0].node_name);
+
+  // Now put a live entry above dead ones: the bound must stay high enough to
+  // keep it visible.
+  add(DEAD_PID, "ghost_low");
+  int32_t live_top = add(getpid(), "alive_top");
+  ASSERT_EQ(3u, header->high_water_slot.load());
+
+  rmw_uds::registry_cleanup_stale(header);
+
+  EXPECT_EQ(3u, header->high_water_slot.load());
+  auto top = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_NODE, nullptr, "alive_top", nullptr);
+  EXPECT_EQ(1u, top.size());
+
+  rmw_uds::registry_remove(header, live_idx);
+  rmw_uds::registry_remove(header, live_top);
+}
+
 TEST_F(RegistryTest, CleanupStaleRemovesDeadPidEntries)
 {
   auto * header = rmw_uds::registry_header(registry_ptr);
