@@ -26,6 +26,7 @@
 #include <set>
 #include <string>
 #include <unistd.h>
+#include <unordered_map>
 #include <vector>
 
 #include "rmw/event_callback_type.h"
@@ -59,6 +60,16 @@ inline std::string make_ros_type_name(const char * ns, const char * name)
   result += "/";
   result += name;
   return result;
+}
+
+// Process-wide monotonic id, stamped on every entity that can be armed in a
+// wait set. Never reused, so a wait set can tell "the same fd armed for the
+// same entity" from "the same fd number handed to a different entity after a
+// close".
+inline uint64_t next_entity_uid()
+{
+  static std::atomic<uint64_t> counter{1};
+  return counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 struct UdsGid
@@ -239,6 +250,7 @@ struct UdsPublisher
 // Subscription data
 struct UdsSubscription
 {
+  uint64_t uid = next_entity_uid();
   UdsGid gid;
   std::string topic_name;
   std::string type_name;
@@ -277,6 +289,7 @@ struct CachedClient
 // Service server data
 struct UdsService
 {
+  uint64_t uid = next_entity_uid();
   UdsGid gid;
   std::string service_name;
   std::string type_name;
@@ -312,6 +325,7 @@ struct UdsService
 // Service client data
 struct UdsClient
 {
+  uint64_t uid = next_entity_uid();
   UdsGid gid;
   std::string service_name;
   std::string type_name;
@@ -349,7 +363,28 @@ struct UdsClient
 // Guard condition data
 struct UdsGuardCondition
 {
+  // Wait-set arming identity; see next_entity_uid().
+  uint64_t uid = next_entity_uid();
   int eventfd_fd = -1;
+};
+
+// What a given epoll fd was armed for. Lets rmw_wait map an epoll result back
+// to its owner without scanning the wait set, and skip the epoll_ctl when the
+// fd is already armed for the same entity.
+enum ArmedKind : uint8_t
+{
+  ARMED_SUBSCRIPTION = 0,
+  ARMED_SERVICE,
+  ARMED_CLIENT,
+  ARMED_GUARD_CONDITION,
+  ARMED_DOORBELL,
+};
+
+struct ArmedEntry
+{
+  uint8_t kind = ARMED_SUBSCRIPTION;  // ArmedKind
+  void * entity = nullptr;            // UdsSubscription * etc, for the drain
+  uint64_t uid = 0;                   // 0 for the doorbell, which has no entity
 };
 
 // Wait set data
@@ -360,6 +395,12 @@ struct UdsWaitSet
   // context even when the wait set holds only guard conditions (rclcpp's
   // GraphListener), so it cannot be scavenged from the waited-on entities.
   UdsContext * context = nullptr;
+  // fd -> what it was armed for. Survives across rmw_wait calls, which is what
+  // lets the arming pass cost no syscall in the steady state. Entries for
+  // destroyed entities are harmless: closing the fd removes it from the epoll
+  // set, so it can never be reported again, and a fd number reused by a new
+  // entity is re-armed because the uid differs.
+  std::unordered_map<int, ArmedEntry> armed;
 };
 
 }  // namespace rmw_uds
