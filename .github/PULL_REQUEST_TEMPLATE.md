@@ -24,7 +24,7 @@ If yes, please explain how user-experience changes with this pull request.
 <!--
 Which tests did you add or run, and on which ROS 2 distro?
 For a bug fix, a test that fails before the change and passes after it is the best evidence.
-CI builds and tests on jazzy, kilted and rolling.
+CI builds and tests run on jazzy, kilted and rolling.
 -->
 
 ### Did you use Generative AI?
