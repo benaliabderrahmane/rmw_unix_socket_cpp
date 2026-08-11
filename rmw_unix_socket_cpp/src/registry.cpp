@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstring>
 #include <sched.h>
+#include <vector>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -68,6 +69,7 @@ static void initialize_header(RegistryHeader * header, size_t total_size)
   header->max_entries = REGISTRY_MAX_ENTRIES;
   header->generation.store(0, std::memory_order_relaxed);
   header->high_water_slot.store(0, std::memory_order_relaxed);
+  header->doorbell_generation.store(0, std::memory_order_relaxed);
 
   pthread_mutexattr_t attr;
   pthread_mutexattr_init(&attr);
@@ -280,6 +282,13 @@ static int32_t try_add_once(RegistryHeader * header, const RegistryEntry & entry
       while (cur < want &&
              !header->high_water_slot.compare_exchange_weak(
                cur, want, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+      // Same ordering argument as high_water_slot: sequenced before the release
+      // generation bump, so a ringer that synchronizes on the generation also
+      // sees that its cached doorbell list is stale and rebuilds it. Getting
+      // this backwards would let a just-started process miss wakeups.
+      if (entry.type == ENTRY_DOORBELL) {
+        header->doorbell_generation.fetch_add(1, std::memory_order_relaxed);
+      }
       header->generation.fetch_add(1, std::memory_order_acq_rel);
       ring_doorbells(header);  // strictly after the bump — see ring_doorbells
       return static_cast<int32_t>(i);
@@ -350,6 +359,9 @@ void registry_remove(RegistryHeader * header, int32_t index)
     return;  // someone else removed it
   }
   teardown_slot(slot);
+  if (st == ENTRY_DOORBELL) {
+    header->doorbell_generation.fetch_add(1, std::memory_order_relaxed);
+  }
   header->generation.fetch_add(1, std::memory_order_acq_rel);
   ring_doorbells(header);  // strictly after the bump — see ring_doorbells
 }
@@ -392,26 +404,77 @@ static const char * entry_type_name(uint8_t t)
 // means the peer already has a wakeup queued; other send errors mean a dead
 // peer whose slot will be reclaimed. Scans slots directly (not registry_query,
 // which calls back into cleanup and would recurse).
+// Send one wake octet, best-effort. EAGAIN gets one retry on a fresh fd:
+// AF_UNIX datagrams stay charged to the SENDER's buffer until the receiver
+// consumes them, so a peer that never drains can exhaust this fd's budget and
+// make sendto fail for every OTHER peer too. Resetting the fd releases that
+// budget so one hung participant cannot mute the whole domain. Bounding the
+// receiver's queue (see the doorbell SO_RCVBUF in rmw_init) shrinks how much
+// any one peer can pin, but does not remove the effect, so the reset stays.
+// Regression cover: LatchedTopicSurvivesAnUnresponsiveParticipant.
+static void ring_one(int & fd, const struct sockaddr_un & addr)
+{
+  const uint8_t octet = 1;
+  const ssize_t sent = sendto(
+    fd, &octet, 1, MSG_DONTWAIT | MSG_NOSIGNAL,
+    reinterpret_cast<const struct sockaddr *>(&addr), sizeof(addr));
+  if (sent >= 0 || (errno != EAGAIN && errno != EWOULDBLOCK)) {
+    return;  // Delivered, or the peer is gone and its slot will be reclaimed.
+  }
+  close(fd);
+  fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    return;
+  }
+  // EAGAIN again on a fresh fd means this peer's own queue is full, so a
+  // wakeup is already pending there and dropping this one is safe.
+  (void)sendto(
+    fd, &octet, 1, MSG_DONTWAIT | MSG_NOSIGNAL,
+    reinterpret_cast<const struct sockaddr *>(&addr), sizeof(addr));
+}
+
 static void ring_doorbells(RegistryHeader * header)
 {
-  // One ring socket per mutating thread, closed at thread exit. AF_UNIX
-  // datagrams stay charged to the SENDER's buffer until the receiver consumes
-  // them, so a peer that is slow to drain could exhaust this fd's budget and
-  // make sendto fail for every OTHER peer too; the recreate-on-EAGAIN below
-  // resets that budget. On a fresh fd, EAGAIN can only mean the destination's
-  // own queue is full — a wakeup is already pending there, so the drop is safe.
-  struct RingFd
+  // One ring socket per mutating thread, closed at thread exit, plus the
+  // doorbell addresses this thread last resolved. Rebuilding that list means
+  // scanning every used slot to find the handful that are doorbells, so it is
+  // keyed on doorbell_generation, which only moves when a process registers or
+  // drops its doorbell. Entity churn therefore rings straight from the vector.
+  struct RingState
   {
     int fd = -1;
-    ~RingFd() {if (fd >= 0) {close(fd);}}
+    uint32_t built_at = 0;
+    bool primed = false;
+    std::vector<struct sockaddr_un> addrs;
+    ~RingState() {if (fd >= 0) {close(fd);}}
   };
-  static thread_local RingFd ring;
+  static thread_local RingState ring;
   if (ring.fd < 0) {
     ring.fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (ring.fd < 0) {
       return;
     }
   }
+
+  // Read the doorbell generation BEFORE the scan. If a doorbell is registered
+  // during the scan we may miss it here, but then this load happened before
+  // that registration, which happened before the new process reads the
+  // generation it is about to block on — so our own generation bump, which
+  // already happened before this call, is visible in that read. The wakeup is
+  // carried by the generation instead of the datagram, and the next ring
+  // rebuilds. No lost wakeup either way.
+  const uint32_t dgen = header->doorbell_generation.load(std::memory_order_acquire);
+  if (ring.primed && ring.built_at == dgen) {
+    for (const auto & cached : ring.addrs) {
+      if (ring.fd < 0) {
+        return;
+      }
+      ring_one(ring.fd, cached);
+    }
+    return;
+  }
+
+  ring.addrs.clear();
   auto * slots = registry_slots(header);
   const uint32_t hi = header->high_water_slot.load(std::memory_order_acquire);
   for (uint32_t i = 0; i < hi; ++i) {
@@ -445,24 +508,14 @@ static void ring_doorbells(RegistryHeader * header)
     // memcpy of the measured length: addr is zeroed, so termination is free
     // and -Wstringop-truncation stays quiet (path may fill all 108 bytes).
     std::memcpy(addr.sun_path, path, strnlen(path, sizeof(addr.sun_path) - 1));
-    const uint8_t octet = 1;
-    ssize_t sent = sendto(
-      ring.fd, &octet, 1, MSG_DONTWAIT | MSG_NOSIGNAL,
-      reinterpret_cast<const struct sockaddr *>(&addr), sizeof(addr));
-    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-      // Sender-side budget exhausted (some peer is slow to drain): reset the
-      // budget and retry once, so one undrained doorbell cannot mute rings to
-      // healthy peers. EAGAIN again on the fresh fd is the benign case.
-      close(ring.fd);
-      ring.fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-      if (ring.fd < 0) {
-        return;
-      }
-      (void)sendto(
-        ring.fd, &octet, 1, MSG_DONTWAIT | MSG_NOSIGNAL,
-        reinterpret_cast<const struct sockaddr *>(&addr), sizeof(addr));
+    ring.addrs.push_back(addr);
+    if (ring.fd < 0) {
+      return;
     }
+    ring_one(ring.fd, addr);
   }
+  ring.built_at = dgen;
+  ring.primed = true;
 }
 
 void registry_cleanup_stale(RegistryHeader * header)
@@ -524,6 +577,9 @@ void registry_cleanup_stale(RegistryHeader * header)
       snap.topic_name[0] ? snap.topic_name : "(none)");
 
     teardown_slot(&slots[i]);
+    if (expected == ENTRY_DOORBELL) {
+      header->doorbell_generation.fetch_add(1, std::memory_order_relaxed);
+    }
     header->generation.fetch_add(1, std::memory_order_acq_rel);
     reclaimed = true;
   }

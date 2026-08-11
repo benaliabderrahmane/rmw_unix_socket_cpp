@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <sys/socket.h>
 #include <sys/stat.h>
 
 #include "identifier.hpp"
@@ -208,6 +209,24 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
       delete ctx;
       RMW_SET_ERROR_MSG("failed to create doorbell socket");
       return RMW_RET_ERROR;
+    }
+    // Shrink the receive buffer that create_bound_socket sized for real data.
+    // A doorbell datagram carries no payload, it only says "the registry
+    // changed", so a queue of them is pure redundancy: rmw_wait drains the
+    // whole queue and re-reads the registry once. Bounding the queue makes the
+    // kernel coalesce the storm for us — a ringer hits EAGAIN and drops the
+    // extra ring instead of appending to a queue hundreds deep, and the drain
+    // side reads a couple of datagrams rather than hundreds. The kernel doubles
+    // this and floors it at SOCK_MIN_RCVBUF, so a handful still fit, which is
+    // all the no-lost-wakeup pairing needs.
+    const int doorbell_rcvbuf = 1024;
+    if (setsockopt(
+        ctx->doorbell_fd, SOL_SOCKET, SO_RCVBUF,
+        &doorbell_rcvbuf, sizeof(doorbell_rcvbuf)) != 0)
+    {
+      RMW_UDS_LOG_WARN(
+        "rmw_init: could not shrink doorbell SO_RCVBUF: %s — "
+        "wakeup datagrams may queue deeper than needed", std::strerror(errno));
     }
     rmw_uds::RegistryEntry dentry;
     std::memset(&dentry, 0, sizeof(dentry));

@@ -34,7 +34,11 @@ static constexpr uint32_t REGISTRY_MAX_ENTRIES = 32768;
 // Layout v3: per-slot seqlock + atomic state. No global mutex on hot paths.
 // Layout v4: adds a monotonic high_water_slot bound to the header so query and
 // cleanup scan only the used slot prefix instead of all REGISTRY_MAX_ENTRIES.
-static constexpr uint32_t REGISTRY_VERSION = 4;
+// Layout v5: adds doorbell_generation. Same size and same slot offset as v4
+// (it lands in existing tail padding), but a v4 writer never bumps it, which
+// would let a v5 reader keep a stale doorbell cache and miss wakeups. The
+// version tag keeps the two apart, so upgrade a domain all at once.
+static constexpr uint32_t REGISTRY_VERSION = 5;
 
 enum RegistryEntryType : uint8_t
 {
@@ -156,6 +160,13 @@ struct RegistryHeader
   // query/cleanup scan only [0, high_water_slot) instead of all max_entries.
   // Only grows; over-scan is always safe, so reads need no strict ordering.
   std::atomic<uint32_t> high_water_slot;
+  // Bumped only when an ENTRY_DOORBELL slot is claimed or released, which
+  // happens once per process rather than once per entity. ring_doorbells caches
+  // the doorbell addresses and rebuilds that cache only when this changes, so
+  // the common mutation rings straight from the cache instead of scanning every
+  // slot. Lands in the tail padding after high_water_slot, so sizeof and the
+  // slot offset are unchanged (see the offset guard below).
+  std::atomic<uint32_t> doorbell_generation;
 };
 
 // Header layout guard: only the integer prefix is asserted. The total size
@@ -165,6 +176,13 @@ static_assert(offsetof(RegistryHeader, version) == 0, "RegistryHeader layout cha
 static_assert(offsetof(RegistryHeader, max_entries) == 4, "RegistryHeader layout changed");
 static_assert(offsetof(RegistryHeader, generation) == 8, "RegistryHeader layout changed");
 static_assert(offsetof(RegistryHeader, init_mutex) == 16, "RegistryHeader layout changed");
+// doorbell_generation must sit in the padding that already followed
+// high_water_slot. If this ever moves, every slot moves with it and the shm
+// becomes incompatible with the same REGISTRY_VERSION.
+static_assert(
+  offsetof(RegistryHeader, doorbell_generation) ==
+  offsetof(RegistryHeader, high_water_slot) + sizeof(uint32_t),
+  "doorbell_generation must pack into the tail padding after high_water_slot");
 
 // Open or create the shared memory registry for the given domain_id.
 // Returns fd >= 0 on success, sets *out_ptr and *out_size.

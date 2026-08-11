@@ -19,7 +19,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 
 #include "../src/registry.hpp"
 
@@ -257,6 +259,91 @@ TEST_F(RegistryTest, HighWaterBoundsScanWithoutLosingTopEntry)
 // A PID that is extremely unlikely to exist. /proc/<this> should be ENOENT,
 // which is what cleanup_stale uses to decide an entry's owner is dead.
 static constexpr pid_t DEAD_PID = 2147483000;
+
+// ring_doorbells caches the doorbell addresses and only rebuilds that cache
+// when doorbell_generation moves. If a newly registered doorbell failed to move
+// it, every process that had already warmed its cache would stop ringing the
+// new one, and that process would sit blocked through graph changes it should
+// have seen. This is the regression guard for that.
+TEST_F(RegistryTest, RingReachesADoorbellRegisteredAfterTheCacheWasWarmed)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+
+  auto bind_doorbell = [&](const char * path) {
+      unlink(path);
+      int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+      if (fd < 0) {return -1;}
+      struct sockaddr_un addr;
+      std::memset(&addr, 0, sizeof(addr));
+      addr.sun_family = AF_UNIX;
+      std::strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+      if (bind(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
+        close(fd);
+        return -1;
+      }
+      return fd;
+    };
+  auto register_doorbell = [&](const char * path) {
+      rmw_uds::RegistryEntry e;
+      std::memset(&e, 0, sizeof(e));
+      e.type = rmw_uds::ENTRY_DOORBELL;
+      e.pid = getpid();
+      std::strncpy(e.socket_path, path, sizeof(e.socket_path) - 1);
+      return rmw_uds::registry_add(header, e);
+    };
+  auto drain = [](int fd) {
+      uint8_t buf[16];
+      int n = 0;
+      while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {++n;}
+      return n;
+    };
+  auto add_plain_entry = [&](const char * name) {
+      rmw_uds::RegistryEntry e;
+      std::memset(&e, 0, sizeof(e));
+      e.type = rmw_uds::ENTRY_NODE;
+      e.pid = getpid();
+      std::strncpy(e.node_name, name, sizeof(e.node_name) - 1);
+      return rmw_uds::registry_add(header, e);
+    };
+
+  const char * path_a = "/tmp/rmw_uds_test_doorbell_a.sock";
+  const char * path_b = "/tmp/rmw_uds_test_doorbell_b.sock";
+  const int fd_a = bind_doorbell(path_a);
+  const int fd_b = bind_doorbell(path_b);
+  ASSERT_GE(fd_a, 0);
+  ASSERT_GE(fd_b, 0);
+
+  const int32_t idx_a = register_doorbell(path_a);
+  ASSERT_GE(idx_a, 0);
+  drain(fd_a);
+
+  // Warm this thread's cache: a plain mutation rings only A.
+  const int32_t idx_n1 = add_plain_entry("warmer");
+  ASSERT_GE(idx_n1, 0);
+  EXPECT_GT(drain(fd_a), 0) << "the only registered doorbell was not rung";
+
+  // B joins after the cache was built, then another plain mutation. B must be
+  // rung, which only happens if registering it invalidated the cache.
+  const int32_t idx_b = register_doorbell(path_b);
+  ASSERT_GE(idx_b, 0);
+  drain(fd_a);
+  drain(fd_b);
+
+  const int32_t idx_n2 = add_plain_entry("after_b");
+  ASSERT_GE(idx_n2, 0);
+  EXPECT_GT(drain(fd_b), 0) <<
+    "a doorbell registered after the cache was warmed never got rung";
+  EXPECT_GT(drain(fd_a), 0) << "the original doorbell stopped being rung";
+
+  rmw_uds::registry_remove(header, idx_n1);
+  rmw_uds::registry_remove(header, idx_n2);
+  rmw_uds::registry_remove(header, idx_a);
+  rmw_uds::registry_remove(header, idx_b);
+  close(fd_a);
+  close(fd_b);
+  unlink(path_a);
+  unlink(path_b);
+}
 
 TEST_F(RegistryTest, CleanupStaleRemovesDeadPidEntries)
 {
