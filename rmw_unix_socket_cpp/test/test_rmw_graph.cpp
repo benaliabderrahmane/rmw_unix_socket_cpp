@@ -17,6 +17,9 @@
 #include <cstring>
 #include <string>
 
+#include "../src/registry.hpp"
+#include "../src/types.hpp"
+
 #include "test_msgs/msg/basic_types.hpp"
 
 #include "rmw/get_topic_names_and_types.h"
@@ -44,6 +47,54 @@ TEST_F(RmwUdsNodeTest, GetNodeNames)
 
   auto _r1 [[maybe_unused]] = rcutils_string_array_fini(&names);
   auto _r2 [[maybe_unused]] = rcutils_string_array_fini(&namespaces);
+}
+
+// registry_cleanup_stale walks every live slot and stats /proc/<pid> for each
+// one. That is garbage collection, and it must not run on every graph query.
+TEST_F(RmwUdsNodeTest, GraphQueryThrottlesStaleCleanup)
+{
+  auto * nd = static_cast<rmw_uds::UdsNode *>(node->data);
+  auto * header = rmw_uds::registry_header(nd->context->registry_ptr);
+
+  // A PID that cannot be running, so cleanup_stale sees the entry as dead.
+  constexpr pid_t DEAD_PID = 2147483000;
+  auto add_ghost = [&](const char * name) {
+      rmw_uds::RegistryEntry e;
+      std::memset(&e, 0, sizeof(e));
+      e.type = rmw_uds::ENTRY_NODE;
+      e.pid = DEAD_PID;
+      std::strncpy(e.node_name, name, sizeof(e.node_name) - 1);
+      return rmw_uds::registry_add(header, e);
+    };
+
+  auto graph_lists = [&](const char * name) {
+      rcutils_string_array_t names = rcutils_get_zero_initialized_string_array();
+      rcutils_string_array_t namespaces = rcutils_get_zero_initialized_string_array();
+      EXPECT_EQ(RMW_RET_OK, rmw_get_node_names(node, &names, &namespaces));
+      bool found = false;
+      for (size_t i = 0; i < names.size; ++i) {
+        if (std::string(names.data[i]) == name) {
+          found = true;
+        }
+      }
+      auto _r1 [[maybe_unused]] = rcutils_string_array_fini(&names);
+      auto _r2 [[maybe_unused]] = rcutils_string_array_fini(&namespaces);
+      return found;
+    };
+
+  // The first query after a quiet period does sweep, so this one is reclaimed.
+  ASSERT_GE(add_ghost("ghost_first"), 0);
+  EXPECT_FALSE(graph_lists("ghost_first")) <<
+    "the first graph query should still reclaim dead slots";
+
+  // A second dead slot added immediately must survive: the sweep is throttled,
+  // so the very next query does not pay for another full stat() pass.
+  const int32_t second = add_ghost("ghost_second");
+  ASSERT_GE(second, 0);
+  EXPECT_TRUE(graph_lists("ghost_second")) <<
+    "cleanup_stale ran again right away; the throttle is not in effect";
+
+  rmw_uds::registry_remove(header, second);
 }
 
 TEST_F(RmwUdsNodeTest, CountPublishersAndSubscribers)

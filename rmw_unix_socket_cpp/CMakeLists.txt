@@ -197,8 +197,11 @@ if(BUILD_TESTING)
   target_link_libraries(test_rmw_wait ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_wait PRIVATE src)
 
-  # RMW API: graph introspection
-  ament_add_gtest(test_rmw_graph test/test_rmw_graph.cpp)
+  # RMW API: graph introspection. registry.cpp is compiled in as well so the
+  # test can seed the shared registry directly; the rmw library does not export
+  # those internal symbols. Both copies act on the same shared memory, and the
+  # registry keeps no per-process state, so this is safe.
+  ament_add_gtest(test_rmw_graph test/test_rmw_graph.cpp src/registry.cpp)
   target_link_libraries(test_rmw_graph ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_graph PRIVATE src)
 
