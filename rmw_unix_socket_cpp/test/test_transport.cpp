@@ -14,10 +14,13 @@
 
 #include <gtest/gtest.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include "../src/transport.hpp"
@@ -98,6 +101,41 @@ TEST_F(TransportTest, RecvFromEmptyReturnsF)
   EXPECT_FALSE(rmw_uds::recv_from(fd, hdr, payload));
 
   rmw_uds::close_socket(fd, path);
+}
+
+TEST_F(TransportTest, RecvFromConsumesZeroLengthDatagram)
+{
+  auto path = rmw_uds::make_socket_path(domain_id, "zerolen");
+  int recv_fd = rmw_uds::create_bound_socket(path);
+  ASSERT_GE(recv_fd, 0);
+
+  int send_fd = rmw_uds::create_send_socket();
+  ASSERT_GE(send_fd, 0);
+
+  struct sockaddr_un addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+  ASSERT_EQ(
+    0, sendto(
+      send_fd, nullptr, 0, 0,
+      reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)));
+
+  // A zero-length datagram carries no WireHeader, so it is not a message.
+  rmw_uds::WireHeader hdr;
+  std::vector<uint8_t> payload;
+  EXPECT_FALSE(rmw_uds::recv_from(recv_fd, hdr, payload));
+
+  // It must still have been consumed. MSG_PEEK does not dequeue, so leaving it
+  // would keep the socket readable forever and spin every wait polling this fd.
+  char probe = 0;
+  errno = 0;
+  const ssize_t left = recv(recv_fd, &probe, sizeof(probe), MSG_DONTWAIT | MSG_PEEK);
+  EXPECT_EQ(-1, left) << "zero-length datagram was left queued on the socket";
+  EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+
+  close(send_fd);
+  rmw_uds::close_socket(recv_fd, path);
 }
 
 TEST_F(TransportTest, MultipleMessages)
