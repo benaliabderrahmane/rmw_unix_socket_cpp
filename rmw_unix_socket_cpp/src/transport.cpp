@@ -216,6 +216,13 @@ bool recv_from(
     return false;
   }
   if (n == 0) {
+    // A zero-length datagram carries no WireHeader, so it is not a message.
+    // The peek above did not dequeue it, so it has to be consumed here:
+    // leaving it queued keeps the socket permanently readable, which spins
+    // every wait that polls this fd.
+    char discard;
+    (void)recv(socket_fd, &discard, sizeof(discard), MSG_DONTWAIT);
+    RMW_UDS_LOG_WARN_THROTTLE(5000, "UDS recv: zero-length datagram — dropped");
     return false;
   }
 
