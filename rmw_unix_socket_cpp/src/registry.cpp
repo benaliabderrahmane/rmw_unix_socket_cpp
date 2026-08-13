@@ -281,7 +281,13 @@ static int32_t try_add_once(RegistryHeader * header, const RegistryEntry & entry
              !header->high_water_slot.compare_exchange_weak(
                cur, want, std::memory_order_relaxed, std::memory_order_relaxed)) {}
       header->generation.fetch_add(1, std::memory_order_acq_rel);
-      ring_doorbells(header);  // strictly after the bump — see ring_doorbells
+      // Strictly after the bump — see ring_doorbells. Doorbell registration
+      // itself rings nobody: the slot is invisible to queries, no consumer
+      // exists for the wake, and ringing here would let K graph-waiting
+      // processes registering at launch produce a K^2/2 datagram mini-storm.
+      if (entry.type != ENTRY_DOORBELL) {
+        ring_doorbells(header);
+      }
       return static_cast<int32_t>(i);
     }
   }
@@ -325,9 +331,16 @@ static void teardown_slot(RegistryEntrySlot * slot)
   slot->seq.fetch_add(1, std::memory_order_acq_rel);
 
   // Unlink outside the seqlock — filesystem op, doesn't need to be observable
-  // by other readers atomically.
+  // by other readers atomically. A TRANSIENT_LOCAL publisher slot names its
+  // latched-cache shm segment here (not a socket file), so a stale-PID reap
+  // reclaims the dead publisher's cache promptly instead of leaking it until
+  // the next rmw_init sweep.
   if (path_copy[0] != '\0') {
-    unlink(path_copy);
+    if (std::strncmp(path_copy, "/ros2_uds_tl_", 13) == 0) {
+      shm_unlink(path_copy);
+    } else {
+      unlink(path_copy);
+    }
   }
 }
 
@@ -351,7 +364,9 @@ void registry_remove(RegistryHeader * header, int32_t index)
   }
   teardown_slot(slot);
   header->generation.fetch_add(1, std::memory_order_acq_rel);
-  ring_doorbells(header);  // strictly after the bump — see ring_doorbells
+  if (st != ENTRY_DOORBELL) {  // doorbell slots have no wake consumers
+    ring_doorbells(header);    // strictly after the bump — see ring_doorbells
+  }
 }
 
 // Best-effort: stat /proc/<pid>. ENOENT means the PID is not in our
@@ -525,7 +540,9 @@ void registry_cleanup_stale(RegistryHeader * header)
 
     teardown_slot(&slots[i]);
     header->generation.fetch_add(1, std::memory_order_acq_rel);
-    reclaimed = true;
+    if (expected != static_cast<uint8_t>(ENTRY_DOORBELL)) {
+      reclaimed = true;  // doorbell-only reclaims ring nobody
+    }
   }
   if (reclaimed) {
     ring_doorbells(header);  // strictly after the bump(s) — see ring_doorbells

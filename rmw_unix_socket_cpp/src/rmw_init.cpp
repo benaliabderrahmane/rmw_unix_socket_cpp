@@ -193,13 +193,16 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
 
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
 
-  // Doorbell: bind + register BEFORE the first generation snapshot below, so
-  // no registry mutation can land in the gap between the snapshot and the
-  // wakeup wiring (a mutation after registration rings this socket; one
-  // before it is covered by the snapshot).
+  // Doorbell: bind the socket now so the fd is stable for every rmw_wait, but
+  // do NOT register the ENTRY_DOORBELL slot yet. Registration is lazy, from
+  // the first rmw_wait whose wait set holds a graph guard condition (see
+  // rmw_wait.cpp): with TRANSIENT_LOCAL replay pull-based, only graph-event
+  // consumers need registry wakeups, so plain pub/sub processes never ring —
+  // a fleet launch sends ~zero doorbell datagrams instead of mutations x
+  // processes. The lazy path replicates this bind-before-register ordering.
   {
-    const std::string ctl_path = rmw_uds::make_socket_path(domain_id, "ctl");
-    ctx->doorbell_fd = rmw_uds::create_bound_socket(ctl_path);
+    ctx->doorbell_path = rmw_uds::make_socket_path(domain_id, "ctl");
+    ctx->doorbell_fd = rmw_uds::create_bound_socket(ctx->doorbell_path);
     if (ctx->doorbell_fd < 0) {
       RMW_UDS_LOG_ERROR(
         "rmw_init: failed to create doorbell socket (domain_id=%zu)", domain_id);
@@ -207,23 +210,6 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
       rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);
       delete ctx;
       RMW_SET_ERROR_MSG("failed to create doorbell socket");
-      return RMW_RET_ERROR;
-    }
-    rmw_uds::RegistryEntry dentry;
-    std::memset(&dentry, 0, sizeof(dentry));
-    dentry.type = rmw_uds::ENTRY_DOORBELL;
-    dentry.pid = getpid();
-    std::strncpy(dentry.socket_path, ctl_path.c_str(), sizeof(dentry.socket_path) - 1);
-    ctx->doorbell_registry_index = rmw_uds::registry_add(header, dentry);
-    if (ctx->doorbell_registry_index < 0) {
-      RMW_UDS_LOG_ERROR(
-        "rmw_init: registry full — cannot register doorbell (domain_id=%zu)", domain_id);
-      close(ctx->doorbell_fd);
-      unlink(ctl_path.c_str());
-      close(ctx->send_socket_fd);
-      rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);
-      delete ctx;
-      RMW_SET_ERROR_MSG("registry full — cannot register doorbell");
       return RMW_RET_ERROR;
     }
   }
@@ -303,10 +289,13 @@ rmw_ret_t rmw_context_fini(rmw_context_t * context)
   auto * ctx = reinterpret_cast<rmw_uds::UdsContext *>(context->impl);
   if (ctx) {
     // Doorbell teardown before the registry unmaps: registry_remove's slot
-    // teardown also unlinks the socket file.
+    // teardown also unlinks the socket file. When the doorbell was never
+    // lazily registered there is no slot, so unlink the socket file here.
     if (ctx->doorbell_registry_index >= 0 && ctx->registry_ptr) {
       auto * header = rmw_uds::registry_header(ctx->registry_ptr);
       rmw_uds::registry_remove(header, ctx->doorbell_registry_index);
+    } else if (!ctx->doorbell_path.empty()) {
+      unlink(ctx->doorbell_path.c_str());
     }
     if (ctx->doorbell_fd >= 0) {
       close(ctx->doorbell_fd);

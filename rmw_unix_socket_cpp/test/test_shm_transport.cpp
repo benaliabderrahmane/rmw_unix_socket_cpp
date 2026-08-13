@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -24,6 +25,7 @@
 #include <unistd.h>
 
 #include "../src/shm_transport.hpp"
+#include "../src/types.hpp"  // WireHeader, for the tl_ring latched cache
 
 class ShmTransportTest : public ::testing::Test
 {
@@ -306,4 +308,89 @@ TEST_F(ShmTransportTest, CommitOverReservationIsRejected)
   auto wire = stage(payload);
   ASSERT_TRUE(rmw_uds::shm_fetch_payload(cache, domain_id, wire));
   EXPECT_EQ(payload, wire);
+}
+
+// --- TRANSIENT_LOCAL latched cache (tl_ring) ---
+
+static rmw_uds::WireHeader make_tl_header(int64_t seq)
+{
+  rmw_uds::WireHeader hdr;
+  std::memset(&hdr, 0, sizeof(hdr));
+  hdr.gid[0] = 0xAB;
+  hdr.gid[8] = 0xCD;  // context-id byte: part of the full-GID validation
+  hdr.sequence_number = seq;
+  hdr.msg_type = 0;
+  return hdr;
+}
+
+TEST_F(ShmTransportTest, TlRingLatchAndPullRoundTrip)
+{
+  rmw_uds::TlRingWriter ring;
+  uint8_t gid[16] = {0xAB, 0, 0, 0, 0, 0, 0, 0, 0xCD, 0, 0, 0, 0, 0, 0, 0};
+  ASSERT_TRUE(rmw_uds::tl_ring_create(ring, domain_id, gid, 5));
+
+  for (int64_t i = 1; i <= 8; ++i) {  // 8 > depth 5: oldest three lap out
+    auto hdr = make_tl_header(i);
+    std::vector<uint8_t> payload(64, static_cast<uint8_t>(i));
+    hdr.payload_size = static_cast<uint32_t>(payload.size());
+    ASSERT_TRUE(rmw_uds::tl_ring_latch(
+        ring, domain_id, hdr, payload.data(), payload.size(), nullptr, nullptr));
+  }
+
+  std::vector<rmw_uds::TlPulledRecord> records;
+  int64_t max_seq = 0;
+  ASSERT_TRUE(rmw_uds::tl_ring_pull(ring.shm_name, gid, 10, records, max_seq));
+  EXPECT_EQ(8, max_seq);
+  ASSERT_EQ(5u, records.size());
+  for (size_t i = 0; i < records.size(); ++i) {
+    EXPECT_EQ(static_cast<int64_t>(4 + i), records[i].sequence_number);
+    EXPECT_EQ(static_cast<uint8_t>(4 + i), records[i].payload.at(0));
+  }
+
+  // Wrong expected GID (stale-segment defense): the pull must refuse.
+  uint8_t wrong_gid[16] = {0xAB, 0, 0, 0, 0, 0, 0, 0, 0xEE, 0, 0, 0, 0, 0, 0, 0};
+  EXPECT_FALSE(rmw_uds::tl_ring_pull(ring.shm_name, wrong_gid, 10, records, max_seq));
+
+  rmw_uds::tl_ring_close(ring);
+  EXPECT_FALSE(rmw_uds::tl_ring_pull(ring.shm_name, gid, 10, records, max_seq));
+}
+
+TEST_F(ShmTransportTest, TlRingPullSkipsPoisonedSlotAndReturnsPromptly)
+{
+  // A publisher killed mid-latch leaves one slot's seqlock odd forever. The
+  // pull must skip exactly that slot after bounded retries — never spin, and
+  // never discard the rest of the history.
+  rmw_uds::TlRingWriter ring;
+  uint8_t gid[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+  ASSERT_TRUE(rmw_uds::tl_ring_create(ring, domain_id, gid, 4));
+
+  for (int64_t i = 1; i <= 4; ++i) {
+    auto hdr = make_tl_header(i);
+    std::vector<uint8_t> payload(32, static_cast<uint8_t>(i));
+    hdr.payload_size = static_cast<uint32_t>(payload.size());
+    ASSERT_TRUE(rmw_uds::tl_ring_latch(
+        ring, domain_id, hdr, payload.data(), payload.size(), nullptr, nullptr));
+  }
+
+  // Poison slot 1 (record seq 2) the way a SIGKILL mid-write would: odd seq.
+  auto * record = reinterpret_cast<rmw_uds::ShmRecordHeader *>(
+    ring.base + 64 /* header area */ + 1 * ring.slot_bytes);
+  record->seq.store(2 * 2 - 1, std::memory_order_release);
+
+  const auto t0 = std::chrono::steady_clock::now();
+  std::vector<rmw_uds::TlPulledRecord> records;
+  int64_t max_seq = 0;
+  ASSERT_TRUE(rmw_uds::tl_ring_pull(ring.shm_name, gid, 10, records, max_seq));
+  const auto elapsed = std::chrono::steady_clock::now() - t0;
+
+  EXPECT_LT(
+    std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count(), 500)
+    << "pull must not spin on a dead writer's odd seqlock";
+  ASSERT_EQ(3u, records.size()) << "only the poisoned slot may be skipped";
+  EXPECT_EQ(1, records[0].sequence_number);
+  EXPECT_EQ(3, records[1].sequence_number);
+  EXPECT_EQ(4, records[2].sequence_number);
+  EXPECT_EQ(4, max_seq);
+
+  rmw_uds::tl_ring_close(ring);
 }

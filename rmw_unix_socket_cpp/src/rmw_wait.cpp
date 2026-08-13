@@ -18,13 +18,12 @@
 #include "types.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
-#include <iterator>
 #include <limits>
-#include <memory>
-#include <set>
+#include <map>
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -64,7 +63,8 @@ static void drain_socket(
   rmw_uds::ShmReaderCache & shm_cache,
   size_t domain_id,
   bool ignore_local = false,
-  uint64_t context_id = 0)
+  uint64_t context_id = 0,
+  std::map<std::array<uint8_t, 16>, int64_t> * replay_watermarks = nullptr)
 {
   rmw_uds::WireHeader hdr;
   std::vector<uint8_t> payload;
@@ -73,6 +73,24 @@ static void drain_socket(
     if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != expected_msg_type) {
       payload.clear();
       continue;
+    }
+    if (replay_watermarks) {
+      // TRANSIENT_LOCAL dedup (subscriptions only): drop a datagram whose
+      // sample the creation-time pull already delivered. Checked before the
+      // descriptor resolve so a duplicate never maps a segment.
+      std::array<uint8_t, 16> key;
+      std::memcpy(key.data(), hdr.gid, key.size());
+      bool dup = false;
+      {
+        std::lock_guard<std::mutex> lock(queue_mutex);
+        auto it = replay_watermarks->find(key);
+        dup = it != replay_watermarks->end() &&
+          hdr.sequence_number <= it->second;
+      }
+      if (dup) {
+        payload.clear();
+        continue;
+      }
     }
     if (!rmw_uds::shm_resolve_incoming(shm_cache, domain_id, hdr, payload)) {
       payload.clear();
@@ -179,7 +197,8 @@ rmw_ret_t rmw_wait(
       auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
       drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
         sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id,
-        sub->ignore_local_publications, sub->context->context_id);
+        sub->ignore_local_publications, sub->context->context_id,
+        &sub->replayed_watermarks);
     }
   }
 
@@ -201,12 +220,58 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  // 2. Check graph generation changes — trigger graph guard conditions.
-  // The context comes from the wait set itself (set at rmw_create_wait_set):
-  // a guard-condition-only wait set (rclcpp's GraphListener) has no entity to
-  // scavenge it from, and this check must run for those waits too. Wrapped in
-  // a lambda so the step-4 loop can re-run it on each doorbell wake.
+  // 2. Graph-event wiring. The context comes from the wait set itself (set at
+  // rmw_create_wait_set): a guard-condition-only wait set (rclcpp's
+  // GraphListener) has no entity to scavenge it from, and this must run for
+  // those waits too.
   rmw_uds::UdsContext * ctx = ws_data->context;
+
+  // Lazy doorbell registration: only graph-event consumers need registry
+  // wakeups (TRANSIENT_LOCAL replay is pull-based and needs no wake at all),
+  // so the ENTRY_DOORBELL slot is registered on the first wait whose set
+  // holds one of this context's graph guard conditions. Ordering mirrors the
+  // eager rmw_init recipe this replaces: the socket was bound at rmw_init,
+  // registration happens HERE — strictly before the generation check below —
+  // so a mutation either predates the registration (caught by the check) or
+  // rings the already-bound socket. Registration failure (registry full)
+  // leaves the flag unlatched and retries on the next wait; it never turns
+  // the wait into an error.
+  if (ctx && ctx->registry_ptr && guard_conditions &&
+    !ctx->doorbell_registered.load(std::memory_order_acquire))
+  {
+    bool has_graph_gc = false;
+    {
+      std::lock_guard<std::mutex> gc_lock(ctx->graph_gcs_mutex);
+      for (size_t i = 0;
+        !has_graph_gc && i < guard_conditions->guard_condition_count; ++i)
+      {
+        for (auto * gc : ctx->graph_gcs) {
+          if (gc && gc->data == guard_conditions->guard_conditions[i]) {
+            has_graph_gc = true;
+            break;
+          }
+        }
+      }
+    }
+    if (has_graph_gc) {
+      std::lock_guard<std::mutex> reg_lock(ctx->doorbell_reg_mutex);
+      if (!ctx->doorbell_registered.load(std::memory_order_relaxed)) {
+        auto * reg_header = rmw_uds::registry_header(ctx->registry_ptr);
+        rmw_uds::RegistryEntry dentry;
+        std::memset(&dentry, 0, sizeof(dentry));
+        dentry.type = rmw_uds::ENTRY_DOORBELL;
+        dentry.pid = getpid();
+        std::strncpy(dentry.socket_path, ctx->doorbell_path.c_str(),
+          sizeof(dentry.socket_path) - 1);
+        const int32_t idx = rmw_uds::registry_add(reg_header, dentry);
+        if (idx >= 0) {
+          ctx->doorbell_registry_index = idx;
+          ctx->doorbell_registered.store(true, std::memory_order_release);
+        }
+      }
+    }
+  }
+
   const int doorbell_fd = ctx ? ctx->doorbell_fd : -1;
   auto run_generation_check = [&]() {
       // Drain the doorbell strictly BEFORE reading the generation: paired with
@@ -225,63 +290,6 @@ rmw_ret_t rmw_wait(
     uint64_t gen = rmw_uds::registry_generation(header);
     if (gen != ctx->last_registry_generation.load(std::memory_order_relaxed)) {
       ctx->last_registry_generation.store(gen, std::memory_order_relaxed);
-
-      // TRANSIENT_LOCAL late-joiner replay. Lock held across the loop —
-      // rmw_destroy_publisher takes the same mutex then deletes, so this
-      // is what keeps each pub pointer alive while we dereference it.
-      std::lock_guard<std::mutex> tl_lock(ctx->transient_local_pubs_mutex);
-      for (auto * pub : ctx->transient_local_pubs) {
-        std::shared_ptr<const std::vector<std::string>> sub_paths;
-        {
-          std::lock_guard<std::mutex> sc_lock(pub->sub_cache_mutex);
-          if (rmw_uds::registry_generation(header) != pub->cached_generation) {
-            auto subs = rmw_uds::registry_query(
-              header, rmw_uds::ENTRY_SUBSCRIPTION,
-              pub->topic_name.c_str(), nullptr, nullptr);
-            auto fresh = std::make_shared<std::vector<std::string>>();
-            fresh->reserve(subs.size());
-            for (const auto & s : subs) {
-              if (!s.socket_path.empty()) {
-                fresh->push_back(s.socket_path);
-              }
-            }
-            pub->cached_generation = rmw_uds::registry_generation(header);
-            pub->cached_subscriber_paths = std::move(fresh);
-
-            // Prune known subscribers no longer present, against the freshly-
-            // built canonical list while STILL holding sub_cache_mutex (nested
-            // lock order sub_cache_mutex -> cache_mutex), so a concurrent
-            // refresh (e.g. from rmw_publish) cannot make the pruning set stale
-            // and erase a still-live late-joiner.
-            std::lock_guard<std::mutex> prune_lock(pub->cache_mutex);
-            std::set<std::string> current(
-              pub->cached_subscriber_paths->begin(),
-              pub->cached_subscriber_paths->end());
-            for (auto it = pub->known_subscriber_paths.begin();
-              it != pub->known_subscriber_paths.end(); )
-            {
-              it = (current.count(*it) == 0) ?
-                pub->known_subscriber_paths.erase(it) : std::next(it);
-            }
-          }
-          sub_paths = pub->cached_subscriber_paths;
-        }
-        std::lock_guard<std::mutex> c_lock(pub->cache_mutex);
-        if (!sub_paths) {
-          continue;
-        }
-        for (const auto & path : *sub_paths) {
-          if (pub->known_subscriber_paths.count(path) != 0) {
-            continue;
-          }
-          pub->known_subscriber_paths.insert(path);
-          for (const auto & cm : pub->message_cache) {
-            rmw_uds::send_to(
-              ctx->send_socket_fd,
-              path, cm.header, cm.payload.data(), cm.payload.size());
-          }
-        }
-      }
 
       // Wake graph listeners: trigger every node's graph guard condition
       // (rclcpp's GraphListener waits on these). rmw_destroy_node removes a
@@ -425,7 +433,7 @@ rmw_ret_t rmw_wait(
   // deadline. There is no internal poll: a registry mutation in any process
   // rings this context's doorbell (ring_doorbells in registry.cpp), which
   // wakes the epoll; the doorbell is drained, the registry re-checked
-  // (TRANSIENT_LOCAL late-joiner replay + graph guard conditions), and — if
+  // (graph guard conditions; TRANSIENT_LOCAL replay is pull-based), and — if
   // nothing the caller waits on became ready — the wait re-blocks.
   // RMW_RET_TIMEOUT surfaces only at the caller's own deadline; an infinite
   // wait never surfaces a synthetic timeout. EINTR re-enters the loop, so a
@@ -465,7 +473,7 @@ rmw_ret_t rmw_wait(
         }
       }
       if (rang) {
-        run_generation_check();  // Drains the doorbell, replays, triggers GCs.
+        run_generation_check();  // Drains the doorbell, triggers graph GCs.
       }
       if (!only_doorbell) {
         break;  // Something the caller waits on fired -> fall through to drain.

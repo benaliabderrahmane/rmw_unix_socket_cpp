@@ -138,14 +138,6 @@ TEST_F(QosTest, TransientLocalLargeMessageUsesDurableShm)
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
 
   auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    ASSERT_EQ(1u, pub_data->message_cache.size());
-    const auto & cm = pub_data->message_cache.back();
-    EXPECT_NE(nullptr, cm.shm_seg)
-      << "a large TRANSIENT_LOCAL message must be cached in a durable shm segment";
-    EXPECT_TRUE(cm.header.msg_type & rmw_uds::SHM_PAYLOAD_FLAG);
-  }
   EXPECT_EQ(nullptr, pub_data->shm_ring.base)
     << "TRANSIENT_LOCAL must use a durable segment, never the cycling ring";
 
@@ -198,13 +190,6 @@ TEST_F(QosTest, TransientLocalHugeMessageLateJoiner)
     big.uint8_values[i] = static_cast<uint8_t>((i * 131 + 7) & 0xFF);
   }
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &big, nullptr));
-
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    ASSERT_EQ(1u, pub_data->message_cache.size());
-    EXPECT_NE(nullptr, pub_data->message_cache.back().shm_seg);
-  }
 
   // Late joiner, then a small publish to trigger replay of the cached 5 MB msg.
   auto sub_opts = rmw_get_default_subscription_options();
@@ -267,11 +252,14 @@ TEST_F(QosTest, TransientLocalPublishReturnsErrorOnEMSGSIZE)
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
-TEST_F(QosTest, TransientLocalLargeMessageInlineFallbackWhenShmUnavailable)
+TEST_F(QosTest, TransientLocalLargeMessageNotLatchedWhenShmUnavailable)
 {
-  // When shm staging is unavailable, a large latched payload falls back to
-  // caching inline (no durable segment, no SHM_PAYLOAD_FLAG) and is still
-  // delivered byte-equal to a late joiner. The test seam forces the failure.
+  // When shm staging is unavailable, a large latched payload cannot enter the
+  // pull cache (there is nowhere durable to put it): the publish still
+  // returns OK, an EXISTING subscriber still receives the sample live as an
+  // inline datagram, and a late joiner gets nothing — the documented
+  // degradation of pull-based replay, replacing the old inline-heap fallback
+  // that the deleted push machinery could still replay.
   auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
     test_msgs::msg::UnboundedSequences>();
   auto qos = make_qos(
@@ -280,6 +268,11 @@ TEST_F(QosTest, TransientLocalLargeMessageInlineFallbackWhenShmUnavailable)
   auto pub_opts = rmw_get_default_publisher_options();
   auto * pub = rmw_create_publisher(node, seq_ts, "/tl_fallback", &qos, &pub_opts);
   ASSERT_NE(nullptr, pub);
+
+  // Existing subscriber: must receive the sample live despite shm being down.
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * live_sub = rmw_create_subscription(node, seq_ts, "/tl_fallback", &qos, &sub_opts);
+  ASSERT_NE(nullptr, live_sub);
 
   setenv("RMW_UDS_TEST_FORCE_SHM_FAILURE", "1", 1);
   test_msgs::msg::UnboundedSequences msg;
@@ -290,30 +283,22 @@ TEST_F(QosTest, TransientLocalLargeMessageInlineFallbackWhenShmUnavailable)
   EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
   unsetenv("RMW_UDS_TEST_FORCE_SHM_FAILURE");  // reset before it leaks to other tests
 
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    ASSERT_EQ(1u, pub_data->message_cache.size());
-    const auto & cm = pub_data->message_cache.back();
-    EXPECT_EQ(nullptr, cm.shm_seg)
-      << "shm forced unavailable — the large payload must be cached inline";
-    EXPECT_FALSE(cm.header.msg_type & rmw_uds::SHM_PAYLOAD_FLAG);
-  }
-
-  auto sub_opts = rmw_get_default_subscription_options();
-  auto * sub = rmw_create_subscription(node, seq_ts, "/tl_fallback", &qos, &sub_opts);
-  ASSERT_NE(nullptr, sub);
-  test_msgs::msg::UnboundedSequences trigger;
-  trigger.uint8_values = {5, 6, 7};
-  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &trigger, nullptr));
-
   test_msgs::msg::UnboundedSequences recv;
   bool taken = false;
-  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
-  ASSERT_TRUE(taken) << "late joiner must receive the inline-fallback message";
+  EXPECT_EQ(RMW_RET_OK, rmw_take(live_sub, &recv, &taken, nullptr));
+  ASSERT_TRUE(taken) << "existing subscriber must receive the inline live send";
   EXPECT_EQ(msg.uint8_values, recv.uint8_values);
 
-  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  // Late joiner: the sample was never latched, so nothing is replayed.
+  auto * late_sub = rmw_create_subscription(node, seq_ts, "/tl_fallback", &qos, &sub_opts);
+  ASSERT_NE(nullptr, late_sub);
+  taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take(late_sub, &recv, &taken, nullptr));
+  EXPECT_FALSE(taken) <<
+    "a sample that could not be latched must not reach a late joiner";
+
+  auto _r0 [[maybe_unused]] = rmw_destroy_subscription(node, late_sub);
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, live_sub);
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
@@ -385,12 +370,6 @@ TEST_F(QosTest, TransientLocalSerializedLargeMessageLateJoiner)
 
   // Publish BEFORE any subscriber — must be cached in a durable segment.
   EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &serialized, nullptr));
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    ASSERT_EQ(1u, pub_data->message_cache.size());
-    EXPECT_NE(nullptr, pub_data->message_cache.back().shm_seg);
-  }
 
   auto sub_opts = rmw_get_default_subscription_options();
   auto * sub = rmw_create_subscription(node, ts, "/tl_serialized_huge", &qos, &sub_opts);
@@ -419,100 +398,6 @@ TEST_F(QosTest, TransientLocalSerializedLargeMessageLateJoiner)
   auto _f [[maybe_unused]] = rmw_serialized_message_fini(&received);
   std::free(serialized.buffer);
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
-  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
-}
-
-TEST_F(QosTest, KnownSubscriberPathsPrunedOnChurn)
-{
-  // The publisher's known_subscriber_paths must not accumulate dead entries as
-  // subscribers churn: each create/destroy bumps the registry generation, and a
-  // restarted subscriber gets a brand-new unique socket path. Without pruning on
-  // refresh the set is insert-only and grows by one per churned subscriber.
-  auto qos = make_qos(
-    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
-    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
-
-  auto pub_opts = rmw_get_default_publisher_options();
-  auto * pub = rmw_create_publisher(node, ts, "/churn", &qos, &pub_opts);
-  ASSERT_NE(nullptr, pub);
-
-  // Seed the cache so there is something to replay.
-  test_msgs::msg::BasicTypes seed;
-  seed.int32_value = 1;
-  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &seed, nullptr));
-
-  auto sub_opts = rmw_get_default_subscription_options();
-  constexpr int kChurn = 8;
-  for (int i = 0; i < kChurn; ++i) {
-    // New sub bumps generation -> next publish refreshes + records this sub.
-    auto * sub = rmw_create_subscription(node, ts, "/churn", &qos, &sub_opts);
-    ASSERT_NE(nullptr, sub);
-    test_msgs::msg::BasicTypes m;
-    m.int32_value = i + 2;
-    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
-    // Destroy bumps generation again; next publish refreshes + prunes the gone sub.
-    auto _r [[maybe_unused]] = rmw_destroy_subscription(node, sub);
-    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
-  }
-
-  // After the loop every churned sub is destroyed, so known should be empty.
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  size_t known_size = 0;
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    known_size = pub_data->known_subscriber_paths.size();
-  }
-  // With the prune: tracks only live subs (0 here). Without it: grows to kChurn.
-  EXPECT_LE(known_size, 1u)
-    << "known_subscriber_paths leaked dead entries: size=" << known_size;
-
-  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
-}
-
-TEST_F(QosTest, TransientLocalSerializedKnownSubscriberPathsPrunedOnChurn)
-{
-  // Same prune guarantee as KnownSubscriberPathsPrunedOnChurn, but driven
-  // through rmw_publish_serialized_message, which carries its own copy of the
-  // prune-on-refresh logic. Guards against that copy silently diverging: without
-  // the prune the serialized path's known_subscriber_paths grows by one per
-  // churned subscriber.
-  auto qos = make_qos(
-    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
-    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
-
-  auto pub_opts = rmw_get_default_publisher_options();
-  auto * pub = rmw_create_publisher(node, ts, "/churn_serialized", &qos, &pub_opts);
-  ASSERT_NE(nullptr, pub);
-
-  uint8_t bytes[] = {1, 2, 3, 4, 5, 6, 7, 8};
-  rmw_serialized_message_t msg;
-  msg.buffer = bytes;
-  msg.buffer_length = sizeof(bytes);
-  msg.buffer_capacity = sizeof(bytes);
-  msg.allocator = rcutils_get_default_allocator();
-
-  // Seed the cache so there is something to replay.
-  EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &msg, nullptr));
-
-  auto sub_opts = rmw_get_default_subscription_options();
-  constexpr int kChurn = 8;
-  for (int i = 0; i < kChurn; ++i) {
-    auto * sub = rmw_create_subscription(node, ts, "/churn_serialized", &qos, &sub_opts);
-    ASSERT_NE(nullptr, sub);
-    EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &msg, nullptr));
-    auto _r [[maybe_unused]] = rmw_destroy_subscription(node, sub);
-    EXPECT_EQ(RMW_RET_OK, rmw_publish_serialized_message(pub, &msg, nullptr));
-  }
-
-  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
-  size_t known_size = 0;
-  {
-    std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    known_size = pub_data->known_subscriber_paths.size();
-  }
-  EXPECT_LE(known_size, 1u)
-    << "serialized-path known_subscriber_paths leaked dead entries: size=" << known_size;
-
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
@@ -1134,4 +1019,261 @@ TEST_F(QosTest, TransientLocalLateJoinerWhilePublisherProcessIdle)
   auto _r2 [[maybe_unused]] = rmw_destroy_wait_set(ws);
   auto _r3 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
   auto _r4 [[maybe_unused]] = rmw_destroy_guard_condition(gc);
+}
+
+// --- Pull-based TRANSIENT_LOCAL replay (latched-cache pull) ---
+
+TEST_F(QosTest, TransientLocalPullDeliversWithNoWaitAnywhere)
+{
+  // The strongest form of the idle-publisher scenario: NO thread in this
+  // process ever enters rmw_wait, so there is no doorbell drain and no
+  // wait-side replay. A late joiner must still receive the latched history,
+  // immediately, because it pulls the publisher's latched cache itself at
+  // rmw_create_subscription.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/pull_no_wait", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  for (int i = 1; i <= 3; ++i) {
+    test_msgs::msg::BasicTypes msg;
+    msg.int32_value = i * 10;
+    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+  }
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/pull_no_wait", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  // No sleeps, no rmw_wait: the history must already be in the queue.
+  int got = 0;
+  for (int i = 0; i < 5; ++i) {
+    test_msgs::msg::BasicTypes recv;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    if (!taken) {break;}
+    EXPECT_EQ((got + 1) * 10, recv.int32_value);  // oldest-first, in seq order
+    ++got;
+  }
+  EXPECT_EQ(3, got) <<
+    "late joiner did not receive the latched history without a wait cycle";
+
+  auto _p1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalPullNoDuplicateWithLivePublish)
+{
+  // Publish latched history, join, then publish one live sample. The
+  // subscriber must see each sample exactly once: the pull covers the history,
+  // the datagram covers the live sample, and the per-publisher sequence
+  // watermark dedups any overlap.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 10);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/pull_dedup", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  for (int i = 1; i <= 3; ++i) {
+    test_msgs::msg::BasicTypes msg;
+    msg.int32_value = i;
+    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+  }
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/pull_dedup", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  test_msgs::msg::BasicTypes live;
+  live.int32_value = 4;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &live, nullptr));
+
+  // Drain with retries: the live datagram needs a moment to land.
+  std::vector<int32_t> seen;
+  for (int i = 0; i < 200 && seen.size() < 4; ++i) {
+    test_msgs::msg::BasicTypes recv;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    if (taken) {
+      seen.push_back(recv.int32_value);
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+  ASSERT_EQ(4u, seen.size()) << "expected the 3 latched + 1 live samples";
+  for (int i = 0; i < 4; ++i) {
+    EXPECT_EQ(i + 1, seen[i]);  // exactly once each, in order
+  }
+  // And nothing further: no duplicate from replay-vs-datagram overlap.
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    test_msgs::msg::BasicTypes recv;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    EXPECT_FALSE(taken) << "duplicate sample delivered";
+  }
+
+  auto _p1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalPullRespectsIgnoreLocal)
+{
+  // Same context, ignore_local_publications=true: the pulled history must be
+  // filtered exactly like the datagram path filters live samples, or a
+  // transform/republish node feeds back its own latched output.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/pull_ignore_local", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  test_msgs::msg::BasicTypes msg;
+  msg.int32_value = 42;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub_opts.ignore_local_publications = true;
+  auto * sub = rmw_create_subscription(node, ts, "/pull_ignore_local", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  test_msgs::msg::BasicTypes recv;
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+  EXPECT_FALSE(taken) <<
+    "same-context latched history delivered despite ignore_local_publications";
+
+  auto _p1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalPullSubscriberChurnRedelivers)
+{
+  // Destroy + recreate a subscription on the same topic: the NEW subscription
+  // is a new endpoint and must receive the full latched history again (its own
+  // pull), exactly once. This replaces the old known_subscriber_paths pruning
+  // tests, which pinned the deleted push-side machinery.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/pull_churn", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  test_msgs::msg::BasicTypes msg;
+  msg.int32_value = 5;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  for (int round = 0; round < 3; ++round) {
+    auto * sub = rmw_create_subscription(node, ts, "/pull_churn", &qos, &sub_opts);
+    ASSERT_NE(nullptr, sub);
+
+    test_msgs::msg::BasicTypes recv;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    EXPECT_TRUE(taken) << "round " << round << ": latched history not redelivered";
+    if (taken) {
+      EXPECT_EQ(5, recv.int32_value);
+    }
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    EXPECT_FALSE(taken) << "round " << round << ": history delivered twice";
+
+    auto _p [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  }
+
+  auto _p2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalConcurrentPublishChurnStress)
+{
+  // Merge gate for the pull design: subscriptions churn while a publisher
+  // thread latches continuously. Every subscription must observe its
+  // publisher's samples exactly once (no pull/datagram duplicate, no
+  // watermark-swallowed sample) and in sequence order — the pull runs
+  // concurrently with ring overwrites, so this exercises the per-record
+  // seqlock snapshot and the store-buffering fence pair under real load.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 10);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/pull_stress", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  std::atomic<bool> stop{false};
+  std::atomic<int32_t> published{0};
+  std::thread publisher_thread(
+    [&] {
+      int32_t v = 0;
+      while (!stop.load()) {
+        test_msgs::msg::BasicTypes m;
+        m.int32_value = ++v;
+        if (rmw_publish(pub, &m, nullptr) != RMW_RET_OK) {
+          break;
+        }
+        published.store(v);
+      }
+    });
+
+  // Churn: each round joins mid-stream, drains for a moment, and must see a
+  // strictly increasing, duplicate-free value sequence.
+  auto sub_opts = rmw_get_default_subscription_options();
+  for (int round = 0; round < 20; ++round) {
+    auto * sub = rmw_create_subscription(node, ts, "/pull_stress", &qos, &sub_opts);
+    ASSERT_NE(nullptr, sub);
+    int32_t last = 0;
+    int received = 0;
+    for (int i = 0; i < 40; ++i) {
+      test_msgs::msg::BasicTypes recv;
+      bool taken = false;
+      ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+      if (!taken) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        continue;
+      }
+      EXPECT_GT(recv.int32_value, last)
+        << "round " << round << ": duplicate or out-of-order sample "
+        << recv.int32_value << " after " << last;
+      last = recv.int32_value;
+      ++received;
+    }
+    EXPECT_GT(received, 0) << "round " << round << ": no samples at all";
+    auto _r [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  }
+
+  stop.store(true);
+  publisher_thread.join();
+
+  // Quiesced late joiner: must receive exactly the newest depth samples, in
+  // order — the latched history and nothing else.
+  const int32_t total = published.load();
+  ASSERT_GE(total, 20);
+  auto * final_sub = rmw_create_subscription(node, ts, "/pull_stress", &qos, &sub_opts);
+  ASSERT_NE(nullptr, final_sub);
+  std::vector<int32_t> tail;
+  for (int i = 0; i < 15; ++i) {
+    test_msgs::msg::BasicTypes recv;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(final_sub, &recv, &taken, nullptr));
+    if (!taken) {break;}
+    tail.push_back(recv.int32_value);
+  }
+  ASSERT_EQ(10u, tail.size()) << "expected exactly depth latched samples";
+  for (size_t i = 0; i < tail.size(); ++i) {
+    EXPECT_EQ(total - 9 + static_cast<int32_t>(i), tail[i])
+      << "latched history is not the newest-depth suffix in order";
+  }
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, final_sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
