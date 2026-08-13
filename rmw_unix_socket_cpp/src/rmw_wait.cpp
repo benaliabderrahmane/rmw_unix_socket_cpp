@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "identifier.hpp"
+#include "logging.hpp"
 #include "registry.hpp"
 #include "transport.hpp"
 #include "types.hpp"
@@ -236,6 +237,7 @@ rmw_ret_t rmw_wait(
   // rings the already-bound socket. Registration failure (registry full)
   // leaves the flag unlatched and retries on the next wait; it never turns
   // the wait into an error.
+  bool graph_gc_unwired = false;  // graph GC waited on, doorbell unregistered
   if (ctx && ctx->registry_ptr && guard_conditions &&
     !ctx->doorbell_registered.load(std::memory_order_acquire))
   {
@@ -267,6 +269,17 @@ rmw_ret_t rmw_wait(
         if (idx >= 0) {
           ctx->doorbell_registry_index = idx;
           ctx->doorbell_registered.store(true, std::memory_order_release);
+        } else {
+          // Registry full: this graph wait has no wakeup wiring. Returning an
+          // error would be executor-fatal, and blocking unbounded would lose
+          // graph events forever, so the block below is bounded instead: the
+          // wait degrades to a coarse retry loop (spurious OK wakes) until a
+          // slot frees up and registration succeeds.
+          graph_gc_unwired = true;
+          RMW_UDS_LOG_WARN_THROTTLE(
+            5000,
+            "registry full — graph-event doorbell unregistered; graph waits "
+            "degrade to polling until a slot frees");
         }
       }
     }
@@ -452,6 +465,13 @@ rmw_ret_t rmw_wait(
         block_ms = static_cast<int>(
           std::min<int64_t>(rem_ms, std::numeric_limits<int>::max()));
       }
+      if (graph_gc_unwired && (block_ms < 0 || block_ms > 200)) {
+        // No doorbell wiring (registry full): never block unbounded on a
+        // graph wait, or a later graph change is silently lost forever. The
+        // early return is a spurious wake (OK, nothing ready) that lets the
+        // next rmw_wait retry registration.
+        block_ms = 200;
+      }
       int n = epoll_wait(ws_data->epoll_fd, ready_events, 64, block_ms);
       if (n < 0) {
         if (errno == EINTR) {
@@ -492,7 +512,8 @@ rmw_ret_t rmw_wait(
         auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
         drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
           sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id,
-          sub->ignore_local_publications, sub->context->context_id);
+          sub->ignore_local_publications, sub->context->context_id,
+          &sub->replayed_watermarks);
       }
     }
     if (services) {

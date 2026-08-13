@@ -1224,6 +1224,21 @@ TEST_F(QosTest, TransientLocalConcurrentPublishChurnStress)
         published.store(v);
       }
     });
+  // A fatal assertion below returns from the test with publisher_thread
+  // still joinable, which would std::terminate the whole process instead of
+  // reporting the failure — stop and join on every exit path.
+  struct JoinGuard
+  {
+    std::atomic<bool> & stop_flag;
+    std::thread & thread;
+    ~JoinGuard()
+    {
+      stop_flag.store(true);
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  } join_guard{stop, publisher_thread};
 
   // Churn: each round joins mid-stream, drains for a moment, and must see a
   // strictly increasing, duplicate-free value sequence.
@@ -1252,7 +1267,9 @@ TEST_F(QosTest, TransientLocalConcurrentPublishChurnStress)
   }
 
   stop.store(true);
-  publisher_thread.join();
+  if (publisher_thread.joinable()) {
+    publisher_thread.join();  // JoinGuard then finds nothing left to do
+  }
 
   // Quiesced late joiner: must receive exactly the newest depth samples, in
   // order — the latched history and nothing else.

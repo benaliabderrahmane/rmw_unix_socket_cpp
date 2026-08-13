@@ -745,12 +745,11 @@ bool tl_ring_latch(
     slot_hdr.payload_size = static_cast<uint32_t>(sizeof(desc));
     slot_payload = reinterpret_cast<const uint8_t *>(&desc);
     slot_payload_size = sizeof(desc);
-    if (live_desc_out) {
-      *live_desc_out = desc;
-    }
-    if (staged_out) {
-      *staged_out = true;
-    }
+    // live_desc_out/staged_out are filled only AFTER the slot commits: if the
+    // fallocate below fails, `seg` is destroyed (segment unlinked) on return,
+    // and a caller that had already seen staged==true would fan out a
+    // descriptor to a segment that no longer exists — silently losing the
+    // live message while this publish reports OK.
   }
 
   const uint64_t index = ring.next_index;
@@ -787,8 +786,17 @@ bool tl_ring_latch(
 
   // Evict the overwritten slot's durable segment only AFTER the new record is
   // committed: until then a puller could still legitimately read the old one.
+  const bool staged_durable = static_cast<bool>(seg);
   ring.durable_segs[slot] = std::move(seg);
   ring.next_index = index + 1;
+  if (staged_durable) {
+    if (live_desc_out) {
+      *live_desc_out = desc;
+    }
+    if (staged_out) {
+      *staged_out = true;
+    }
+  }
   return true;
 }
 
