@@ -158,6 +158,11 @@ struct UdsContext
   std::atomic<bool> is_shutdown{false};
   std::atomic<uint64_t> last_registry_generation{0};
 
+  // Last time this process swept the registry for slots whose owning process
+  // is gone (steady clock, ns). Keeps that sweep off the graph query path; see
+  // maybe_cleanup_stale in rmw_graph.cpp.
+  std::atomic<int64_t> last_cleanup_ns{0};
+
   // Doorbell: a bound datagram socket other processes ring (one octet) after
   // any registry mutation, so a blocked rmw_wait re-checks the registry
   // without polling. The socket is bound at rmw_init, but the ENTRY_DOORBELL
