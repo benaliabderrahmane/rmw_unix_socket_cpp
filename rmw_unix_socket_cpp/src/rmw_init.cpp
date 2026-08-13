@@ -224,7 +224,7 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   if (options->enclave) {
     enclave_copy = rcutils_strdup(options->enclave, options->allocator);
     if (!enclave_copy) {
-      rmw_uds::registry_remove(header, ctx->doorbell_registry_index);
+      unlink(ctx->doorbell_path.c_str());  // doorbell not yet registered
       close(ctx->doorbell_fd);
       close(ctx->send_socket_fd);
       rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);
@@ -251,7 +251,7 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
     if (enclave_copy) {
       options->allocator.deallocate(enclave_copy, options->allocator.state);
     }
-    rmw_uds::registry_remove(header, ctx->doorbell_registry_index);
+    unlink(ctx->doorbell_path.c_str());  // doorbell not yet registered
     close(ctx->doorbell_fd);
     close(ctx->send_socket_fd);
     rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);

@@ -280,8 +280,11 @@ static constexpr size_t TL_EMBED_CAP = 1024;
 // Hard byte ceiling for one publisher's latched ring (record area). A
 // misconfigured depth cannot fallocate tens of MB: slots are clamped to
 // whatever fits. Replay may then hold fewer than qos.depth samples — a
-// stated, accepted limit (DESIGN, latched cache).
-static constexpr size_t TL_RING_MAX_BYTES = 1 * 1024 * 1024;
+// stated, accepted limit (DESIGN, latched cache). 2 MiB admits the stock
+// rosout profile (TRANSIENT_LOCAL, KEEP_LAST 1000: 1000 x 1088 B stride)
+// without clamping; the file is sparse, so the ceiling costs nothing until
+// slots are actually latched.
+static constexpr size_t TL_RING_MAX_BYTES = 2 * 1024 * 1024;
 
 static constexpr uint32_t TL_RING_MAGIC = 0x4C544455;  // "UDTL"
 static constexpr uint32_t TL_RING_VERSION = 1;
@@ -353,23 +356,25 @@ bool tl_ring_create(
   const uint8_t * gid16,
   size_t depth);
 
-// Latch one sample: payloads above TL_EMBED_CAP are staged into a fresh
-// durable segment (owned by the ring, evicted with the slot); the slot is
-// written under the per-record seqlock. Caller holds the publisher's
-// cache_mutex and has already assigned hdr.sequence_number under it.
-// When a durable segment was staged, *live_desc_out (if non-null) receives
-// its descriptor so the caller can reuse it for the live fan-out of a
-// payload at or above SHM_PAYLOAD_THRESHOLD, and *staged_out is set true.
-// Returns false (nothing latched, live sends unaffected) when the ring is
-// absent or the slot's pages cannot be committed (ENOSPC).
+// Latch one sample under the per-record seqlock. Caller holds the
+// publisher's cache_mutex and has already assigned hdr.sequence_number under
+// it. Payloads above TL_EMBED_CAP must be pre-staged BY THE CALLER (outside
+// the lock — staging is shm_open/fallocate/mmap, up to milliseconds) via
+// shm_stage_durable; pass its descriptor and segment here and the slot then
+// carries the 32-byte descriptor with SHM_PAYLOAD_FLAG. On success the ring
+// owns staged_seg (evicted with the slot); the previously-latched segment of
+// the overwritten slot is returned in evicted_out so the caller can destroy
+// it (munmap + shm_unlink) after releasing the lock. Returns false — and
+// leaves staged_seg destroyed, nothing latched, live sends unaffected — when
+// the ring is absent or the slot's pages cannot be committed (ENOSPC).
 bool tl_ring_latch(
   TlRingWriter & ring,
-  size_t domain_id,
   const WireHeader & hdr,
   const uint8_t * payload,
   size_t payload_size,
-  ShmPayloadDescriptor * live_desc_out,
-  bool * staged_out);
+  const ShmPayloadDescriptor * staged_desc,
+  std::unique_ptr<DurableShmSegment> staged_seg,
+  std::unique_ptr<DurableShmSegment> & evicted_out);
 
 // Map, validate, and snapshot a publisher's latched cache. expected_gid16 is
 // the slot GID the name came from; a mismatched or malformed segment is
@@ -378,12 +383,18 @@ bool tl_ring_latch(
 // sequence number observed among stable records — the subscriber's dedup
 // watermark. Per-slot seqlock reads are bounded (skip, never spin), so a
 // publisher killed mid-write cannot hang subscription creation.
+// *overlapped_out is set true when a writer latched DURING the scan (any
+// pulled slot's seq moved by the end): the scan is then not a point-in-time
+// snapshot and a sequence gap in the result may hide a sample the scan
+// missed — the caller must not extend its dedup watermark across such a gap
+// (the missed sample's datagram is in flight and must not be dropped).
 bool tl_ring_pull(
   const std::string & shm_name,
   const uint8_t * expected_gid16,
   size_t max_records,
   std::vector<TlPulledRecord> & records_out,
-  int64_t & max_seq_out);
+  int64_t & max_seq_out,
+  bool * overlapped_out);
 
 // Unmap + unlink the latched cache (publisher destruction / failed create).
 void tl_ring_close(TlRingWriter & ring);

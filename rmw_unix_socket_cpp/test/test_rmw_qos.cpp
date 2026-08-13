@@ -14,6 +14,7 @@
 
 #include "test_base.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
@@ -30,6 +31,8 @@
 #include "rmw/qos_profiles.h"
 #include "rosidl_typesupport_cpp/message_type_support.hpp"
 #include "rosidl_typesupport_cpp/service_type_support.hpp"
+
+#include <sys/un.h>
 
 #include "types.hpp"
 
@@ -1240,6 +1243,14 @@ TEST_F(QosTest, TransientLocalConcurrentPublishChurnStress)
     }
   } join_guard{stop, publisher_thread};
 
+  // Gate round 0 on the pipeline being live: with zero publishes completed,
+  // the first churn round's pull finds an empty ring and its take loop could
+  // expire before the first sample lands — a scheduler flake, not a defect.
+  for (int i = 0; i < 2000 && published.load() == 0; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_GT(published.load(), 0) << "publisher thread never published";
+
   // Churn: each round joins mid-stream, drains for a moment, and must see a
   // strictly increasing, duplicate-free value sequence.
   auto sub_opts = rmw_get_default_subscription_options();
@@ -1292,5 +1303,194 @@ TEST_F(QosTest, TransientLocalConcurrentPublishChurnStress)
   }
 
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, final_sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalWatermarkDropsForgedDuplicate)
+{
+  // Deterministic dedup coverage: after the pull sets the watermark, a
+  // datagram carrying the publisher's GID with a sequence number at or below
+  // the watermark must be dropped by the drain — and a genuine live sample
+  // must still get through, proving the drop is not vacuous.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 10);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/wm_forge", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+  for (int i = 1; i <= 3; ++i) {
+    test_msgs::msg::BasicTypes m;
+    m.int32_value = i;
+    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
+  }
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/wm_forge", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+  // Drain the pulled history (seqs 1..3, watermark = 3).
+  for (int i = 0; i < 3; ++i) {
+    test_msgs::msg::BasicTypes recv;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    ASSERT_TRUE(taken);
+  }
+
+  // Forge a duplicate the way the pull/live overlap would produce one: the
+  // publisher's GID, sequence 2, sent straight to the subscription socket.
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+  rmw_uds::WireHeader forged;
+  std::memset(&forged, 0, sizeof(forged));
+  std::memcpy(forged.gid, pub_data->gid.data, sizeof(forged.gid));
+  forged.sequence_number = 2;
+  forged.msg_type = 0;
+  uint8_t junk[8] = {0};
+  forged.payload_size = sizeof(junk);
+  // Raw sendto (send_to is not exported from the shared library): one
+  // datagram of WireHeader + payload to the subscription's bound socket,
+  // exactly what a publisher's fan-out produces.
+  {
+    struct sockaddr_un addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    std::strncpy(addr.sun_path, sub_data->socket_path.c_str(),
+      sizeof(addr.sun_path) - 1);
+    std::vector<uint8_t> dgram(sizeof(forged) + sizeof(junk));
+    std::memcpy(dgram.data(), &forged, sizeof(forged));
+    std::memcpy(dgram.data() + sizeof(forged), junk, sizeof(junk));
+    ASSERT_EQ(static_cast<ssize_t>(dgram.size()),
+      sendto(sub_data->context->send_socket_fd, dgram.data(), dgram.size(),
+        0, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)));
+  }
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(30));
+  test_msgs::msg::BasicTypes recv;
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+  EXPECT_FALSE(taken) << "forged duplicate (seq <= watermark) was delivered";
+
+  // The watermark must not eat genuine live traffic.
+  test_msgs::msg::BasicTypes live;
+  live.int32_value = 44;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &live, nullptr));
+  bool got_live = false;
+  for (int i = 0; i < 100 && !got_live; ++i) {
+    taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    if (taken && recv.int32_value == 44) {got_live = true;}
+    if (!taken) {std::this_thread::sleep_for(std::chrono::milliseconds(2));}
+  }
+  EXPECT_TRUE(got_live) << "live sample after the watermark was not delivered";
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, TransientLocalTwoPublishersBothHistoriesPulled)
+{
+  // Two latched publishers on one topic: a late joiner must receive both
+  // histories exactly once (independent per-GID watermarks), then one live
+  // sample from each.
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 10);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub_a = rmw_create_publisher(node, ts, "/two_pubs", &qos, &pub_opts);
+  auto * pub_b = rmw_create_publisher(node, ts, "/two_pubs", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub_a);
+  ASSERT_NE(nullptr, pub_b);
+
+  for (int i = 1; i <= 2; ++i) {
+    test_msgs::msg::BasicTypes m;
+    m.int32_value = 100 + i;  // A: 101, 102
+    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub_a, &m, nullptr));
+    m.int32_value = 200 + i;  // B: 201, 202
+    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub_b, &m, nullptr));
+  }
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/two_pubs", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  std::vector<int32_t> seen;
+  for (int i = 0; i < 6; ++i) {
+    test_msgs::msg::BasicTypes recv;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    if (!taken) {break;}
+    seen.push_back(recv.int32_value);
+  }
+  std::sort(seen.begin(), seen.end());
+  const std::vector<int32_t> expect = {101, 102, 201, 202};
+  EXPECT_EQ(expect, seen) << "both publishers' histories, exactly once";
+
+  test_msgs::msg::BasicTypes m;
+  m.int32_value = 103;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub_a, &m, nullptr));
+  m.int32_value = 203;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub_b, &m, nullptr));
+  seen.clear();
+  for (int i = 0; i < 200 && seen.size() < 2; ++i) {
+    test_msgs::msg::BasicTypes recv;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    if (taken) {
+      seen.push_back(recv.int32_value);
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+  }
+  std::sort(seen.begin(), seen.end());
+  const std::vector<int32_t> expect_live = {103, 203};
+  EXPECT_EQ(expect_live, seen) << "one live sample from each publisher";
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub_a);
+  auto _r3 [[maybe_unused]] = rmw_destroy_publisher(node, pub_b);
+}
+
+TEST_F(QosTest, TransientLocalMidBandPayloadLatchedAndLive)
+{
+  // The mid band — above the embed cap (1 KiB), below the datagram shm
+  // threshold (64 KiB) — rides a durable descriptor in the latched slot but
+  // an inline datagram on the wire. Both consumers must get byte-equal data.
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, seq_ts, "/mid_band", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * live_sub = rmw_create_subscription(node, seq_ts, "/mid_band", &qos, &sub_opts);
+  ASSERT_NE(nullptr, live_sub);
+
+  test_msgs::msg::UnboundedSequences msg;
+  msg.uint8_values.resize(4 * 1024);  // squarely in the mid band
+  for (size_t i = 0; i < msg.uint8_values.size(); ++i) {
+    msg.uint8_values[i] = static_cast<uint8_t>((i * 13 + 3) & 0xFF);
+  }
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+
+  test_msgs::msg::UnboundedSequences recv;
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take(live_sub, &recv, &taken, nullptr));
+  ASSERT_TRUE(taken) << "live mid-band sample not delivered inline";
+  EXPECT_EQ(msg.uint8_values, recv.uint8_values);
+
+  auto * late_sub = rmw_create_subscription(node, seq_ts, "/mid_band", &qos, &sub_opts);
+  ASSERT_NE(nullptr, late_sub);
+  taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take(late_sub, &recv, &taken, nullptr));
+  ASSERT_TRUE(taken) << "mid-band latched sample not pulled by the late joiner";
+  EXPECT_EQ(msg.uint8_values, recv.uint8_values);
+
+  auto _r0 [[maybe_unused]] = rmw_destroy_subscription(node, late_sub);
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, live_sub);
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }

@@ -213,7 +213,12 @@ static std::shared_ptr<const std::vector<std::string>> refresh_sub_paths(
   uint64_t current_gen)
 {
   std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
-  if (current_gen != pub_data->cached_generation) {
+  // Monotonic guard (not !=): a thread that loaded an older generation and
+  // lost the race must not move cached_generation backward — the invariant
+  // above is what the pull-based replay reasoning cites. A lower current_gen
+  // means the cached list was built by a newer query and is already a
+  // superset of the subscribers that generation covers.
+  if (current_gen > pub_data->cached_generation) {
     auto subs = rmw_uds::registry_query(
       header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
       nullptr, nullptr);
@@ -252,42 +257,68 @@ static rmw_ret_t transient_local_publish(
   rmw_uds::WireHeader hdr,
   const std::vector<uint8_t> & payload)
 {
-  rmw_uds::ShmPayloadDescriptor live_desc;
-  bool staged = false;
+  // Stage an over-cap payload BEFORE taking cache_mutex: staging is
+  // shm_open/fallocate/mmap (up to milliseconds), reads only the payload,
+  // the immutable domain id, and a global atomic counter — nothing
+  // cache_mutex guards. A staging failure just means this sample is not
+  // latched; the live path is unaffected.
+  rmw_uds::ShmPayloadDescriptor staged_desc;
+  std::unique_ptr<rmw_uds::DurableShmSegment> staged_seg;
+  if (payload.size() > rmw_uds::TL_EMBED_CAP) {
+    staged_seg = rmw_uds::shm_stage_durable(
+      pub_data->context->domain_id, payload.data(), payload.size(),
+      staged_desc);
+    if (!staged_seg) {
+      RMW_UDS_LOG_WARN_THROTTLE(
+        5000,
+        "latched sample (%zu bytes) could not be staged in shared memory — "
+        "not replayable to late joiners",
+        payload.size());
+    }
+  }
+  const bool staged = static_cast<bool>(staged_seg);
+
+  // Latch, fence, refresh, and fan out under cache_mutex, so concurrent
+  // publishes on this publisher hit the wire in sequence order (the deleted
+  // push code held the same lock across its sends). The evicted slot's
+  // durable segment destructs (munmap + shm_unlink) after the lock drops.
+  std::unique_ptr<rmw_uds::DurableShmSegment> evicted;
+  bool latched = false;
+  bool config_error = false;
   {
     std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
     hdr.sequence_number =
       pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
-    rmw_uds::tl_ring_latch(
-      pub_data->tl_ring, pub_data->context->domain_id,
-      hdr, payload.data(), payload.size(), &live_desc, &staged);
-  }
-  std::atomic_thread_fence(std::memory_order_seq_cst);
+    latched = rmw_uds::tl_ring_latch(
+      pub_data->tl_ring, hdr, payload.data(), payload.size(),
+      staged ? &staged_desc : nullptr, std::move(staged_seg), evicted);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
 
-  auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
-  const uint64_t current_gen = rmw_uds::registry_generation(header);
-  auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
+    auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
+    const uint64_t current_gen = rmw_uds::registry_generation(header);
+    auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
 
-  // Live fan-out: payloads at or above the datagram threshold reuse the
-  // durable segment the latch just staged (same bytes, same descriptor);
-  // without one (latch failed) the inline send surfaces EMSGSIZE below.
-  const uint8_t * wire_data = payload.data();
-  size_t wire_size = payload.size();
-  if (staged && payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
-    hdr.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
-    hdr.payload_size = static_cast<uint32_t>(sizeof(live_desc));
-    wire_data = reinterpret_cast<const uint8_t *>(&live_desc);
-    wire_size = sizeof(live_desc);
-  }
+    // Live fan-out: payloads at or above the datagram threshold reuse the
+    // durable segment the latch just committed (same bytes, same
+    // descriptor). If the latch did NOT commit, the segment is already
+    // destroyed, so fall back to the inline send, which surfaces EMSGSIZE.
+    const uint8_t * wire_data = payload.data();
+    size_t wire_size = payload.size();
+    if (staged && latched && payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
+      hdr.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
+      hdr.payload_size = static_cast<uint32_t>(sizeof(staged_desc));
+      wire_data = reinterpret_cast<const uint8_t *>(&staged_desc);
+      wire_size = sizeof(staged_desc);
+    }
 
-  bool config_error = false;
-  if (sub_paths) {
-    for (const auto & path : *sub_paths) {
-      if (rmw_uds::send_to(
-          pub_data->context->send_socket_fd,
-          path, hdr, wire_data, wire_size) == rmw_uds::SendResult::ConfigError)
-      {
-        config_error = true;
+    if (sub_paths) {
+      for (const auto & path : *sub_paths) {
+        if (rmw_uds::send_to(
+            pub_data->context->send_socket_fd,
+            path, hdr, wire_data, wire_size) == rmw_uds::SendResult::ConfigError)
+        {
+          config_error = true;
+        }
       }
     }
   }

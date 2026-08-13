@@ -631,12 +631,16 @@ bool tl_ring_create(
   auto now = std::chrono::steady_clock::now().time_since_epoch();
   uint32_t time_component = static_cast<uint32_t>(
     std::chrono::duration_cast<std::chrono::microseconds>(now).count() & 0xFFFF);
-  const uint32_t owner_id =
-    (g_shm_owner_counter.fetch_add(1, std::memory_order_relaxed) << 16) |
-    time_component;
+  // Unlike the descriptor-borne ring owner_id (32-bit field), the tl name is
+  // a free-form string, so the full counter and the time salt are kept as
+  // separate components: the name-collision period is 2^32 creations, not
+  // 2^16 — a truncated counter could otherwise alias a LIVE same-process
+  // ring and unlink it via the EEXIST branch below.
+  const uint32_t owner_counter =
+    g_shm_owner_counter.fetch_add(1, std::memory_order_relaxed);
   char name[96];
-  std::snprintf(name, sizeof(name), "/ros2_uds_tl_%zu_%d_%u",
-    domain_id, pid, owner_id);
+  std::snprintf(name, sizeof(name), "/ros2_uds_tl_%zu_%d_%u_%x",
+    domain_id, pid, owner_counter, time_component);
 
   int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0644);
   if (fd < 0 && errno == EEXIST) {
@@ -706,50 +710,38 @@ bool tl_ring_create(
 
 bool tl_ring_latch(
   TlRingWriter & ring,
-  size_t domain_id,
   const WireHeader & hdr,
   const uint8_t * payload,
   size_t payload_size,
-  ShmPayloadDescriptor * live_desc_out,
-  bool * staged_out)
+  const ShmPayloadDescriptor * staged_desc,
+  std::unique_ptr<DurableShmSegment> staged_seg,
+  std::unique_ptr<DurableShmSegment> & evicted_out)
 {
-  if (staged_out) {
-    *staged_out = false;
-  }
   if (!ring.base) {
     return false;  // ring-less publisher (creation failed) — no replay
   }
+  if (!staged_desc && payload_size > TL_EMBED_CAP) {
+    // Over-cap payload whose caller-side staging failed: it cannot fit the
+    // fixed slot, and writing it anyway would run past the slot (and the
+    // mapping). The sample is simply not latched; live sends are unaffected.
+    return false;
+  }
 
-  // Payloads beyond the embed cap are staged once into a fresh durable
-  // segment; the slot then carries the 32-byte descriptor, exactly like a
-  // large sample on the wire. The segment is owned by this slot and evicted
-  // (unlinked) when the slot is overwritten — an in-flight puller that
-  // already mapped it keeps a valid mapping; one that has not yet mapped
-  // gets ENOENT and skips, the documented lapped-record semantics.
+  // Over-cap payloads arrive pre-staged by the caller (outside cache_mutex —
+  // staging is ms-scale syscalls); the slot then carries the 32-byte
+  // descriptor, exactly like a large sample on the wire. The segment becomes
+  // owned by this slot and is evicted (returned to the caller for unlinking
+  // outside the lock) when the slot is overwritten — an in-flight puller
+  // that already mapped it keeps a valid mapping; one that has not yet
+  // mapped gets ENOENT and skips, the documented lapped-record semantics.
   WireHeader slot_hdr = hdr;
-  ShmPayloadDescriptor desc;
   const uint8_t * slot_payload = payload;
   size_t slot_payload_size = payload_size;
-  std::unique_ptr<DurableShmSegment> seg;
-  if (payload_size > TL_EMBED_CAP) {
-    seg = shm_stage_durable(domain_id, payload, payload_size, desc);
-    if (!seg) {
-      RMW_UDS_LOG_WARN_THROTTLE(
-        5000,
-        "latched sample (%zu bytes) could not be staged in shared memory — "
-        "not replayable to late joiners",
-        payload_size);
-      return false;
-    }
+  if (staged_desc) {
     slot_hdr.msg_type |= SHM_PAYLOAD_FLAG;
-    slot_hdr.payload_size = static_cast<uint32_t>(sizeof(desc));
-    slot_payload = reinterpret_cast<const uint8_t *>(&desc);
-    slot_payload_size = sizeof(desc);
-    // live_desc_out/staged_out are filled only AFTER the slot commits: if the
-    // fallocate below fails, `seg` is destroyed (segment unlinked) on return,
-    // and a caller that had already seen staged==true would fan out a
-    // descriptor to a segment that no longer exists — silently losing the
-    // live message while this publish reports OK.
+    slot_hdr.payload_size = static_cast<uint32_t>(sizeof(*staged_desc));
+    slot_payload = reinterpret_cast<const uint8_t *>(staged_desc);
+    slot_payload_size = sizeof(*staged_desc);
   }
 
   const uint64_t index = ring.next_index;
@@ -786,17 +778,11 @@ bool tl_ring_latch(
 
   // Evict the overwritten slot's durable segment only AFTER the new record is
   // committed: until then a puller could still legitimately read the old one.
-  const bool staged_durable = static_cast<bool>(seg);
-  ring.durable_segs[slot] = std::move(seg);
+  // The evicted handle goes back to the caller so its munmap + shm_unlink
+  // run after cache_mutex is released.
+  evicted_out = std::move(ring.durable_segs[slot]);
+  ring.durable_segs[slot] = std::move(staged_seg);
   ring.next_index = index + 1;
-  if (staged_durable) {
-    if (live_desc_out) {
-      *live_desc_out = desc;
-    }
-    if (staged_out) {
-      *staged_out = true;
-    }
-  }
   return true;
 }
 
@@ -805,10 +791,14 @@ bool tl_ring_pull(
   const uint8_t * expected_gid16,
   size_t max_records,
   std::vector<TlPulledRecord> & records_out,
-  int64_t & max_seq_out)
+  int64_t & max_seq_out,
+  bool * overlapped_out)
 {
   max_seq_out = 0;
   records_out.clear();
+  if (overlapped_out) {
+    *overlapped_out = false;
+  }
   if (shm_name.empty() || max_records == 0) {
     return false;
   }
@@ -849,6 +839,10 @@ bool tl_ring_pull(
   }
   const uint32_t slots = header->slots;
   const auto * area = static_cast<const uint8_t *>(base) + SHM_RECORD_ALIGN;
+
+  // (slot index, accepted seq) per pulled record, re-checked after the scan
+  // to detect a writer latching concurrently (see overlapped_out contract).
+  std::vector<std::pair<uint32_t, uint32_t>> accepted_at;
 
   for (uint32_t i = 0; i < slots; ++i) {
     const auto * record =
@@ -895,8 +889,22 @@ bool tl_ring_pull(
       if (rec.sequence_number > max_seq_out) {
         max_seq_out = rec.sequence_number;
       }
+      accepted_at.emplace_back(i, s1);
       records_out.push_back(std::move(rec));
       break;
+    }
+  }
+  // Overlap detection: if any pulled slot's seq moved since its snapshot, a
+  // writer latched during the scan — the result is not a point-in-time
+  // snapshot, and a sequence gap in it may hide a sample the scan missed.
+  if (overlapped_out) {
+    for (const auto & [slot_i, s1] : accepted_at) {
+      const auto * rec_hdr =
+        reinterpret_cast<const ShmRecordHeader *>(area + slot_i * stride);
+      if (rec_hdr->seq.load(std::memory_order_acquire) != s1) {
+        *overlapped_out = true;
+        break;
+      }
     }
   }
   munmap(base, map_size);

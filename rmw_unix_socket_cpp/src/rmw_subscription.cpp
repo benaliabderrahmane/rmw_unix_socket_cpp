@@ -61,8 +61,10 @@ static int64_t system_now_ns()
 // TRANSIENT_LOCAL dedup: true when this datagram's sample was already
 // delivered by the creation-time pull — the sender's GID has a watermark and
 // the sequence number is at or below it. Sequence numbers are assigned inside
-// the publisher's latch critical section, so anything <= the watermark was
-// either pulled or lapped out of the latched history; nothing is lost.
+// the publisher's latch critical section and the pull never extends the
+// watermark across a scan-overlap gap, so anything <= the watermark was
+// either pulled or already lapped out of the publisher's ring at pull time —
+// history DDS would not owe a late joiner either.
 static bool is_replayed_duplicate(
   rmw_uds::UdsSubscription * sub, const rmw_uds::WireHeader & hdr)
 {
@@ -272,10 +274,36 @@ rmw_subscription_t * rmw_create_subscription(
       }
       std::vector<rmw_uds::TlPulledRecord> records;
       int64_t max_seq = 0;
+      bool overlapped = false;
       if (!rmw_uds::tl_ring_pull(
-          p.socket_path, p.gid, sub_data->queue_depth, records, max_seq))
+          p.socket_path, p.gid, sub_data->queue_depth, records, max_seq,
+          &overlapped))
       {
         continue;  // stale incarnation, empty cache, or poisoned writer: skip
+      }
+      if (overlapped) {
+        // A writer latched during the scan, so the snapshot is not
+        // point-in-time: a sequence gap may hide a sample the scan missed
+        // whose datagram is in flight to us (our slot was already visible).
+        // Keep only the contiguous prefix and let everything above the first
+        // gap arrive as datagrams — extending the watermark across the gap
+        // would silently drop the missed sample. Without overlap, a gap can
+        // only be a dead writer's poisoned slot, where the datagrams will
+        // never come: keep everything (partial history, documented).
+        size_t keep = records.size();
+        for (size_t i = 1; i < records.size(); ++i) {
+          if (records[i].sequence_number != records[i - 1].sequence_number + 1) {
+            keep = i;
+            break;
+          }
+        }
+        if (keep < records.size()) {
+          records.resize(keep);
+        }
+        max_seq = records.empty() ? 0 : records.back().sequence_number;
+        if (records.empty()) {
+          continue;  // nothing safely claimable; datagrams will deliver
+        }
       }
       const int64_t now_ns = system_now_ns();
       {

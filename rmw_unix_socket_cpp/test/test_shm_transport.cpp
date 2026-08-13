@@ -329,17 +329,22 @@ TEST_F(ShmTransportTest, TlRingLatchAndPullRoundTrip)
   uint8_t gid[16] = {0xAB, 0, 0, 0, 0, 0, 0, 0, 0xCD, 0, 0, 0, 0, 0, 0, 0};
   ASSERT_TRUE(rmw_uds::tl_ring_create(ring, domain_id, gid, 5));
 
+  std::unique_ptr<rmw_uds::DurableShmSegment> evicted;
   for (int64_t i = 1; i <= 8; ++i) {  // 8 > depth 5: oldest three lap out
     auto hdr = make_tl_header(i);
     std::vector<uint8_t> payload(64, static_cast<uint8_t>(i));
     hdr.payload_size = static_cast<uint32_t>(payload.size());
     ASSERT_TRUE(rmw_uds::tl_ring_latch(
-        ring, domain_id, hdr, payload.data(), payload.size(), nullptr, nullptr));
+        ring, hdr, payload.data(), payload.size(), nullptr, nullptr, evicted));
+    EXPECT_EQ(nullptr, evicted);  // embedded records own no durable segment
   }
 
   std::vector<rmw_uds::TlPulledRecord> records;
   int64_t max_seq = 0;
-  ASSERT_TRUE(rmw_uds::tl_ring_pull(ring.shm_name, gid, 10, records, max_seq));
+  bool overlapped = true;
+  ASSERT_TRUE(rmw_uds::tl_ring_pull(
+      ring.shm_name, gid, 10, records, max_seq, &overlapped));
+  EXPECT_FALSE(overlapped);  // no concurrent writer in this test
   EXPECT_EQ(8, max_seq);
   ASSERT_EQ(5u, records.size());
   for (size_t i = 0; i < records.size(); ++i) {
@@ -349,10 +354,15 @@ TEST_F(ShmTransportTest, TlRingLatchAndPullRoundTrip)
 
   // Wrong expected GID (stale-segment defense): the pull must refuse.
   uint8_t wrong_gid[16] = {0xAB, 0, 0, 0, 0, 0, 0, 0, 0xEE, 0, 0, 0, 0, 0, 0, 0};
-  EXPECT_FALSE(rmw_uds::tl_ring_pull(ring.shm_name, wrong_gid, 10, records, max_seq));
+  EXPECT_FALSE(rmw_uds::tl_ring_pull(
+      ring.shm_name, wrong_gid, 10, records, max_seq, nullptr));
 
+  // Capture the name BEFORE close (close clears it): this drives the pull
+  // through shm_open ENOENT — the destroyed-publisher path — instead of the
+  // empty-name early return, verifying close actually unlinked the segment.
+  const std::string name = ring.shm_name;
   rmw_uds::tl_ring_close(ring);
-  EXPECT_FALSE(rmw_uds::tl_ring_pull(ring.shm_name, gid, 10, records, max_seq));
+  EXPECT_FALSE(rmw_uds::tl_ring_pull(name, gid, 10, records, max_seq, nullptr));
 }
 
 TEST_F(ShmTransportTest, TlRingPullSkipsPoisonedSlotAndReturnsPromptly)
@@ -364,12 +374,13 @@ TEST_F(ShmTransportTest, TlRingPullSkipsPoisonedSlotAndReturnsPromptly)
   uint8_t gid[16] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
   ASSERT_TRUE(rmw_uds::tl_ring_create(ring, domain_id, gid, 4));
 
+  std::unique_ptr<rmw_uds::DurableShmSegment> evicted;
   for (int64_t i = 1; i <= 4; ++i) {
     auto hdr = make_tl_header(i);
     std::vector<uint8_t> payload(32, static_cast<uint8_t>(i));
     hdr.payload_size = static_cast<uint32_t>(payload.size());
     ASSERT_TRUE(rmw_uds::tl_ring_latch(
-        ring, domain_id, hdr, payload.data(), payload.size(), nullptr, nullptr));
+        ring, hdr, payload.data(), payload.size(), nullptr, nullptr, evicted));
   }
 
   // Poison slot 1 (record seq 2) the way a SIGKILL mid-write would: odd seq.
@@ -380,7 +391,10 @@ TEST_F(ShmTransportTest, TlRingPullSkipsPoisonedSlotAndReturnsPromptly)
   const auto t0 = std::chrono::steady_clock::now();
   std::vector<rmw_uds::TlPulledRecord> records;
   int64_t max_seq = 0;
-  ASSERT_TRUE(rmw_uds::tl_ring_pull(ring.shm_name, gid, 10, records, max_seq));
+  bool overlapped = true;
+  ASSERT_TRUE(rmw_uds::tl_ring_pull(
+      ring.shm_name, gid, 10, records, max_seq, &overlapped));
+  EXPECT_FALSE(overlapped) << "a dead writer's poisoned slot is not overlap";
   const auto elapsed = std::chrono::steady_clock::now() - t0;
 
   EXPECT_LT(
@@ -392,5 +406,93 @@ TEST_F(ShmTransportTest, TlRingPullSkipsPoisonedSlotAndReturnsPromptly)
   EXPECT_EQ(4, records[2].sequence_number);
   EXPECT_EQ(4, max_seq);
 
+  rmw_uds::tl_ring_close(ring);
+}
+
+TEST_F(ShmTransportTest, TlRingDepthClampAndNewestSuffix)
+{
+  // A depth beyond the byte cap clamps to the computed slot count (the stock
+  // rosout depth of 1000 must fit un-clamped — that is what sized the cap),
+  // and a fully-lapped ring replays exactly the newest slot-count suffix.
+  const size_t stride = 64;  // SHM_RECORD_ALIGN
+  const size_t slot_bytes =
+    (sizeof(rmw_uds::ShmRecordHeader) + 37 + rmw_uds::TL_EMBED_CAP + stride - 1) &
+    ~(stride - 1);
+  const size_t expect_max = rmw_uds::TL_RING_MAX_BYTES / slot_bytes;
+  ASSERT_GE(expect_max, 1000u) << "stock rosout depth must fit the byte cap";
+
+  rmw_uds::TlRingWriter ring;
+  uint8_t gid[16] = {9, 9, 9, 9, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0};
+  ASSERT_TRUE(rmw_uds::tl_ring_create(ring, domain_id, gid, 10000));
+  EXPECT_EQ(expect_max, ring.slots) << "depth 10000 must clamp to the byte cap";
+
+  // rosout-shaped depth: no clamp.
+  rmw_uds::TlRingWriter rosout_ring;
+  ASSERT_TRUE(rmw_uds::tl_ring_create(rosout_ring, domain_id, gid, 1000));
+  EXPECT_EQ(1000u, rosout_ring.slots);
+  rmw_uds::tl_ring_close(rosout_ring);
+
+  std::unique_ptr<rmw_uds::DurableShmSegment> evicted;
+  const int64_t total = static_cast<int64_t>(ring.slots) + 5;  // lap by 5
+  for (int64_t i = 1; i <= total; ++i) {
+    auto hdr = make_tl_header(i);
+    uint8_t byte = static_cast<uint8_t>(i & 0xFF);
+    hdr.payload_size = 1;
+    ASSERT_TRUE(rmw_uds::tl_ring_latch(ring, hdr, &byte, 1, nullptr, nullptr, evicted));
+  }
+  std::vector<rmw_uds::TlPulledRecord> records;
+  int64_t max_seq = 0;
+  ASSERT_TRUE(rmw_uds::tl_ring_pull(
+      ring.shm_name, gid, total + 10, records, max_seq, nullptr));
+  EXPECT_EQ(total, max_seq);
+  ASSERT_EQ(static_cast<size_t>(ring.slots), records.size());
+  EXPECT_EQ(total - static_cast<int64_t>(ring.slots) + 1,
+    records.front().sequence_number);
+  EXPECT_EQ(total, records.back().sequence_number);
+  rmw_uds::tl_ring_close(ring);
+}
+
+TEST_F(ShmTransportTest, TlRingEmbedCapBoundary)
+{
+  // Exactly TL_EMBED_CAP embeds; one byte over must be pre-staged durably by
+  // the caller. An off-by-one here would make tl_ring_pull treat the record
+  // length as torn and silently drop the latched sample.
+  rmw_uds::TlRingWriter ring;
+  uint8_t gid[16] = {7, 7, 7, 7, 0, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0};
+  ASSERT_TRUE(rmw_uds::tl_ring_create(ring, domain_id, gid, 4));
+
+  std::unique_ptr<rmw_uds::DurableShmSegment> evicted;
+  std::vector<uint8_t> at_cap(rmw_uds::TL_EMBED_CAP, 0x5A);
+  auto hdr1 = make_tl_header(1);
+  hdr1.payload_size = static_cast<uint32_t>(at_cap.size());
+  ASSERT_TRUE(rmw_uds::tl_ring_latch(
+      ring, hdr1, at_cap.data(), at_cap.size(), nullptr, nullptr, evicted));
+
+  std::vector<uint8_t> over_cap(rmw_uds::TL_EMBED_CAP + 1, 0xA5);
+  rmw_uds::ShmPayloadDescriptor desc;
+  auto seg = rmw_uds::shm_stage_durable(
+    domain_id, over_cap.data(), over_cap.size(), desc);
+  ASSERT_NE(nullptr, seg);
+  auto hdr2 = make_tl_header(2);
+  hdr2.payload_size = static_cast<uint32_t>(over_cap.size());
+  ASSERT_TRUE(rmw_uds::tl_ring_latch(
+      ring, hdr2, over_cap.data(), over_cap.size(), &desc, std::move(seg), evicted));
+
+  std::vector<rmw_uds::TlPulledRecord> records;
+  int64_t max_seq = 0;
+  ASSERT_TRUE(rmw_uds::tl_ring_pull(ring.shm_name, gid, 10, records, max_seq, nullptr));
+  ASSERT_EQ(2u, records.size());
+  EXPECT_EQ(at_cap, records[0].payload);  // embedded, byte-equal
+  // Over-cap record carries the 32-byte descriptor + SHM flag; resolve it
+  // through the same fetch path the subscription pull uses.
+  EXPECT_EQ(sizeof(rmw_uds::ShmPayloadDescriptor), records[1].payload.size());
+  rmw_uds::WireHeader hdr_out;
+  std::memcpy(&hdr_out, records[1].wire_header, sizeof(hdr_out));
+  EXPECT_TRUE(hdr_out.msg_type & rmw_uds::SHM_PAYLOAD_FLAG);
+  rmw_uds::ShmReaderCache local_cache;
+  std::vector<uint8_t> resolved = records[1].payload;
+  ASSERT_TRUE(rmw_uds::shm_fetch_payload(local_cache, domain_id, resolved));
+  EXPECT_EQ(over_cap, resolved);
+  rmw_uds::shm_reader_close(local_cache);
   rmw_uds::tl_ring_close(ring);
 }
