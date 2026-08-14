@@ -200,74 +200,81 @@ bool recv_from(
   // Use a fixed buffer approach: header + payload up to recv buffer
   static thread_local std::vector<uint8_t> recv_buf(256 * 1024);  // 256KB initial
 
-  ssize_t n = recv(socket_fd, recv_buf.data(), recv_buf.size(),
-    MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC);
+  // Junk datagrams (zero-length, runt) are consumed and skipped here rather
+  // than returned as false: every drain loop stops on the first false, so
+  // ending the call on consumed junk would strand real messages queued behind
+  // it until the next wake. False means the socket is genuinely empty.
+  while (true) {
+    ssize_t n = recv(socket_fd, recv_buf.data(), recv_buf.size(),
+      MSG_DONTWAIT | MSG_PEEK | MSG_TRUNC);
 
-  if (n < 0) {
-    // EAGAIN is the steady-state "nothing to read" case driven by wait()
-    // loops; staying silent is intentional. Anything else (EBADF, EINVAL,
-    // EINTR-after-shutdown) is worth surfacing.
-    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-      RMW_UDS_LOG_WARN_THROTTLE(
-        1000,
-        "UDS recv (peek) failed: %s (errno=%d)",
-        std::strerror(errno), errno);
+    if (n < 0) {
+      // EAGAIN is the steady-state "nothing to read" case driven by wait()
+      // loops; staying silent is intentional. Anything else (EBADF, EINVAL,
+      // EINTR-after-shutdown) is worth surfacing.
+      if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        RMW_UDS_LOG_WARN_THROTTLE(
+          1000,
+          "UDS recv (peek) failed: %s (errno=%d)",
+          std::strerror(errno), errno);
+      }
+      return false;
     }
-    return false;
-  }
-  if (n == 0) {
-    // A zero-length datagram carries no WireHeader, so it is not a message.
-    // The peek above did not dequeue it, so it has to be consumed here:
-    // leaving it queued keeps the socket permanently readable, which spins
-    // every wait that polls this fd.
-    char discard;
-    (void)recv(socket_fd, &discard, sizeof(discard), MSG_DONTWAIT);
-    RMW_UDS_LOG_WARN_THROTTLE(5000, "UDS recv: zero-length datagram — dropped");
-    return false;
-  }
 
-  // Resize if needed
-  if (static_cast<size_t>(n) > recv_buf.size()) {
-    recv_buf.resize(static_cast<size_t>(n));
-  }
-
-  // Actually receive the message
-  n = recv(socket_fd, recv_buf.data(), recv_buf.size(), MSG_DONTWAIT);
-  if (n < 0) {
-    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-      RMW_UDS_LOG_WARN_THROTTLE(
-        1000, "UDS recv failed: %s (errno=%d)",
-        std::strerror(errno), errno);
+    // Resize if needed
+    if (static_cast<size_t>(n) > recv_buf.size()) {
+      recv_buf.resize(static_cast<size_t>(n));
     }
-    return false;
+
+    // Actually receive the message. Concurrent drains of the same fd race the
+    // peek, so only this recv decides what was dequeued: a zero-length
+    // datagram peeked above may be gone by now with a real message at the
+    // head, which is why the n == 0 case is handled after the consume — a
+    // blind fixed-size discard here could destroy that real message.
+    n = recv(socket_fd, recv_buf.data(), recv_buf.size(), MSG_DONTWAIT);
+    if (n < 0) {
+      if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        RMW_UDS_LOG_WARN_THROTTLE(
+          1000, "UDS recv failed: %s (errno=%d)",
+          std::strerror(errno), errno);
+      }
+      return false;
+    }
+    if (n == 0) {
+      // A zero-length datagram carries no WireHeader, so it is not a message.
+      // It was consumed just above: leaving it queued would keep the socket
+      // permanently readable, which spins every wait that polls this fd.
+      RMW_UDS_LOG_WARN_THROTTLE(5000, "UDS recv: zero-length datagram — dropped");
+      continue;
+    }
+    if (n < static_cast<ssize_t>(sizeof(WireHeader))) {
+      RMW_UDS_LOG_WARN_THROTTLE(
+        5000,
+        "UDS recv: runt datagram (%zd bytes, expected >= %zu) — dropped",
+        n, sizeof(WireHeader));
+      continue;
+    }
+
+    std::memcpy(&header_out, recv_buf.data(), sizeof(WireHeader));
+
+    size_t payload_len = static_cast<size_t>(n) - sizeof(WireHeader);
+    if (payload_len != header_out.payload_size) {
+      // Mismatch — typically the sender's payload was larger than our
+      // recv buffer and the kernel truncated. Surface it so we can correlate
+      // with the corresponding sender-side EMSGSIZE.
+      RMW_UDS_LOG_WARN_THROTTLE(
+        5000,
+        "UDS recv: payload size mismatch (got %zu, header says %u) — truncating",
+        payload_len, header_out.payload_size);
+      payload_len = std::min(payload_len, static_cast<size_t>(header_out.payload_size));
+    }
+
+    payload_out.assign(
+      recv_buf.data() + sizeof(WireHeader),
+      recv_buf.data() + sizeof(WireHeader) + payload_len);
+
+    return true;
   }
-  if (n < static_cast<ssize_t>(sizeof(WireHeader))) {
-    RMW_UDS_LOG_WARN_THROTTLE(
-      5000,
-      "UDS recv: runt datagram (%zd bytes, expected >= %zu) — dropped",
-      n, sizeof(WireHeader));
-    return false;
-  }
-
-  std::memcpy(&header_out, recv_buf.data(), sizeof(WireHeader));
-
-  size_t payload_len = static_cast<size_t>(n) - sizeof(WireHeader);
-  if (payload_len != header_out.payload_size) {
-    // Mismatch — typically the sender's payload was larger than our
-    // recv buffer and the kernel truncated. Surface it so we can correlate
-    // with the corresponding sender-side EMSGSIZE.
-    RMW_UDS_LOG_WARN_THROTTLE(
-      5000,
-      "UDS recv: payload size mismatch (got %zu, header says %u) — truncating",
-      payload_len, header_out.payload_size);
-    payload_len = std::min(payload_len, static_cast<size_t>(header_out.payload_size));
-  }
-
-  payload_out.assign(
-    recv_buf.data() + sizeof(WireHeader),
-    recv_buf.data() + sizeof(WireHeader) + payload_len);
-
-  return true;
 }
 
 OutboundPayload shm_prepare_send(
