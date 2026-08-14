@@ -50,7 +50,7 @@ static int64_t steady_now_ns()
     std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// Shortest gap between two stale-slot sweeps in one process.
+// Shortest gap between two stale-slot sweeps in one context.
 static constexpr int64_t CLEANUP_MIN_INTERVAL_NS = 1000000000;  // 1 s
 
 // Reclaiming slots whose owner died is garbage collection: it walks every live
@@ -62,9 +62,12 @@ static constexpr int64_t CLEANUP_MIN_INTERVAL_NS = 1000000000;  // 1 s
 // This does not weaken any guarantee. A graph query can already return an
 // entity whose owner died a microsecond after the sweep that vetted it, so the
 // answer was never a liveness statement to begin with; the throttle only
-// widens a window that was always open. The full-registry path in registry_add
-// still sweeps unconditionally, because there it is the last resort before
-// entity creation fails.
+// widens a window that was always open. The observable cost is crash-detection
+// latency: reclaiming a dead process's slots — and with them the doorbell
+// rings and latched-cache teardown only a sweep produces — now lags up to one
+// interval per polling context. The full-registry path in registry_add still
+// sweeps unconditionally, because there it is the last resort before entity
+// creation fails.
 static void maybe_cleanup_stale(rmw_uds::UdsContext * ctx, rmw_uds::RegistryHeader * header)
 {
   const int64_t now = steady_now_ns();
