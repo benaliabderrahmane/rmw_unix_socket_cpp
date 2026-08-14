@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "identifier.hpp"
+#include "logging.hpp"
 #include "registry.hpp"
 #include "transport.hpp"
 #include "types.hpp"
@@ -25,6 +26,7 @@
 #include <limits>
 #include <memory>
 #include <set>
+#include <unordered_set>
 
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -273,17 +275,25 @@ rmw_ret_t rmw_wait(
   // this same entity. ws_data->armed remembers what each fd was armed for and
   // survives across calls, so in the steady state this pass costs no syscall
   // at all. A fd number reused after its previous owner closed carries a
-  // different uid and is re-armed. The kernel auto-removes closed fds, so no
-  // EPOLL_CTL_DEL is needed.
+  // different uid and is re-armed. A ready fd is dispatched below only when
+  // this call armed it (armed_this_call); stale entries are pruned there.
   //
   // gc_index maps a guard condition back to its slot in the caller's array, so
   // an epoll result can mark the right entry in gc_triggered below.
   std::unordered_map<const void *, size_t> gc_index;
+  // Fds armed by THIS call: the caller's entities plus the doorbell. The
+  // dispatch loop never touches an entity outside this set — it may already
+  // be destroyed, or belong to a wait set that is actually waiting on it.
+  std::unordered_set<int> armed_this_call;
+  // Entities epoll could not watch (e.g. watch exhaustion): drained directly
+  // each call below so they degrade to polling instead of vanishing.
+  std::vector<rmw_uds::ArmedEntry> unarmed;
   {
     struct epoll_event ev;
     std::memset(&ev, 0, sizeof(ev));
     auto register_fd = [&](int fd, uint8_t kind, void * entity, uint64_t uid) {
         if (fd < 0) {return;}
+        armed_this_call.insert(fd);
         auto it = ws_data->armed.find(fd);
         if (it != ws_data->armed.end() && it->second.uid == uid) {
           return;  // Already armed for this entity.
@@ -297,7 +307,18 @@ rmw_ret_t rmw_wait(
         if (epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_ADD, fd, &ev) != 0 &&
           errno != EEXIST)
         {
-          return;  // Other errors are ignored, as before.
+          // Without a watch this entity is never reported ready, and there is
+          // no unconditional pre-drain any more — a silent skip would leave it
+          // permanently invisible. Surface the error (epoll watch exhaustion
+          // is an operator-level sysctl problem) and fall back to polling.
+          RMW_UDS_LOG_ERROR_THROTTLE(
+            1000,
+            "epoll_ctl ADD failed for fd %d: %s (errno=%d) — entity degraded "
+            "to per-wait polling",
+            fd, std::strerror(errno), errno);
+          armed_this_call.erase(fd);
+          unarmed.push_back(rmw_uds::ArmedEntry{kind, entity, uid});
+          return;
         }
         ws_data->armed[fd] = rmw_uds::ArmedEntry{kind, entity, uid};
       };
@@ -336,6 +357,36 @@ rmw_ret_t rmw_wait(
     // It has no entity, so uid 0 (never handed out by next_entity_uid) arms it
     // exactly once for the life of the wait set.
     register_fd(doorbell_fd, rmw_uds::ARMED_DOORBELL, nullptr, 0);
+  }
+
+  // Fallback for entities epoll cannot watch: drain their sockets directly so
+  // the queue check below still sees their data, and bound the block below so
+  // the drain recurs. Guard-condition eventfds need no drain here — step 2
+  // reads every caller GC directly.
+  for (const auto & ue : unarmed) {
+    switch (ue.kind) {
+      case rmw_uds::ARMED_SUBSCRIPTION: {
+          auto * sub = static_cast<rmw_uds::UdsSubscription *>(ue.entity);
+          drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
+            sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id,
+            sub->ignore_local_publications, sub->context->context_id);
+          break;
+        }
+      case rmw_uds::ARMED_SERVICE: {
+          auto * srv = static_cast<rmw_uds::UdsService *>(ue.entity);
+          drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1,
+            srv->shm_cache, srv->context->domain_id);
+          break;
+        }
+      case rmw_uds::ARMED_CLIENT: {
+          auto * cli = static_cast<rmw_uds::UdsClient *>(ue.entity);
+          drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2,
+            cli->shm_cache, cli->context->domain_id);
+          break;
+        }
+      default:
+        break;
+    }
   }
 
   // 2. Check if anything is already ready, without blocking. drain_socket()
@@ -445,6 +496,12 @@ rmw_ret_t rmw_wait(
           block_ms = static_cast<int>(
             std::min<int64_t>(rem_ms, std::numeric_limits<int>::max()));
         }
+        if (!unarmed.empty() && (block_ms < 0 || block_ms > 200)) {
+          // An entity epoll cannot watch: never block unbounded, or its event
+          // is silently lost forever. The early return is a spurious wake
+          // (OK, nothing ready) that lets the next rmw_wait re-drain.
+          block_ms = 200;
+        }
       }
       int n = epoll_wait(ws_data->epoll_fd, ready_events, 64, block_ms);
       if (n < 0) {
@@ -467,10 +524,22 @@ rmw_ret_t rmw_wait(
       bool progressed = false;
       bool rang = false;
       for (int e = 0; e < n; ++e) {
-        auto it = ws_data->armed.find(ready_events[e].data.fd);
-        if (it == ws_data->armed.end()) {
-          progressed = true;  // Unknown fd: end the wait rather than spin on it.
-          continue;
+        const int rfd = ready_events[e].data.fd;
+        auto it = ws_data->armed.find(rfd);
+        if (it == ws_data->armed.end() ||
+          armed_this_call.find(rfd) == armed_this_call.end())
+        {
+          // Not armed by this call: the entity may belong to another wait set
+          // now, or may already be destroyed. Never touch it — consuming its
+          // event here would steal a wakeup the owning wait set never gets
+          // back, and dereferencing a destroyed entity is a use-after-free.
+          // Withdraw the fd so a readable level-triggered fd cannot spin this
+          // loop; a later call that waits on the entity re-arms it.
+          (void)epoll_ctl(ws_data->epoll_fd, EPOLL_CTL_DEL, rfd, nullptr);
+          if (it != ws_data->armed.end()) {
+            ws_data->armed.erase(it);
+          }
+          continue;  // Not progress: nothing the caller waits on changed.
         }
         const rmw_uds::ArmedEntry & entry = it->second;
         switch (entry.kind) {
@@ -532,6 +601,10 @@ rmw_ret_t rmw_wait(
         run_generation_check();  // Drains the doorbell, replays, triggers GCs.
       }
       if (poll_only) {
+        if (n == 64) {
+          continue;  // A full batch: more fds may be ready than one epoll_wait
+                     // reports. Terminates because drained fds stop being ready.
+        }
         break;  // Non-blocking sweep: a single pass is all it is for.
       }
       if (progressed) {
@@ -540,9 +613,13 @@ rmw_ret_t rmw_wait(
       if (!infinite && steady_now_ns() >= caller_deadline_ns) {
         break;  // Doorbell-only wake at the deadline -> timeout.
       }
+      if (!unarmed.empty()) {
+        break;  // Bounded degraded wait: surface the spurious wake so the
+                // caller's next rmw_wait re-drains the unwatchable entities.
+      }
       // Doorbell-only wake: re-block for the caller's remaining time.
     }
-    // No EPOLL_CTL_DEL needed — fds stay registered across calls.
+    // Fds stay registered across calls; the gate above prunes stale ones.
   }
 
   // 4. Set output: ready entities stay, non-ready set to NULL
