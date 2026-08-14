@@ -14,6 +14,8 @@
 
 #include <sys/stat.h>
 
+#include <chrono>
+
 #include "identifier.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
@@ -172,6 +174,15 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
     rmw_uds::registry_cleanup_stale(init_header);
     rmw_uds::cleanup_orphan_socket_files(domain_id);
     rmw_uds::shm_cleanup_orphan_segments(domain_id);
+    // Date the sweep, or the first graph query — typically moments later,
+    // during node discovery — repeats the full stat-every-slot pass this one
+    // just paid for. Also keeps 0 unreachable as a live sentinel (steady_clock
+    // starts at boot, so a process starting within the first second of uptime
+    // would otherwise misread 0 as "swept just now").
+    ctx->last_cleanup_ns.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(),
+      std::memory_order_relaxed);
   }
 
   rmw_uds::warn_if_sysctl_buffers_undersized();
