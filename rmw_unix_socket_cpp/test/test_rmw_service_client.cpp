@@ -240,6 +240,57 @@ TEST_F(ServiceClientTest, LargeRequestDeliveredThroughWaitDrain)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
 }
 
+// Response delivery through rmw_wait: post-drain-only-ready-fds, a client
+// socket is read only when epoll reports it in the wait, so the client arm of
+// that dispatch is the sole path that makes a response visible to an executor.
+// Drive it via a wait on the clients array rather than a direct take.
+TEST_F(ServiceClientTest, ResponseDeliveredThroughWaitOnClient)
+{
+  srv = rmw_create_service(node, ts, "/wait_client_srv", &qos);
+  cli = rmw_create_client(node, ts, "/wait_client_srv", &qos);
+  ASSERT_NE(nullptr, srv);
+  ASSERT_NE(nullptr, cli);
+
+  test_msgs::srv::BasicTypes::Request request;
+  request.int32_value = 55;
+  int64_t seq_id = 0;
+  EXPECT_EQ(RMW_RET_OK, rmw_send_request(cli, &request, &seq_id));
+
+  test_msgs::srv::BasicTypes::Request recv_request;
+  rmw_service_info_t request_header;
+  std::memset(&request_header, 0, sizeof(request_header));
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_request(srv, &request_header, &recv_request, &taken));
+  ASSERT_TRUE(taken);
+
+  test_msgs::srv::BasicTypes::Response response;
+  response.int32_value = 110;
+  EXPECT_EQ(RMW_RET_OK, rmw_send_response(srv, &request_header.request_id, &response));
+
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  rmw_clients_t clients;
+  void * cli_array[1] = {cli->data};
+  clients.clients = cli_array;
+  clients.client_count = 1;
+  rmw_time_t timeout{2, 0};
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_wait(nullptr, nullptr, nullptr, &clients, nullptr, ws, &timeout)) <<
+    "the response never made the client ready through rmw_wait";
+  EXPECT_NE(nullptr, clients.clients[0]);
+
+  test_msgs::srv::BasicTypes::Response recv_response;
+  rmw_service_info_t response_header;
+  std::memset(&response_header, 0, sizeof(response_header));
+  taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_response(cli, &response_header, &recv_response, &taken));
+  ASSERT_TRUE(taken);
+  EXPECT_EQ(110, recv_response.int32_value);
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+}
+
 TEST_F(ServiceClientTest, SendResponseToGoneClientReturnsOk)
 {
   // A service that responds after its client has shut down must NOT return an

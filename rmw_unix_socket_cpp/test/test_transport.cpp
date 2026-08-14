@@ -138,6 +138,52 @@ TEST_F(TransportTest, RecvFromConsumesZeroLengthDatagram)
   rmw_uds::close_socket(recv_fd, path);
 }
 
+// A junk datagram must not end a drain: with a zero-length datagram queued
+// ahead of a real message, a single recv_from call must consume the junk and
+// return the real message. Every drain loop stops on the first false, so
+// returning false here would leave the real message stranded until the next
+// wake.
+TEST_F(TransportTest, RecvFromSkipsZeroLengthDatagramToRealMessage)
+{
+  auto path = rmw_uds::make_socket_path(domain_id, "zerolen_then_real");
+  int recv_fd = rmw_uds::create_bound_socket(path);
+  ASSERT_GE(recv_fd, 0);
+
+  int send_fd = rmw_uds::create_send_socket();
+  ASSERT_GE(send_fd, 0);
+
+  struct sockaddr_un addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+  ASSERT_EQ(
+    0, sendto(
+      send_fd, nullptr, 0, 0,
+      reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)));
+
+  rmw_uds::WireHeader send_hdr;
+  std::memset(&send_hdr, 0, sizeof(send_hdr));
+  send_hdr.sequence_number = 7;
+  std::vector<uint8_t> payload = {9, 8, 7};
+  send_hdr.payload_size = static_cast<uint32_t>(payload.size());
+  ASSERT_EQ(
+    rmw_uds::SendResult::Ok,
+    rmw_uds::send_to(send_fd, path, send_hdr, payload.data(), payload.size()));
+
+  rmw_uds::WireHeader hdr;
+  std::vector<uint8_t> recv_payload;
+  EXPECT_TRUE(rmw_uds::recv_from(recv_fd, hdr, recv_payload)) <<
+    "the zero-length datagram terminated the drain with a real message queued";
+  EXPECT_EQ(7, hdr.sequence_number);
+  EXPECT_EQ(payload, recv_payload);
+
+  // Nothing left: the junk was consumed, not skipped over.
+  EXPECT_FALSE(rmw_uds::recv_from(recv_fd, hdr, recv_payload));
+
+  close(send_fd);
+  rmw_uds::close_socket(recv_fd, path);
+}
+
 TEST_F(TransportTest, MultipleMessages)
 {
   auto path = rmw_uds::make_socket_path(domain_id, "multi");

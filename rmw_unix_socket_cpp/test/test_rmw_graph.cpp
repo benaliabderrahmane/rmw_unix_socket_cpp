@@ -14,6 +14,7 @@
 
 #include "test_base.hpp"
 
+#include <chrono>
 #include <cstring>
 #include <string>
 
@@ -51,7 +52,18 @@ TEST_F(RmwUdsNodeTest, GetNodeNames)
 
 // registry_cleanup_stale walks every live slot and stats /proc/<pid> for each
 // one. That is garbage collection, and it must not run on every graph query.
-TEST_F(RmwUdsNodeTest, GraphQueryThrottlesStaleCleanup)
+//
+// Private domain: the assertions below are negatives on shared registry state,
+// and domain 99 is one machine-global segment that every fixture-based test
+// binary sweeps unthrottled at rmw_init — under parallel ctest that reclaims
+// the ghost mid-test. (94-98 are taken by the other binaries, 99 by fixtures.)
+class RmwUdsGraphThrottleTest : public RmwUdsNodeTest
+{
+protected:
+  RmwUdsGraphThrottleTest() {domain_id = 93;}
+};
+
+TEST_F(RmwUdsGraphThrottleTest, GraphQueryThrottlesStaleCleanup)
 {
   auto * nd = static_cast<rmw_uds::UdsNode *>(node->data);
   auto * header = rmw_uds::registry_header(nd->context->registry_ptr);
@@ -82,18 +94,43 @@ TEST_F(RmwUdsNodeTest, GraphQueryThrottlesStaleCleanup)
       return found;
     };
 
-  // The first query after a quiet period does sweep, so this one is reclaimed.
-  ASSERT_GE(add_ghost("ghost_first"), 0);
+  auto steady_ns = [] {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+
+  // Age the stamp past the interval so the first query sweeps regardless of
+  // how recently rmw_init dated its own sweep.
+  nd->context->last_cleanup_ns.store(
+    steady_ns() - 2 * 1000000000LL, std::memory_order_relaxed);
+  const int32_t first = add_ghost("ghost_first");
+  ASSERT_GE(first, 0);
   EXPECT_FALSE(graph_lists("ghost_first")) <<
     "the first graph query should still reclaim dead slots";
 
-  // A second dead slot added immediately must survive: the sweep is throttled,
-  // so the very next query does not pay for another full stat() pass.
+  // Re-arm the throttle deterministically rather than racing the 1 s interval
+  // against the wall clock (a slow/sanitized run can lose that race).
+  nd->context->last_cleanup_ns.store(steady_ns(), std::memory_order_relaxed);
+
+  // A second dead slot added now must survive: the sweep is throttled, so the
+  // very next query does not pay for another full stat() pass.
   const int32_t second = add_ghost("ghost_second");
   ASSERT_GE(second, 0);
   EXPECT_TRUE(graph_lists("ghost_second")) <<
     "cleanup_stale ran again right away; the throttle is not in effect";
 
+  // And the sweep must resume once the interval has passed — "once per process
+  // lifetime" would satisfy the two assertions above. Age the stamp again
+  // instead of sleeping through the interval.
+  nd->context->last_cleanup_ns.store(
+    steady_ns() - 2 * 1000000000LL, std::memory_order_relaxed);
+  EXPECT_FALSE(graph_lists("ghost_second")) <<
+    "the sweep never resumed after the throttle interval passed";
+
+  // A failed assertion above strands a ghost in the persistent segment; remove
+  // unconditionally (no-op for slots the sweeps already reclaimed — nothing
+  // else writes this private domain, so the indices cannot have been reused).
+  rmw_uds::registry_remove(header, first);
   rmw_uds::registry_remove(header, second);
 }
 

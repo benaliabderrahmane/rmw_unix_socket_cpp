@@ -31,13 +31,15 @@ class RmwUdsTestBase : public ::testing::Test
 protected:
   rmw_context_t context = rmw_get_zero_initialized_context();
   rmw_init_options_t options = rmw_get_zero_initialized_init_options();
+  // Unique domain to avoid collisions with running ROS systems. A subclass
+  // constructor may override it for tests that need a private registry.
+  size_t domain_id = 99;
 
   void SetUp() override
   {
     rcutils_allocator_t allocator = rcutils_get_default_allocator();
     ASSERT_EQ(RMW_RET_OK, rmw_init_options_init(&options, allocator));
-    // Use a unique domain to avoid collisions with running ROS systems
-    options.domain_id = 99;
+    options.domain_id = domain_id;
     ASSERT_EQ(RMW_RET_OK, rmw_init(&options, &context));
   }
 
