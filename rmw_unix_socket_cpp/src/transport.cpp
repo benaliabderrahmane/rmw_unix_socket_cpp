@@ -231,7 +231,7 @@ bool recv_from(
     // datagram peeked above may be gone by now with a real message at the
     // head, which is why the n == 0 case is handled after the consume — a
     // blind fixed-size discard here could destroy that real message.
-    n = recv(socket_fd, recv_buf.data(), recv_buf.size(), MSG_DONTWAIT);
+    n = recv(socket_fd, recv_buf.data(), recv_buf.size(), MSG_DONTWAIT | MSG_TRUNC);
     if (n < 0) {
       if (errno != EAGAIN && errno != EWOULDBLOCK) {
         RMW_UDS_LOG_WARN_THROTTLE(
@@ -239,6 +239,16 @@ bool recv_from(
           std::strerror(errno), errno);
       }
       return false;
+    }
+    if (static_cast<size_t>(n) > recv_buf.size()) {
+      // A datagram larger than the buffer raced in behind a smaller peek; the
+      // kernel discarded its tail, so the prefix must not be delivered as a
+      // complete message.
+      RMW_UDS_LOG_WARN_THROTTLE(
+        5000,
+        "UDS recv: datagram truncated (%zd > %zu bytes) — dropped",
+        n, recv_buf.size());
+      continue;
     }
     if (n == 0) {
       // A zero-length datagram carries no WireHeader, so it is not a message.
