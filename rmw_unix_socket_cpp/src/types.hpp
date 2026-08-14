@@ -169,9 +169,10 @@ struct UdsContext
   std::atomic<bool> is_shutdown{false};
   std::atomic<uint64_t> last_registry_generation{0};
 
-  // Last time this process swept the registry for slots whose owning process
+  // Last time this context swept the registry for slots whose owning process
   // is gone (steady clock, ns). Keeps that sweep off the graph query path; see
-  // maybe_cleanup_stale in rmw_graph.cpp.
+  // maybe_cleanup_stale in rmw_graph.cpp. Stamped by the rmw_init sweep too;
+  // the registry-full fallback sweep in registry_add does not participate.
   std::atomic<int64_t> last_cleanup_ns{0};
 
   // Doorbell: a bound datagram socket other processes ring (one octet) after
@@ -402,10 +403,13 @@ struct UdsWaitSet
   // GraphListener), so it cannot be scavenged from the waited-on entities.
   UdsContext * context = nullptr;
   // fd -> what it was armed for. Survives across rmw_wait calls, which is what
-  // lets the arming pass cost no syscall in the steady state. Entries for
-  // destroyed entities are harmless: closing the fd removes it from the epoll
-  // set, so it can never be reported again, and a fd number reused by a new
-  // entity is re-armed because the uid differs.
+  // lets the arming pass cost no syscall in the steady state. An entry is
+  // dispatched only when the current call armed its fd (rmw_wait's
+  // armed_this_call gate); a ready fd outside that set — an entity waited on
+  // elsewhere now, or destroyed — is EPOLL_CTL_DEL'd and erased without ever
+  // dereferencing `entity`. (close() alone does not guarantee epoll removal:
+  // a fork()ed child or dup() keeps the open file description alive.) A fd
+  // number reused by a new entity is re-armed because the uid differs.
   std::unordered_map<int, ArmedEntry> armed;
 };
 
