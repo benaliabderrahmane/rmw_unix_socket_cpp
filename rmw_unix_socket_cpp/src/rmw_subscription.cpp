@@ -315,7 +315,13 @@ rmw_subscription_t * rmw_create_subscription(
           if (!rmw_uds::shm_resolve_incoming(
               pull_cache, ctx->domain_id, msg.header, msg.payload))
           {
-            continue;  // large payload's segment already evicted: lapped
+            // The slot was overwritten and its segment unlinked between the
+            // scan and this resolve, so the sample is not delivered here. A
+            // watermark cannot express a hole: it stops below this sequence
+            // and the rest arrives as datagrams — claiming the sequence would
+            // drop the in-flight datagram carrying that very sample.
+            max_seq = rec.sequence_number - 1;
+            break;
           }
           msg.received_timestamp_ns = now_ns;
           sub_data->message_queue.push_back(std::move(msg));

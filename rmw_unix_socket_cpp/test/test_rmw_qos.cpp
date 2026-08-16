@@ -18,9 +18,13 @@
 #include <atomic>
 #include <cstdlib>
 #include <cstring>
+#include <set>
+#include <string>
 #include <thread>
 #include <chrono>
 
+#include <dirent.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -1382,6 +1386,78 @@ TEST_F(QosTest, TransientLocalWatermarkDropsForgedDuplicate)
     if (!taken) {std::this_thread::sleep_for(std::chrono::milliseconds(2));}
   }
   EXPECT_TRUE(got_live) << "live sample after the watermark was not delivered";
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+TEST_F(QosTest, ReplayWatermarkStopsAtAnUnresolvableRecord)
+{
+  // An over-cap latched record whose durable segment is unlinked after the
+  // scan copied its descriptor cannot be resolved, so it is never delivered.
+  // The watermark must not claim its sequence: the same sample's live
+  // datagram is inline at this size and may be in flight, and dedup would
+  // drop it — losing the sample outright. Unlinking the segments before the
+  // pull stands in for the concurrent overwrite that produces this state.
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto qos = make_qos(
+    RMW_QOS_POLICY_RELIABILITY_RELIABLE,
+    RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL, 5);
+
+  char prefix[64];
+  std::snprintf(prefix, sizeof(prefix), "ros2_uds_data_%zu_%d_",
+    static_cast<size_t>(node->context->actual_domain_id),
+    static_cast<int>(getpid()));
+  auto data_segments = [&prefix]() {
+      std::set<std::string> names;
+      DIR * dir = opendir("/dev/shm");
+      if (dir == nullptr) {
+        return names;
+      }
+      while (auto * entry = readdir(dir)) {
+        if (std::strncmp(entry->d_name, prefix, std::strlen(prefix)) == 0) {
+          names.insert(std::string("/") + entry->d_name);
+        }
+      }
+      closedir(dir);
+      return names;
+    };
+  const auto before = data_segments();
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, seq_ts, "/wm_unresolvable", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  test_msgs::msg::UnboundedSequences msg;
+  msg.uint8_values.resize(4 * 1024);  // over TL_EMBED_CAP: staged durably
+  for (int i = 1; i <= 3; ++i) {  // sequences 1..3
+    msg.uint8_values[0] = static_cast<uint8_t>(i);
+    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+  }
+
+  size_t evicted = 0;
+  for (const auto & name : data_segments()) {
+    if (before.count(name) == 0) {
+      shm_unlink(name.c_str());
+      ++evicted;
+    }
+  }
+  ASSERT_GT(evicted, 0u) << "no durable segment was staged for the latched samples";
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, seq_ts, "/wm_unresolvable", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+  std::array<uint8_t, 16> key;
+  std::memcpy(key.data(), pub_data->gid.data, key.size());
+  {
+    std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
+    EXPECT_EQ(0, sub_data->replayed_watermarks[key])
+      << "the watermark claimed sequences the replay never delivered";
+  }
 
   auto _r1 [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _r2 [[maybe_unused]] = rmw_destroy_publisher(node, pub);
