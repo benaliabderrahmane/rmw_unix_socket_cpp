@@ -840,9 +840,12 @@ bool tl_ring_pull(
   const uint32_t slots = header->slots;
   const auto * area = static_cast<const uint8_t *>(base) + SHM_RECORD_ALIGN;
 
-  // (slot index, accepted seq) per pulled record, re-checked after the scan
-  // to detect a writer latching concurrently (see overlapped_out contract).
-  std::vector<std::pair<uint32_t, uint32_t>> accepted_at;
+  // Last seq the scan observed in EVERY slot, including the ones that yield
+  // no record (never written, or given up on mid-write). A writer filling
+  // one of those during the scan opens a sequence gap that the pulled
+  // records alone cannot reveal, so all slots are re-checked afterwards —
+  // pulled ones only would miss exactly that case (overlapped_out contract).
+  std::vector<uint32_t> observed(slots, 0);
 
   for (uint32_t i = 0; i < slots; ++i) {
     const auto * record =
@@ -853,6 +856,7 @@ bool tl_ring_pull(
     // never spins on memory a dead writer owned.
     for (int retry = 0; retry < 16; ++retry) {
       const uint32_t s1 = record->seq.load(std::memory_order_acquire);
+      observed[i] = s1;
       if (s1 == 0) {
         break;  // never written
       }
@@ -889,19 +893,18 @@ bool tl_ring_pull(
       if (rec.sequence_number > max_seq_out) {
         max_seq_out = rec.sequence_number;
       }
-      accepted_at.emplace_back(i, s1);
       records_out.push_back(std::move(rec));
       break;
     }
   }
-  // Overlap detection: if any pulled slot's seq moved since its snapshot, a
+  // Overlap detection: if any slot's seq moved since the scan observed it, a
   // writer latched during the scan — the result is not a point-in-time
   // snapshot, and a sequence gap in it may hide a sample the scan missed.
   if (overlapped_out) {
-    for (const auto & [slot_i, s1] : accepted_at) {
+    for (uint32_t i = 0; i < slots; ++i) {
       const auto * rec_hdr =
-        reinterpret_cast<const ShmRecordHeader *>(area + slot_i * stride);
-      if (rec_hdr->seq.load(std::memory_order_acquire) != s1) {
+        reinterpret_cast<const ShmRecordHeader *>(area + i * stride);
+      if (rec_hdr->seq.load(std::memory_order_acquire) != observed[i]) {
         *overlapped_out = true;
         break;
       }
