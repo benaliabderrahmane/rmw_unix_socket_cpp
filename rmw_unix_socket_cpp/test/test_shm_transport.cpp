@@ -14,12 +14,15 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -407,6 +410,97 @@ TEST_F(ShmTransportTest, TlRingPullSkipsPoisonedSlotAndReturnsPromptly)
   EXPECT_EQ(4, max_seq);
 
   rmw_uds::tl_ring_close(ring);
+}
+
+TEST_F(ShmTransportTest, TlRingPullFlagsOverlapWhenASkippedSlotIsFilled)
+{
+  // The dedup watermark is sound only if a sequence gap in the pulled result
+  // implies overlapped: on overlap the subscriber keeps just the contiguous
+  // prefix, and without it extends the watermark across the gap — dropping
+  // the missing sample's in-flight datagram. Slots the scan SKIPS (never
+  // written, or given up on after the bounded retries) produce no record, so
+  // a writer filling one during the scan has to be detected all the same.
+  //
+  // The interleaving is forced, not raced: both threads share one CPU, so the
+  // latching thread runs only when the scan yields — which it does at the
+  // poisoned slot, after it has already passed the empty slots 2-5.
+  cpu_set_t original;
+  CPU_ZERO(&original);
+  if (sched_getaffinity(0, sizeof(original), &original) != 0) {
+    GTEST_SKIP() << "CPU affinity unavailable";
+  }
+  cpu_set_t single;
+  CPU_ZERO(&single);
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (CPU_ISSET(cpu, &original)) {
+      CPU_SET(cpu, &single);
+      break;
+    }
+  }
+  if (sched_setaffinity(0, sizeof(single), &single) != 0) {
+    GTEST_SKIP() << "cannot pin to a single CPU";
+  }
+
+  uint8_t gid[16] = {0x5A, 1, 2, 3, 4, 5, 6, 7, 0xC3, 9, 10, 11, 12, 13, 14, 15};
+  bool exercised = false;
+  for (int attempt = 0; attempt < 20 && !exercised; ++attempt) {
+    rmw_uds::TlRingWriter latched;
+    ASSERT_TRUE(rmw_uds::tl_ring_create(latched, domain_id, gid, 8));
+    std::unique_ptr<rmw_uds::DurableShmSegment> evicted;
+    for (int64_t i = 1; i <= 2; ++i) {  // slots 0,1 — the cursor stops at 2
+      auto hdr = make_tl_header(i);
+      std::vector<uint8_t> payload(32, static_cast<uint8_t>(i));
+      hdr.payload_size = static_cast<uint32_t>(payload.size());
+      ASSERT_TRUE(rmw_uds::tl_ring_latch(
+          latched, hdr, payload.data(), payload.size(), nullptr, nullptr, evicted));
+    }
+    // Slot 6 odd, exactly as sample 7 mid-write leaves it: the scan stalls
+    // there, having already passed slots 2-5 as never-written.
+    auto * poisoned = reinterpret_cast<rmw_uds::ShmRecordHeader *>(
+      latched.base + 64 /* header area */ + 6 * latched.slot_bytes);
+    poisoned->seq.store(7 * 2 - 1, std::memory_order_release);
+
+    std::atomic<bool> go{false};
+    std::thread latcher([&latched, &go]() {
+        while (!go.load(std::memory_order_acquire)) {
+        }
+        std::unique_ptr<rmw_uds::DurableShmSegment> ev;
+        for (int64_t i = 3; i <= 8; ++i) {  // slots 2-7; sample 7 clears slot 6
+          auto hdr = make_tl_header(i);
+          std::vector<uint8_t> payload(32, static_cast<uint8_t>(i));
+          hdr.payload_size = static_cast<uint32_t>(payload.size());
+          (void)rmw_uds::tl_ring_latch(
+            latched, hdr, payload.data(), payload.size(), nullptr, nullptr, ev);
+        }
+      });
+
+    std::vector<rmw_uds::TlPulledRecord> records;
+    int64_t max_seq = 0;
+    bool overlapped = false;
+    go.store(true, std::memory_order_release);
+    const bool pulled = rmw_uds::tl_ring_pull(
+      latched.shm_name, gid, 10, records, max_seq, &overlapped);
+    latcher.join();
+
+    bool gap = false;
+    for (size_t i = 1; i < records.size(); ++i) {
+      if (records[i].sequence_number != records[i - 1].sequence_number + 1) {
+        gap = true;
+        break;
+      }
+    }
+    if (pulled && gap) {
+      exercised = true;
+      EXPECT_TRUE(overlapped)
+        << "a gap opened by skipping a slot the writer then filled must read "
+        << "as overlap, or the watermark swallows the missing sample";
+    }
+    rmw_uds::tl_ring_close(latched);
+  }
+  (void)sched_setaffinity(0, sizeof(original), &original);
+  if (!exercised) {
+    GTEST_SKIP() << "the scan never observed a writer-created gap";
+  }
 }
 
 TEST_F(ShmTransportTest, TlRingDepthClampAndNewestSuffix)

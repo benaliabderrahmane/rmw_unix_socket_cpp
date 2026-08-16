@@ -384,10 +384,11 @@ bool tl_ring_latch(
 // watermark. Per-slot seqlock reads are bounded (skip, never spin), so a
 // publisher killed mid-write cannot hang subscription creation.
 // *overlapped_out is set true when a writer latched DURING the scan (any
-// pulled slot's seq moved by the end): the scan is then not a point-in-time
-// snapshot and a sequence gap in the result may hide a sample the scan
-// missed — the caller must not extend its dedup watermark across such a gap
-// (the missed sample's datagram is in flight and must not be dropped).
+// slot's seq moved by the end — skipped slots included, since those are the
+// ones a gap hides behind): the scan is then not a point-in-time snapshot
+// and a sequence gap in the result may hide a sample the scan missed — the
+// caller must not extend its dedup watermark across such a gap (the missed
+// sample's datagram is in flight and must not be dropped).
 bool tl_ring_pull(
   const std::string & shm_name,
   const uint8_t * expected_gid16,
