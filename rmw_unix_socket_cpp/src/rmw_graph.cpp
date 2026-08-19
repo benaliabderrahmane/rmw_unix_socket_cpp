@@ -16,6 +16,7 @@
 #include "registry.hpp"
 #include "types.hpp"
 
+#include <chrono>
 #include <cstring>
 #include <map>
 #include <set>
@@ -43,6 +44,47 @@ static rmw_uds::UdsContext * get_context(const rmw_node_t * node)
   return nd->context;
 }
 
+static int64_t steady_now_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Shortest gap between two stale-slot sweeps in one context.
+static constexpr int64_t CLEANUP_MIN_INTERVAL_NS = 1000000000;  // 1 s
+
+// Reclaiming slots whose owner died is garbage collection: it walks every live
+// entry and stats /proc/<pid> for each one. Running that on every graph query
+// made a single call cost tens of milliseconds on a large registry, and a tool
+// polling the graph paid it several times a second whether or not anything had
+// changed. Sweep at most once per interval instead.
+//
+// This does not weaken any guarantee. A graph query can already return an
+// entity whose owner died a microsecond after the sweep that vetted it, so the
+// answer was never a liveness statement to begin with; the throttle only
+// widens a window that was always open. The observable cost is crash-detection
+// latency: reclaiming a dead process's slots — and with them the doorbell
+// rings and latched-cache teardown only a sweep produces — now lags up to one
+// interval per polling context. The full-registry path in registry_add still
+// sweeps unconditionally, because there it is the last resort before entity
+// creation fails.
+static void maybe_cleanup_stale(rmw_uds::UdsContext * ctx, rmw_uds::RegistryHeader * header)
+{
+  const int64_t now = steady_now_ns();
+  int64_t last = ctx->last_cleanup_ns.load(std::memory_order_relaxed);
+  if (now - last < CLEANUP_MIN_INTERVAL_NS) {
+    return;
+  }
+  // Whoever wins the CAS sweeps; the others skip rather than queue up behind
+  // it, which is the pile-up this change exists to remove.
+  if (!ctx->last_cleanup_ns.compare_exchange_strong(
+      last, now, std::memory_order_relaxed, std::memory_order_relaxed))
+  {
+    return;
+  }
+  rmw_uds::registry_cleanup_stale(header);
+}
+
 static std::vector<rmw_uds::RegistryQueryResult> query_all(
   rmw_uds::UdsContext * ctx,
   rmw_uds::RegistryEntryType type,
@@ -53,7 +95,7 @@ static std::vector<rmw_uds::RegistryQueryResult> query_all(
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
   // Lock-free: cleanup_stale + query both use the per-slot seqlock protocol
   // and may safely run concurrently with other readers/writers.
-  rmw_uds::registry_cleanup_stale(header);
+  maybe_cleanup_stale(ctx, header);
   return rmw_uds::registry_query(header, type, topic, node_name, node_ns);
 }
 
