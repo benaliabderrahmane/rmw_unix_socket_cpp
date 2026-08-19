@@ -19,6 +19,8 @@
 #include "transport.hpp"
 #include "types.hpp"
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 
@@ -56,6 +58,24 @@ static int64_t system_now_ns()
     std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// TRANSIENT_LOCAL dedup: true when this datagram's sample was already
+// delivered by the creation-time pull — the sender's GID has a watermark and
+// the sequence number is at or below it. Sequence numbers are assigned inside
+// the publisher's latch critical section and the pull never extends the
+// watermark across a scan-overlap gap, so anything <= the watermark was
+// either pulled or already lapped out of the publisher's ring at pull time —
+// history DDS would not owe a late joiner either.
+static bool is_replayed_duplicate(
+  rmw_uds::UdsSubscription * sub, const rmw_uds::WireHeader & hdr)
+{
+  std::array<uint8_t, 16> key;
+  std::memcpy(key.data(), hdr.gid, key.size());
+  std::lock_guard<std::mutex> lock(sub->queue_mutex);
+  auto it = sub->replayed_watermarks.find(key);
+  return it != sub->replayed_watermarks.end() &&
+         hdr.sequence_number <= it->second;
+}
+
 // Drain socket into message queue
 static void drain_subscription(rmw_uds::UdsSubscription * sub)
 {
@@ -64,6 +84,10 @@ static void drain_subscription(rmw_uds::UdsSubscription * sub)
 
   while (rmw_uds::recv_from(sub->socket_fd, hdr, payload)) {
     if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 0) {continue;}  // Not a topic message
+
+    if (is_replayed_duplicate(sub, hdr)) {
+      continue;  // already delivered by the creation-time pull
+    }
 
     if (!rmw_uds::shm_resolve_incoming(
         sub->shm_cache, sub->context->domain_id, hdr, payload))
@@ -216,6 +240,104 @@ rmw_subscription_t * rmw_create_subscription(
     *subscription_options : rmw_get_default_subscription_options();
   sub->can_loan_messages = false;
   sub->is_cft_enabled = false;
+
+  // TRANSIENT_LOCAL late-joiner replay, pull-based: this subscription reads
+  // each matched latched publisher's cache ITSELF — the publisher process is
+  // never woken, polled, or rung. The seq_cst fence after registry_add above
+  // mirrors the publisher's ring-write -> fence -> generation-load order
+  // (store-buffering pair): every latched sample is either in a cache this
+  // pull observes, or its publisher observed our registration and sends it
+  // as a datagram; the overlap is deduped by the per-publisher watermark.
+  // Runs to completion before the handle is returned, so pulled history
+  // always precedes live samples in the queue.
+  if (sub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    auto pubs = rmw_uds::registry_query(
+      header, rmw_uds::ENTRY_PUBLISHER, sub_data->topic_name.c_str(),
+      nullptr, nullptr);
+    // Resolve pulled descriptors through a pull-local reader cache: durable
+    // segments are one-shot (fresh owner_id per sample), so retained
+    // mappings would never hit again — tear the cache down with the pull.
+    rmw_uds::ShmReaderCache pull_cache;
+    for (const auto & p : pubs) {
+      if (p.qos.durability != RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL ||
+        p.socket_path.empty())
+      {
+        continue;  // volatile, ring-less, or old-binary publisher: no cache
+      }
+      if (sub_data->ignore_local_publications) {
+        rmw_uds::WireHeader gid_probe;
+        std::memcpy(gid_probe.gid, p.gid, sizeof(gid_probe.gid));
+        if (rmw_uds::is_same_context(gid_probe, ctx->context_id)) {
+          continue;  // same-context history is filtered exactly like live
+        }
+      }
+      std::vector<rmw_uds::TlPulledRecord> records;
+      int64_t max_seq = 0;
+      bool overlapped = false;
+      if (!rmw_uds::tl_ring_pull(
+          p.socket_path, p.gid, sub_data->queue_depth, records, max_seq,
+          &overlapped))
+      {
+        continue;  // stale incarnation, empty cache, or poisoned writer: skip
+      }
+      if (overlapped) {
+        // A writer latched during the scan, so the snapshot is not
+        // point-in-time: a sequence gap may hide a sample the scan missed
+        // whose datagram is in flight to us (our slot was already visible).
+        // Keep only the contiguous prefix and let everything above the first
+        // gap arrive as datagrams — extending the watermark across the gap
+        // would silently drop the missed sample. Without overlap, a gap can
+        // only be a dead writer's poisoned slot, where the datagrams will
+        // never come: keep everything (partial history, documented).
+        size_t keep = records.size();
+        for (size_t i = 1; i < records.size(); ++i) {
+          if (records[i].sequence_number != records[i - 1].sequence_number + 1) {
+            keep = i;
+            break;
+          }
+        }
+        if (keep < records.size()) {
+          records.resize(keep);
+        }
+        max_seq = records.empty() ? 0 : records.back().sequence_number;
+        if (records.empty()) {
+          continue;  // nothing safely claimable; datagrams will deliver
+        }
+      }
+      const int64_t now_ns = system_now_ns();
+      {
+        std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
+        for (auto & rec : records) {
+          rmw_uds::ReceivedMessage msg;
+          std::memcpy(&msg.header, rec.wire_header, sizeof(msg.header));
+          msg.payload = std::move(rec.payload);
+          if (!rmw_uds::shm_resolve_incoming(
+              pull_cache, ctx->domain_id, msg.header, msg.payload))
+          {
+            // The slot was overwritten and its segment unlinked between the
+            // scan and this resolve, so the sample is not delivered here. A
+            // watermark cannot express a hole: it stops below this sequence
+            // and the rest arrives as datagrams — claiming the sequence would
+            // drop the in-flight datagram carrying that very sample.
+            max_seq = rec.sequence_number - 1;
+            break;
+          }
+          msg.received_timestamp_ns = now_ns;
+          sub_data->message_queue.push_back(std::move(msg));
+          while (sub_data->message_queue.size() > sub_data->queue_depth) {
+            sub_data->message_queue.pop_front();
+          }
+        }
+        // Watermark AFTER a validated pull only — a publisher whose cache was
+        // not pulled must never have its datagrams dropped.
+        std::array<uint8_t, 16> key;
+        std::memcpy(key.data(), p.gid, key.size());
+        sub_data->replayed_watermarks[key] = max_seq;
+      }
+    }
+    rmw_uds::shm_reader_close(pull_cache);
+  }
   return sub;
 }
 

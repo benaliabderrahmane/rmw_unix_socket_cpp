@@ -14,6 +14,7 @@
 
 #include "shm_transport.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <chrono>
 #include <cstdio>
@@ -22,11 +23,13 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "logging.hpp"
+#include "types.hpp"  // WireHeader (blitted into latched-cache slots)
 
 namespace rmw_uds
 {
@@ -543,14 +546,18 @@ void shm_reader_close(ShmReaderCache & cache)
 
 void shm_cleanup_orphan_segments(size_t domain_id)
 {
-  // Name format (see make_segment_name, without the leading '/'):
-  //   ros2_uds_data_<domain>_<pid>_<owner>_<segment>
+  // Name formats (without the leading '/'):
+  //   ros2_uds_data_<domain>_<pid>_<owner>_<segment>   (payload rings)
+  //   ros2_uds_tl_<domain>_<pid>_<owner>               (latched caches)
   // Same dead-PID test as registry_cleanup_stale / cleanup_orphan_socket_files:
   // /proc only shows PIDs visible in our namespace, and a PID we cannot see
   // cannot be reached by our sockets either, so unlinking is safe.
-  char prefix[64];
-  std::snprintf(prefix, sizeof(prefix), "ros2_uds_data_%zu_", domain_id);
-  const size_t prefix_len = std::strlen(prefix);
+  char data_prefix[64];
+  std::snprintf(data_prefix, sizeof(data_prefix), "ros2_uds_data_%zu_", domain_id);
+  const size_t data_len = std::strlen(data_prefix);
+  char tl_prefix[64];
+  std::snprintf(tl_prefix, sizeof(tl_prefix), "ros2_uds_tl_%zu_", domain_id);
+  const size_t tl_len = std::strlen(tl_prefix);
 
   DIR * dir = opendir("/dev/shm");
   if (!dir) {
@@ -558,7 +565,12 @@ void shm_cleanup_orphan_segments(size_t domain_id)
   }
   struct dirent * ent;
   while ((ent = readdir(dir)) != nullptr) {
-    if (std::strncmp(ent->d_name, prefix, prefix_len) != 0) {
+    size_t prefix_len;
+    if (std::strncmp(ent->d_name, data_prefix, data_len) == 0) {
+      prefix_len = data_len;
+    } else if (std::strncmp(ent->d_name, tl_prefix, tl_len) == 0) {
+      prefix_len = tl_len;
+    } else {
       continue;
     }
     char * end = nullptr;
@@ -576,6 +588,361 @@ void shm_cleanup_orphan_segments(size_t domain_id)
     }
   }
   closedir(dir);
+}
+
+// ---------------------------------------------------------------------------
+// TRANSIENT_LOCAL latched cache (see shm_transport.hpp for the design notes).
+// ---------------------------------------------------------------------------
+
+static size_t tl_slot_stride()
+{
+  return align_up(TL_SLOT_BYTES_UNALIGNED, SHM_RECORD_ALIGN);
+}
+
+static uint8_t * tl_slot_at(const TlRingWriter & ring, uint32_t slot)
+{
+  return ring.base + SHM_RECORD_ALIGN /* header area */ +
+         static_cast<size_t>(slot) * ring.slot_bytes;
+}
+
+bool tl_ring_create(
+  TlRingWriter & ring,
+  size_t domain_id,
+  const uint8_t * gid16,
+  size_t depth)
+{
+  const size_t stride = tl_slot_stride();
+  size_t slots = depth == 0 ? 1 : depth;
+  const size_t max_slots = TL_RING_MAX_BYTES / stride;
+  if (slots > max_slots) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000,
+      "TRANSIENT_LOCAL depth %zu exceeds the latched-cache byte cap — "
+      "replaying the last %zu samples only",
+      depth, max_slots);
+    slots = max_slots;
+  }
+
+  // Per-incarnation unique name, same counter+time recipe as create_segment:
+  // a recycled PID can never regenerate a dead publisher's cache name, so a
+  // puller can never alias a stale segment. The name is published in the
+  // registry slot, not derived, so uniqueness costs nothing.
+  const int32_t pid = getpid();
+  auto now = std::chrono::steady_clock::now().time_since_epoch();
+  uint32_t time_component = static_cast<uint32_t>(
+    std::chrono::duration_cast<std::chrono::microseconds>(now).count() & 0xFFFF);
+  // Unlike the descriptor-borne ring owner_id (32-bit field), the tl name is
+  // a free-form string, so the full counter and the time salt are kept as
+  // separate components: the name-collision period is 2^32 creations, not
+  // 2^16 — a truncated counter could otherwise alias a LIVE same-process
+  // ring and unlink it via the EEXIST branch below.
+  const uint32_t owner_counter =
+    g_shm_owner_counter.fetch_add(1, std::memory_order_relaxed);
+  char name[96];
+  std::snprintf(name, sizeof(name), "/ros2_uds_tl_%zu_%d_%u_%x",
+    domain_id, pid, owner_counter, time_component);
+
+  int fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0644);
+  if (fd < 0 && errno == EEXIST) {
+    shm_unlink(name);
+    fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0644);
+  }
+  if (fd < 0) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "shm_open('%s') failed: %s — latched replay disabled for this publisher",
+      name, std::strerror(errno));
+    return false;
+  }
+
+  // Sparse ftruncate, unlike create_segment's eager fallocate: an idle
+  // latched publisher must cost pages proportional to what it latched, not
+  // depth x slot_bytes. Slot ranges are committed by posix_fallocate at
+  // latch time, which turns a full /dev/shm into a clean no-latch there.
+  const size_t total = SHM_RECORD_ALIGN + slots * stride;
+  if (ftruncate(fd, static_cast<off_t>(total)) != 0) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "ftruncate('%s', %zu) failed: %s — latched replay disabled",
+      name, total, std::strerror(errno));
+    close(fd);
+    shm_unlink(name);
+    return false;
+  }
+
+  // The header page is written now, so commit it eagerly.
+  const int alloc_err = posix_fallocate(fd, 0, SHM_RECORD_ALIGN);
+  if (alloc_err != 0) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "posix_fallocate('%s') failed: %s — latched replay disabled",
+      name, std::strerror(alloc_err));
+    close(fd);
+    shm_unlink(name);
+    return false;
+  }
+
+  void * base = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+  if (base == MAP_FAILED) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "mmap('%s', %zu) failed: %s — latched replay disabled",
+      name, total, std::strerror(errno));
+    close(fd);
+    shm_unlink(name);
+    return false;
+  }
+
+  auto * header = reinterpret_cast<TlRingHeader *>(base);
+  header->magic = TL_RING_MAGIC;
+  header->version = TL_RING_VERSION;
+  std::memcpy(header->gid, gid16, sizeof(header->gid));
+  header->slots = static_cast<uint32_t>(slots);
+  header->slot_bytes = static_cast<uint32_t>(stride);
+
+  ring.fd = fd;
+  ring.base = static_cast<uint8_t *>(base);
+  ring.map_size = total;
+  ring.slots = static_cast<uint32_t>(slots);
+  ring.slot_bytes = static_cast<uint32_t>(stride);
+  ring.next_index = 1;
+  ring.shm_name = name;
+  ring.durable_segs.clear();
+  ring.durable_segs.resize(slots);
+  return true;
+}
+
+bool tl_ring_latch(
+  TlRingWriter & ring,
+  const WireHeader & hdr,
+  const uint8_t * payload,
+  size_t payload_size,
+  const ShmPayloadDescriptor * staged_desc,
+  std::unique_ptr<DurableShmSegment> staged_seg,
+  std::unique_ptr<DurableShmSegment> & evicted_out)
+{
+  if (!ring.base) {
+    return false;  // ring-less publisher (creation failed) — no replay
+  }
+  if (!staged_desc && payload_size > TL_EMBED_CAP) {
+    // Over-cap payload whose caller-side staging failed: it cannot fit the
+    // fixed slot, and writing it anyway would run past the slot (and the
+    // mapping). The sample is simply not latched; live sends are unaffected.
+    return false;
+  }
+
+  // Over-cap payloads arrive pre-staged by the caller (outside cache_mutex —
+  // staging is ms-scale syscalls); the slot then carries the 32-byte
+  // descriptor, exactly like a large sample on the wire. The segment becomes
+  // owned by this slot and is evicted (returned to the caller for unlinking
+  // outside the lock) when the slot is overwritten — an in-flight puller
+  // that already mapped it keeps a valid mapping; one that has not yet
+  // mapped gets ENOENT and skips, the documented lapped-record semantics.
+  WireHeader slot_hdr = hdr;
+  const uint8_t * slot_payload = payload;
+  size_t slot_payload_size = payload_size;
+  if (staged_desc) {
+    slot_hdr.msg_type |= SHM_PAYLOAD_FLAG;
+    slot_hdr.payload_size = static_cast<uint32_t>(sizeof(*staged_desc));
+    slot_payload = reinterpret_cast<const uint8_t *>(staged_desc);
+    slot_payload_size = sizeof(*staged_desc);
+  }
+
+  const uint64_t index = ring.next_index;
+  const uint32_t slot = static_cast<uint32_t>((index - 1) % ring.slots);
+  uint8_t * slot_base = tl_slot_at(ring, slot);
+
+  // Commit this slot's pages before writing: on a full tmpfs the deferred
+  // allocation would otherwise SIGBUS inside the memcpy below.
+  const off_t slot_off = static_cast<off_t>(slot_base - ring.base);
+  const size_t record_bytes =
+    sizeof(ShmRecordHeader) + sizeof(WireHeader) + slot_payload_size;
+  const int alloc_err = posix_fallocate(ring.fd, slot_off,
+    static_cast<off_t>(record_bytes));
+  if (alloc_err != 0) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "posix_fallocate(latched slot) failed: %s — sample not latched",
+      std::strerror(alloc_err));
+    return false;
+  }
+
+  auto * record = reinterpret_cast<ShmRecordHeader *>(slot_base);
+  // Per-record seqlock, absolute-index protocol shared with the payload ring:
+  // odd while the bytes are in flux, even once committed. exchange is an
+  // acq_rel RMW so the payload write cannot be reordered ahead of it.
+  record->seq.exchange(
+    static_cast<uint32_t>(index * 2 - 1), std::memory_order_acq_rel);
+  record->payload_len = static_cast<uint32_t>(slot_payload_size);
+  std::memcpy(slot_base + sizeof(ShmRecordHeader), &slot_hdr, sizeof(WireHeader));
+  std::memcpy(
+    slot_base + sizeof(ShmRecordHeader) + sizeof(WireHeader),
+    slot_payload, slot_payload_size);
+  record->seq.store(
+    static_cast<uint32_t>(index * 2), std::memory_order_release);
+
+  // Evict the overwritten slot's durable segment only AFTER the new record is
+  // committed: until then a puller could still legitimately read the old one.
+  // The evicted handle goes back to the caller so its munmap + shm_unlink
+  // run after cache_mutex is released.
+  evicted_out = std::move(ring.durable_segs[slot]);
+  ring.durable_segs[slot] = std::move(staged_seg);
+  ring.next_index = index + 1;
+  return true;
+}
+
+bool tl_ring_pull(
+  const std::string & shm_name,
+  const uint8_t * expected_gid16,
+  size_t max_records,
+  std::vector<TlPulledRecord> & records_out,
+  int64_t & max_seq_out,
+  bool * overlapped_out)
+{
+  max_seq_out = 0;
+  records_out.clear();
+  if (overlapped_out) {
+    *overlapped_out = false;
+  }
+  if (shm_name.empty() || max_records == 0) {
+    return false;
+  }
+
+  int fd = shm_open(shm_name.c_str(), O_RDONLY, 0);
+  if (fd < 0) {
+    return false;  // publisher gone (or old binary): silent skip
+  }
+  struct stat st;
+  if (fstat(fd, &st) != 0 ||
+    static_cast<size_t>(st.st_size) < SHM_RECORD_ALIGN)
+  {
+    close(fd);
+    return false;
+  }
+  const size_t map_size = static_cast<size_t>(st.st_size);
+  void * base = mmap(nullptr, map_size, PROT_READ, MAP_SHARED, fd, 0);
+  close(fd);  // the mapping keeps the segment alive
+  if (base == MAP_FAILED) {
+    return false;
+  }
+
+  // Validate the immutable header before trusting any geometry, mirroring
+  // map_segment: magic, version, creator GID against the slot the name came
+  // from, and slot geometry against the mapped size (never the live file).
+  const auto * header = reinterpret_cast<const TlRingHeader *>(base);
+  const size_t stride = tl_slot_stride();
+  bool ok = header->magic == TL_RING_MAGIC &&
+    header->version == TL_RING_VERSION &&
+    std::memcmp(header->gid, expected_gid16, 16) == 0 &&
+    header->slot_bytes == stride &&
+    header->slots > 0 &&
+    static_cast<size_t>(header->slots) <=
+    (map_size - SHM_RECORD_ALIGN) / stride;
+  if (!ok) {
+    munmap(base, map_size);
+    return false;  // stale incarnation or malformed — skip silently
+  }
+  const uint32_t slots = header->slots;
+  const auto * area = static_cast<const uint8_t *>(base) + SHM_RECORD_ALIGN;
+
+  // Last seq the scan observed in EVERY slot, including the ones that yield
+  // no record (never written, or given up on mid-write). A writer filling
+  // one of those during the scan opens a sequence gap that the pulled
+  // records alone cannot reveal, so all slots are re-checked afterwards —
+  // pulled ones only would miss exactly that case (overlapped_out contract).
+  std::vector<uint32_t> observed(slots, 0);
+
+  for (uint32_t i = 0; i < slots; ++i) {
+    const auto * record =
+      reinterpret_cast<const ShmRecordHeader *>(area + i * stride);
+    // Bounded per-slot seqlock snapshot (registry precedent): a slot mid-
+    // write is retried a few times then skipped — a publisher killed with a
+    // slot's seq odd poisons that slot alone, and subscription creation
+    // never spins on memory a dead writer owned.
+    for (int retry = 0; retry < 16; ++retry) {
+      const uint32_t s1 = record->seq.load(std::memory_order_acquire);
+      observed[i] = s1;
+      if (s1 == 0) {
+        break;  // never written
+      }
+      if (s1 & 1u) {
+        sched_yield();
+        continue;
+      }
+      const uint32_t len = record->payload_len;
+      if (len > TL_EMBED_CAP) {
+        // A committed record's length is always <= the cap (written inside
+        // the odd window), so this is a torn read from an in-flight write:
+        // retry like any other unstable snapshot rather than abandoning the
+        // slot.
+        sched_yield();
+        continue;
+      }
+      TlPulledRecord rec;
+      std::memcpy(rec.wire_header,
+        reinterpret_cast<const uint8_t *>(record) + sizeof(ShmRecordHeader),
+        sizeof(rec.wire_header));
+      rec.payload.assign(
+        reinterpret_cast<const uint8_t *>(record) + sizeof(ShmRecordHeader) +
+        sizeof(rec.wire_header),
+        reinterpret_cast<const uint8_t *>(record) + sizeof(ShmRecordHeader) +
+        sizeof(rec.wire_header) + len);
+      // The fence keeps the copies above from sinking below the re-check on
+      // weakly-ordered CPUs (shm_fetch_payload precedent).
+      std::atomic_thread_fence(std::memory_order_acquire);
+      if (record->seq.load(std::memory_order_relaxed) != s1) {
+        sched_yield();
+        continue;  // overwritten mid-copy — retry this slot
+      }
+      std::memcpy(&rec.sequence_number, rec.wire_header + 16, sizeof(int64_t));
+      if (rec.sequence_number > max_seq_out) {
+        max_seq_out = rec.sequence_number;
+      }
+      records_out.push_back(std::move(rec));
+      break;
+    }
+  }
+  // Overlap detection: if any slot's seq moved since the scan observed it, a
+  // writer latched during the scan — the result is not a point-in-time
+  // snapshot, and a sequence gap in it may hide a sample the scan missed.
+  if (overlapped_out) {
+    for (uint32_t i = 0; i < slots; ++i) {
+      const auto * rec_hdr =
+        reinterpret_cast<const ShmRecordHeader *>(area + i * stride);
+      if (rec_hdr->seq.load(std::memory_order_acquire) != observed[i]) {
+        *overlapped_out = true;
+        break;
+      }
+    }
+  }
+  munmap(base, map_size);
+
+  // Oldest-first in sequence order; keep only the newest max_records so the
+  // subscriber's depth trim never fires (and never warns) on the backlog.
+  std::sort(records_out.begin(), records_out.end(),
+    [](const TlPulledRecord & a, const TlPulledRecord & b) {
+      return a.sequence_number < b.sequence_number;
+    });
+  if (records_out.size() > max_records) {
+    records_out.erase(
+      records_out.begin(),
+      records_out.end() - static_cast<ptrdiff_t>(max_records));
+  }
+  return !records_out.empty();
+}
+
+void tl_ring_close(TlRingWriter & ring)
+{
+  if (ring.base) {
+    munmap(ring.base, ring.map_size);
+    ring.base = nullptr;
+  }
+  if (ring.fd >= 0) {
+    close(ring.fd);
+    ring.fd = -1;
+  }
+  if (!ring.shm_name.empty()) {
+    shm_unlink(ring.shm_name.c_str());
+    ring.shm_name.clear();
+  }
+  ring.durable_segs.clear();  // dtors unlink the staged large payloads
+  ring.slots = 0;
+  ring.map_size = 0;
 }
 
 }  // namespace rmw_uds

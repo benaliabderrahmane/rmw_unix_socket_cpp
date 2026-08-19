@@ -19,7 +19,7 @@
 #include "transport.hpp"
 #include "types.hpp"
 
-#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 
@@ -102,6 +102,22 @@ rmw_publisher_t * rmw_create_publisher(
   pub_data->context = ctx;
   pub_data->node = node_data;
 
+  // TRANSIENT_LOCAL: create the latched cache STRICTLY BEFORE registry_add,
+  // so a slot visible to any subscriber always names a mappable, validated
+  // segment. On failure the publisher runs latch-less (live delivery is
+  // unaffected, late joiners get no history) and the slot publishes an empty
+  // name, which pullers skip.
+  if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
+    if (!rmw_uds::tl_ring_create(
+        pub_data->tl_ring, ctx->domain_id, pub_data->gid.data,
+        pub_data->qos.depth))
+    {
+      RMW_UDS_LOG_ERROR(
+        "latched cache unavailable for TRANSIENT_LOCAL topic '%s' — late "
+        "joiners will not receive retained samples", topic_name);
+    }
+  }
+
   // Register in shared memory
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
   rmw_uds::RegistryEntry entry;
@@ -113,6 +129,11 @@ rmw_publisher_t * rmw_create_publisher(
   std::strncpy(entry.node_namespace, node_data->ns.c_str(), sizeof(entry.node_namespace) - 1);
   std::strncpy(entry.topic_name, topic_name, sizeof(entry.topic_name) - 1);
   std::strncpy(entry.type_name, pub_data->type_name.c_str(), sizeof(entry.type_name) - 1);
+  // Publisher slots carried no socket_path until now; a TRANSIENT_LOCAL
+  // publisher publishes its latched-cache shm name here so late joiners can
+  // locate and pull the history themselves (see tl_ring_pull).
+  std::strncpy(entry.socket_path, pub_data->tl_ring.shm_name.c_str(),
+    sizeof(entry.socket_path) - 1);
   entry.qos_reliability = static_cast<uint8_t>(pub_data->qos.reliability);
   entry.qos_durability = static_cast<uint8_t>(pub_data->qos.durability);
   entry.qos_history = static_cast<uint8_t>(pub_data->qos.history);
@@ -126,6 +147,7 @@ rmw_publisher_t * rmw_create_publisher(
       "Increase REGISTRY_MAX_ENTRIES or check for slot leaks.",
       topic_name,
       node_data->ns.c_str(), node_data->name.c_str());
+    rmw_uds::tl_ring_close(pub_data->tl_ring);
     delete pub_data;
     RMW_SET_ERROR_MSG("registry full — cannot create publisher");
     return nullptr;
@@ -134,6 +156,7 @@ rmw_publisher_t * rmw_create_publisher(
   auto * pub = rmw_publisher_allocate();
   if (!pub) {
     rmw_uds::registry_remove(header, pub_data->registry_index);
+    rmw_uds::tl_ring_close(pub_data->tl_ring);
     delete pub_data;
     RMW_SET_ERROR_MSG("failed to allocate rmw_publisher_t");
     return nullptr;
@@ -144,11 +167,6 @@ rmw_publisher_t * rmw_create_publisher(
   pub->topic_name = rcutils_strdup(topic_name, node->context->options.allocator);
   pub->options = publisher_options ? *publisher_options : rmw_get_default_publisher_options();
   pub->can_loan_messages = false;
-
-  if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
-    std::lock_guard<std::mutex> lock(ctx->transient_local_pubs_mutex);
-    ctx->transient_local_pubs.push_back(pub_data);
-  }
 
   return pub;
 }
@@ -163,18 +181,13 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
 
   auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(publisher->data);
   if (pub_data) {
-    if (pub_data->context &&
-      pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL)
-    {
-      auto * ctx = pub_data->context;
-      std::lock_guard<std::mutex> lock(ctx->transient_local_pubs_mutex);
-      auto & v = ctx->transient_local_pubs;
-      v.erase(std::remove(v.begin(), v.end(), pub_data), v.end());
-    }
     if (pub_data->context && pub_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
       rmw_uds::registry_remove(header, pub_data->registry_index);
     }
+    // Slot first, cache second: a puller that raced the removal either saw
+    // the slot and pulled a still-valid segment, or saw no slot at all.
+    rmw_uds::tl_ring_close(pub_data->tl_ring);
     rmw_uds::shm_writer_close(pub_data->shm_ring);
     delete pub_data;
   }
@@ -188,87 +201,121 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
   return RMW_RET_OK;
 }
 
-// Cache a TRANSIENT_LOCAL message for late-joiner replay and send it now.
-// Shared by rmw_publish and rmw_publish_serialized_message. Large payloads
-// (>= SHM_PAYLOAD_THRESHOLD) are staged into a dedicated durable shm segment
-// (shm_stage_durable) so the cached entry and its replays are a small
-// descriptor rather than a datagram the kernel would reject; small payloads and
-// the shm-unavailable fallback are cached inline. `payload` is taken by value:
-// callers std::move a serialized vector in, so the common path is one move, and
-// the inline branch keeps the bytes with no copy. Returns RMW_RET_ERROR if the
-// live send of the current message hits the kernel size cap (EMSGSIZE),
-// mirroring the non-TL path; replay of previously-cached messages to a new
-// subscriber is best-effort and not reflected in the return code.
+// Refresh the generation-keyed subscriber-path cache if `current_gen` moved,
+// and return the (possibly shared) path list. The memoization invariant that
+// keeps the pull-based replay proof sound: cached_generation only ever
+// advances to a value loaded BEFORE the query ran, under sub_cache_mutex —
+// so current_gen == cached_generation implies the cache already saw every
+// subscriber whose registration that generation covers.
+static std::shared_ptr<const std::vector<std::string>> refresh_sub_paths(
+  rmw_uds::UdsPublisher * pub_data,
+  rmw_uds::RegistryHeader * header,
+  uint64_t current_gen)
+{
+  std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
+  // Monotonic guard (not !=): a thread that loaded an older generation and
+  // lost the race must not move cached_generation backward — the invariant
+  // above is what the pull-based replay reasoning cites. A lower current_gen
+  // means the cached list was built by a newer query and is already a
+  // superset of the subscribers that generation covers.
+  if (current_gen > pub_data->cached_generation) {
+    auto subs = rmw_uds::registry_query(
+      header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
+      nullptr, nullptr);
+    auto fresh = std::make_shared<std::vector<std::string>>();
+    fresh->reserve(subs.size());
+    for (const auto & s : subs) {
+      if (!s.socket_path.empty()) {
+        fresh->push_back(s.socket_path);
+      }
+    }
+    pub_data->cached_generation = current_gen;
+    pub_data->cached_subscriber_paths = std::move(fresh);
+  }
+  return pub_data->cached_subscriber_paths;
+}
+
+// Latch a TRANSIENT_LOCAL sample into the pull cache and fan it out live.
+// Shared by rmw_publish and rmw_publish_serialized_message.
+//
+// Ordering is the store-buffering pair that makes late-joiner replay
+// lossless with no publisher-side wakeup (mirrored by rmw_create_subscription,
+// which does registry_add -> seq_cst fence -> pull):
+//   1. write the ring record (sequence number assigned under cache_mutex, so
+//      slot commit order == sequence order and the puller's watermark dedup
+//      is sound),
+//   2. seq_cst fence,
+//   3. FRESH generation load -> refresh the subscriber cache if stale,
+//   4. fan out.
+// If this publish misses a joining subscriber's registration, the fence pair
+// guarantees the subscriber's pull sees the record; if it sees the
+// registration, the sample goes out as a datagram; the overlap is deduped by
+// the subscriber against its pull watermark. Reusing a generation loaded
+// before step 1 would reopen the lost-sample window — never do that here.
 static rmw_ret_t transient_local_publish(
   rmw_uds::UdsPublisher * pub_data,
   rmw_uds::WireHeader hdr,
-  std::vector<uint8_t> payload,
-  const std::shared_ptr<const std::vector<std::string>> & sub_paths)
+  const std::vector<uint8_t> & payload)
 {
-  // Build the cache entry — including the shm_stage_durable() syscalls
-  // (shm_open/posix_fallocate/mmap, up to milliseconds) — BEFORE taking
-  // cache_mutex. Staging reads only the payload, the immutable domain id, and a
-  // global atomic counter, none of it guarded by cache_mutex, so this is
-  // data-safe and keeps the multi-ms segment create off a lock that rmw_wait's
-  // replay holds under the process-wide transient_local_pubs_mutex.
-  rmw_uds::CachedMessage cached;
-  cached.header = hdr;
-  if (payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
-    rmw_uds::ShmPayloadDescriptor desc;
-    auto seg = rmw_uds::shm_stage_durable(
-      pub_data->context->domain_id, payload.data(), payload.size(), desc);
-    if (seg) {
-      cached.header.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
-      cached.header.payload_size = static_cast<uint32_t>(sizeof(desc));
-      cached.payload.assign(
-        reinterpret_cast<const uint8_t *>(&desc),
-        reinterpret_cast<const uint8_t *>(&desc) + sizeof(desc));
-      cached.shm_seg = std::move(seg);
-    } else {
-      cached.payload = std::move(payload);  // inline fallback
+  // Stage an over-cap payload BEFORE taking cache_mutex: staging is
+  // shm_open/fallocate/mmap (up to milliseconds), reads only the payload,
+  // the immutable domain id, and a global atomic counter — nothing
+  // cache_mutex guards. A staging failure just means this sample is not
+  // latched; the live path is unaffected.
+  rmw_uds::ShmPayloadDescriptor staged_desc;
+  std::unique_ptr<rmw_uds::DurableShmSegment> staged_seg;
+  if (payload.size() > rmw_uds::TL_EMBED_CAP) {
+    staged_seg = rmw_uds::shm_stage_durable(
+      pub_data->context->domain_id, payload.data(), payload.size(),
+      staged_desc);
+    if (!staged_seg) {
+      RMW_UDS_LOG_WARN_THROTTLE(
+        5000,
+        "latched sample (%zu bytes) could not be staged in shared memory — "
+        "not replayable to late joiners",
+        payload.size());
     }
-  } else {
-    cached.payload = std::move(payload);
   }
+  const bool staged = static_cast<bool>(staged_seg);
 
-  // Entries trimmed past qos.depth destruct (munmap + shm_unlink of their
-  // durable segment) after the lock is released, keeping that syscall off
-  // cache_mutex too.
-  std::deque<rmw_uds::CachedMessage> evicted;
+  // Latch, fence, refresh, and fan out under cache_mutex, so concurrent
+  // publishes on this publisher hit the wire in sequence order (the deleted
+  // push code held the same lock across its sends). The evicted slot's
+  // durable segment destructs (munmap + shm_unlink) after the lock drops.
+  std::unique_ptr<rmw_uds::DurableShmSegment> evicted;
+  bool latched = false;
   bool config_error = false;
   {
     std::lock_guard<std::mutex> lock(pub_data->cache_mutex);
-    pub_data->message_cache.push_back(std::move(cached));
-    while (pub_data->message_cache.size() > pub_data->qos.depth) {
-      evicted.push_back(std::move(pub_data->message_cache.front()));
-      pub_data->message_cache.pop_front();
+    hdr.sequence_number =
+      pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
+    latched = rmw_uds::tl_ring_latch(
+      pub_data->tl_ring, hdr, payload.data(), payload.size(),
+      staged ? &staged_desc : nullptr, std::move(staged_seg), evicted);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+
+    auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
+    const uint64_t current_gen = rmw_uds::registry_generation(header);
+    auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
+
+    // Live fan-out: payloads at or above the datagram threshold reuse the
+    // durable segment the latch just committed (same bytes, same
+    // descriptor). If the latch did NOT commit, the segment is already
+    // destroyed, so fall back to the inline send, which surfaces EMSGSIZE.
+    const uint8_t * wire_data = payload.data();
+    size_t wire_size = payload.size();
+    if (staged && latched && payload.size() >= rmw_uds::SHM_PAYLOAD_THRESHOLD) {
+      hdr.msg_type |= rmw_uds::SHM_PAYLOAD_FLAG;
+      hdr.payload_size = static_cast<uint32_t>(sizeof(staged_desc));
+      wire_data = reinterpret_cast<const uint8_t *>(&staged_desc);
+      wire_size = sizeof(staged_desc);
     }
 
-    if (sub_paths) {
-      for (const auto & path : *sub_paths) {
-        if (pub_data->known_subscriber_paths.count(path) == 0) {
-          pub_data->known_subscriber_paths.insert(path);
-          for (size_t i = 0; i + 1 < pub_data->message_cache.size(); ++i) {
-            const auto & cm = pub_data->message_cache[i];
-            rmw_uds::send_to(
-              pub_data->context->send_socket_fd,
-              path, cm.header, cm.payload.data(), cm.payload.size());
-          }
-        }
-      }
-    }
-
-    // Send the current message, read from the cached copy since payload was
-    // moved. Trimming never disturbs back(), so it is the message just pushed.
-    // Surface EMSGSIZE the way the non-TL path does so a latched payload the
-    // kernel rejects is not reported as a successful publish.
-    const auto & current = pub_data->message_cache.back();
     if (sub_paths) {
       for (const auto & path : *sub_paths) {
         if (rmw_uds::send_to(
             pub_data->context->send_socket_fd,
-            path, current.header, current.payload.data(), current.payload.size())
-          == rmw_uds::SendResult::ConfigError)
+            path, hdr, wire_data, wire_size) == rmw_uds::SendResult::ConfigError)
         {
           config_error = true;
         }
@@ -298,63 +345,19 @@ rmw_ret_t rmw_publish(
 
   auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(publisher->data);
 
-  // Build wire header. payload_size is filled per-path below: serialization
-  // happens after the TRANSIENT_LOCAL fork so the non-latched path can
-  // serialize directly into the shm ring with no intermediate heap payload.
+  // Build wire header. payload_size is filled per-path below; the sequence
+  // number is assigned per-path too — the TRANSIENT_LOCAL path assigns it
+  // inside its latch critical section so slot commit order equals sequence
+  // order (see transient_local_publish).
   rmw_uds::WireHeader hdr;
   std::memset(&hdr, 0, sizeof(hdr));
   std::memcpy(hdr.gid, pub_data->gid.data, sizeof(hdr.gid));
-  hdr.sequence_number = pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
   hdr.source_timestamp_ns = system_now_ns();
   hdr.msg_type = 0;  // topic message
 
-  // PERFORMANCE: only lock the registry when the graph generation has changed
-  // since we last cached the subscriber list. The hot path is purely local.
-  auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
-  uint64_t current_gen = rmw_uds::registry_generation(header);
-
-  std::shared_ptr<const std::vector<std::string>> sub_paths;
-  {
-    std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
-    if (current_gen != pub_data->cached_generation) {
-      auto subs = rmw_uds::registry_query(
-        header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
-        nullptr, nullptr);
-      auto fresh = std::make_shared<std::vector<std::string>>();
-      fresh->reserve(subs.size());
-      for (const auto & s : subs) {
-        if (!s.socket_path.empty()) {
-          fresh->push_back(s.socket_path);
-        }
-      }
-      pub_data->cached_generation = current_gen;
-      pub_data->cached_subscriber_paths = std::move(fresh);
-
-      // Prune known subscribers no longer present, against the freshly-built
-      // canonical list while STILL holding sub_cache_mutex (nested lock order
-      // sub_cache_mutex -> cache_mutex), so a concurrent refresh on another
-      // thread (e.g. the rmw_wait replay path) cannot make the pruning set
-      // stale and erase a still-live late-joiner.
-      if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
-        std::lock_guard<std::mutex> prune_lock(pub_data->cache_mutex);
-        std::set<std::string> current(
-          pub_data->cached_subscriber_paths->begin(),
-          pub_data->cached_subscriber_paths->end());
-        for (auto it = pub_data->known_subscriber_paths.begin();
-          it != pub_data->known_subscriber_paths.end(); )
-        {
-          it = (current.count(*it) == 0) ?
-            pub_data->known_subscriber_paths.erase(it) : std::next(it);
-        }
-      }
-    }
-    sub_paths = pub_data->cached_subscriber_paths;  // refcount copy under lock
-  }
-
-  // TRANSIENT_LOCAL: cache message and replay to late-joining subscribers.
-  // The replay cache owns the serialized bytes, so this path serializes into
-  // a heap payload as before (the durable segment is staged from it inside
-  // transient_local_publish).
+  // TRANSIENT_LOCAL: latch into the pull cache, then fan out (ordering
+  // documented at transient_local_publish). Serializes to a heap payload —
+  // the latch needs the bytes.
   if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
     std::vector<uint8_t> payload;
     if (!rmw_uds::serialize(ros_message, pub_data->callbacks, payload)) {
@@ -367,8 +370,17 @@ rmw_ret_t rmw_publish(
       return RMW_RET_ERROR;
     }
     hdr.payload_size = static_cast<uint32_t>(payload.size());
-    return transient_local_publish(pub_data, hdr, std::move(payload), sub_paths);
+    return transient_local_publish(pub_data, hdr, payload);
   }
+
+  hdr.sequence_number =
+    pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
+
+  // PERFORMANCE: only lock the registry when the graph generation has changed
+  // since we last cached the subscriber list. The hot path is purely local.
+  auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
+  uint64_t current_gen = rmw_uds::registry_generation(header);
+  auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
 
   // Non-latched path: serialize once, choosing the destination by size — a
   // large payload is written directly into the reserved ring record (no heap
@@ -429,61 +441,29 @@ rmw_ret_t rmw_publish_serialized_message(
   rmw_uds::WireHeader hdr;
   std::memset(&hdr, 0, sizeof(hdr));
   std::memcpy(hdr.gid, pub_data->gid.data, sizeof(hdr.gid));
-  hdr.sequence_number = pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
   hdr.source_timestamp_ns = system_now_ns();
   hdr.payload_size = static_cast<uint32_t>(serialized_message->buffer_length);
   hdr.msg_type = 0;
 
-  // Reuse the cached subscriber list (refresh only on graph change)
-  auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
-  uint64_t current_gen = rmw_uds::registry_generation(header);
-  std::shared_ptr<const std::vector<std::string>> sub_paths;
-  {
-    std::lock_guard<std::mutex> lock(pub_data->sub_cache_mutex);
-    if (current_gen != pub_data->cached_generation) {
-      auto subs = rmw_uds::registry_query(
-        header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
-        nullptr, nullptr);
-      auto fresh = std::make_shared<std::vector<std::string>>();
-      fresh->reserve(subs.size());
-      for (const auto & s : subs) {
-        if (!s.socket_path.empty()) {
-          fresh->push_back(s.socket_path);
-        }
-      }
-      pub_data->cached_generation = current_gen;
-      pub_data->cached_subscriber_paths = std::move(fresh);
-
-      // TRANSIENT_LOCAL: prune known subscribers no longer present, mirroring
-      // rmw_publish (nested lock order sub_cache_mutex -> cache_mutex) so a
-      // concurrent refresh cannot make the pruning set stale.
-      if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
-        std::lock_guard<std::mutex> prune_lock(pub_data->cache_mutex);
-        std::set<std::string> current(
-          pub_data->cached_subscriber_paths->begin(),
-          pub_data->cached_subscriber_paths->end());
-        for (auto it = pub_data->known_subscriber_paths.begin();
-          it != pub_data->known_subscriber_paths.end(); )
-        {
-          it = (current.count(*it) == 0) ?
-            pub_data->known_subscriber_paths.erase(it) : std::next(it);
-        }
-      }
-    }
-    sub_paths = pub_data->cached_subscriber_paths;
-  }
-
-  // TRANSIENT_LOCAL: cache + replay through the same durable-shm path as
+  // TRANSIENT_LOCAL: latch + fan out through the same pull-cache path as
   // rmw_publish, so a serialized latched payload (including one above the
-  // datagram cap) reaches late joiners too.
+  // datagram cap) reaches late joiners too. Sequence number assigned inside
+  // the latch critical section (see transient_local_publish).
   if (pub_data->qos.durability == RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL) {
     return transient_local_publish(
       pub_data, hdr,
       std::vector<uint8_t>(
         serialized_message->buffer,
-        serialized_message->buffer + serialized_message->buffer_length),
-      sub_paths);
+        serialized_message->buffer + serialized_message->buffer_length));
   }
+
+  hdr.sequence_number =
+    pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
+
+  // Reuse the cached subscriber list (refresh only on graph change)
+  auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
+  uint64_t current_gen = rmw_uds::registry_generation(header);
+  auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
 
   // Large non-TL payloads: stage once into the cycling ring, fan out descriptors.
   rmw_uds::ShmPayloadDescriptor desc;

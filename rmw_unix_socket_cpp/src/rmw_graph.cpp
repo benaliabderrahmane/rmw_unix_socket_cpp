@@ -66,8 +66,9 @@ static constexpr int64_t CLEANUP_MIN_INTERVAL_NS = 1000000000;  // 1 s
 // latency: reclaiming a dead process's slots — and with them the doorbell
 // rings and latched-cache teardown only a sweep produces — now lags up to one
 // interval per polling context. The full-registry path in registry_add still
-// sweeps unconditionally, because there it is the last resort before entity
-// creation fails.
+// sweeps unconditionally: there it is the last resort before entity creation
+// fails, and also a recurring retry path (a graph wait whose doorbell
+// registration failed on a full registry retries registry_add every wait).
 static void maybe_cleanup_stale(rmw_uds::UdsContext * ctx, rmw_uds::RegistryHeader * header)
 {
   const int64_t now = steady_now_ns();

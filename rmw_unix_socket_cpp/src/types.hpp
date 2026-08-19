@@ -15,15 +15,16 @@
 #ifndef RMW_UNIX_SOCKET_CPP__TYPES_HPP_
 #define RMW_UNIX_SOCKET_CPP__TYPES_HPP_
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
-#include <set>
 #include <string>
 #include <unistd.h>
 #include <unordered_map>
@@ -154,9 +155,6 @@ inline bool is_same_context(const WireHeader & hdr, uint64_t context_id)
   return sender_context_id == context_id;
 }
 
-// Forward declaration: publisher type defined below.
-struct UdsPublisher;
-
 // Per-context implementation data
 struct UdsContext
 {
@@ -179,9 +177,17 @@ struct UdsContext
 
   // Doorbell: a bound datagram socket other processes ring (one octet) after
   // any registry mutation, so a blocked rmw_wait re-checks the registry
-  // without polling. Registered in the registry as ENTRY_DOORBELL; the slot's
-  // teardown unlinks the socket file (graceful or via the stale-PID reaper).
+  // without polling. The socket is bound at rmw_init, but the ENTRY_DOORBELL
+  // slot is registered LAZILY, from the first rmw_wait whose wait set holds a
+  // graph guard condition: only graph-event consumers (wait_for_service,
+  // GraphListener, rosbag2) need registry wakeups now that TRANSIENT_LOCAL
+  // replay is pull-based, so plain pub/sub processes never register one and a
+  // fleet launch rings ~no doorbells. Guarded by doorbell_reg_mutex; the
+  // slot's teardown unlinks the socket file (graceful or stale-PID reaper).
   int doorbell_fd = -1;
+  std::string doorbell_path;
+  std::mutex doorbell_reg_mutex;
+  std::atomic<bool> doorbell_registered{false};
   int32_t doorbell_registry_index = -1;
 
   // Per-node graph guard conditions (see rmw_node_get_graph_guard_condition),
@@ -189,10 +195,6 @@ struct UdsContext
   // the mutex; rmw_destroy_node removes its entry before destroying the GC.
   std::mutex graph_gcs_mutex;
   std::vector<rmw_guard_condition_t *> graph_gcs;
-
-  // TRANSIENT_LOCAL publishers, for wait-side cache replay on graph change.
-  std::mutex transient_local_pubs_mutex;
-  std::vector<UdsPublisher *> transient_local_pubs;
 };
 
 // Node data
@@ -203,19 +205,6 @@ struct UdsNode
   UdsContext * context = nullptr;
   rmw_guard_condition_t * graph_guard_condition = nullptr;
   int32_t registry_index = -1;
-};
-
-// Cached message for TRANSIENT_LOCAL replay. For large payloads, `payload`
-// holds a ShmPayloadDescriptor (header.msg_type carries SHM_PAYLOAD_FLAG) and
-// `shm_seg` owns the durable segment the descriptor points at; the segment
-// lives exactly as long as this cache entry, so it is replayable to late
-// joiners and unlinked when the entry is evicted. Small payloads keep the
-// inline bytes and leave shm_seg null.
-struct CachedMessage
-{
-  WireHeader header;
-  std::vector<uint8_t> payload;
-  std::unique_ptr<DurableShmSegment> shm_seg;
 };
 
 // Publisher data
@@ -241,10 +230,14 @@ struct UdsPublisher
   // wait hot path copies one refcount instead of N strings. Null until first refresh.
   std::shared_ptr<const std::vector<std::string>> cached_subscriber_paths;
 
-  // TRANSIENT_LOCAL: cache of last N messages for late-joining subscribers
+  // TRANSIENT_LOCAL latched cache, pulled by late joiners themselves at
+  // rmw_create_subscription (see shm_transport.hpp). cache_mutex serializes
+  // latching; hdr.sequence_number is assigned under it so slot commit order
+  // equals sequence order, which is what makes the puller's watermark dedup
+  // sound. The segment is created BEFORE registry_add and its name published
+  // in the slot's socket_path; the idle publisher pays nothing, ever.
   std::mutex cache_mutex;
-  std::deque<CachedMessage> message_cache;
-  std::set<std::string> known_subscriber_paths;  // subs we've already replayed to
+  TlRingWriter tl_ring;
 
   // Large payloads: per-publisher /dev/shm ring (created lazily on the first
   // payload >= SHM_PAYLOAD_THRESHOLD). shm_mutex serializes staging when
@@ -275,6 +268,14 @@ struct UdsSubscription
   // rmw_subscription_options_t::ignore_local_publications, copied at creation
   // time (used by drain_subscription()/drain_socket()).
   bool ignore_local_publications = false;
+  // TRANSIENT_LOCAL dedup: highest sequence number pulled from each latched
+  // publisher's cache at creation, keyed by the FULL 16-byte GID (the trailing
+  // context_id bytes are what distinguish a respawned publisher under a
+  // recycled pid — anything less would blackhole its fresh samples). Frozen at
+  // pull time; the drains drop an inbound datagram whose (gid, seq) is at or
+  // below its watermark. Guarded by queue_mutex. One small entry per latched
+  // publisher ever pulled — subscription-lifetime state, never pruned.
+  std::map<std::array<uint8_t, 16>, int64_t> replayed_watermarks;
   // Callback support
   std::mutex callback_mutex;
   rmw_event_callback_t on_new_message_cb = nullptr;

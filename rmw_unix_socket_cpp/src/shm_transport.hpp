@@ -30,6 +30,9 @@
 namespace rmw_uds
 {
 
+// Defined in types.hpp (which includes this header); only referenced here.
+struct WireHeader;
+
 // Shared-memory payload path for large messages — topic payloads, service
 // requests, and service responses alike.
 //
@@ -255,6 +258,147 @@ bool shm_fetch_payload(
   ShmReaderCache & cache,
   size_t domain_id,
   std::vector<uint8_t> & payload_io);
+
+// ---------------------------------------------------------------------------
+// TRANSIENT_LOCAL latched cache: a per-publisher shm segment holding the last
+// qos.depth latched samples, written at publish time and READ BY THE LATE
+// JOINER ITSELF at rmw_create_subscription. The publisher process is never
+// woken for replay — durability is pull-based, like discovery itself. The
+// segment's name is published in the publisher's registry slot (socket_path,
+// unused for publishers until now), so a subscriber locates it from the slot
+// it already queried; the name carries a per-incarnation unique id, so a
+// recycled PID can never alias a dead publisher's cache.
+// ---------------------------------------------------------------------------
+
+// Latched payloads at or below this many bytes are embedded in the slot;
+// larger ones are staged once via shm_stage_durable and the slot carries the
+// 32-byte descriptor (resolved by the puller through shm_fetch_payload).
+// Small keeps the fixed slot stride — and with it the ring's RAM commit —
+// modest for chatty latched topics like /rosout (depth 1000).
+static constexpr size_t TL_EMBED_CAP = 1024;
+
+// Hard byte ceiling for one publisher's latched ring (record area). A
+// misconfigured depth cannot fallocate tens of MB: slots are clamped to
+// whatever fits. Replay may then hold fewer than qos.depth samples — a
+// stated, accepted limit (DESIGN, latched cache). 2 MiB admits the stock
+// rosout profile (TRANSIENT_LOCAL, KEEP_LAST 1000: 1000 x 1088 B stride)
+// without clamping; the file is sparse, so the ceiling costs nothing until
+// slots are actually latched.
+static constexpr size_t TL_RING_MAX_BYTES = 2 * 1024 * 1024;
+
+static constexpr uint32_t TL_RING_MAGIC = 0x4C544455;  // "UDTL"
+static constexpr uint32_t TL_RING_VERSION = 1;
+
+// First bytes of a latched-cache segment. Written once at creation, before
+// the publisher's registry slot exists; immutable afterwards, so readers
+// need no synchronization to validate it. The creator's full 16-byte GID is
+// embedded so a puller can verify the segment belongs to the slot it derived
+// the name from (stale-segment defense in depth; the unique name is the
+// primary defense).
+struct TlRingHeader
+{
+  uint32_t magic;
+  uint32_t version;
+  uint8_t gid[16];
+  uint32_t slots;       // slot count (qos.depth clamped by TL_RING_MAX_BYTES)
+  uint32_t slot_bytes;  // stride of one slot
+};
+
+static_assert(sizeof(TlRingHeader) == 32, "TL ring header shm layout changed");
+
+// One latched slot: ShmRecordHeader (seq + payload_len) followed by the
+// sample's WireHeader (37 packed bytes) and the payload area (TL_EMBED_CAP
+// bytes — inline CDR, or a 32-byte ShmPayloadDescriptor when the WireHeader
+// carries SHM_PAYLOAD_FLAG). Slot i holds record n where n % slots == i; the
+// record seq is the absolute 2n-1 (writing) / 2n (stable) protocol shared
+// with the payload ring, so a reader detects both in-flight and lapped slots
+// per record — a writer preempted or killed mid-write poisons exactly one
+// slot, never the history.
+static constexpr size_t TL_SLOT_BYTES_UNALIGNED =
+  sizeof(ShmRecordHeader) + 37 /* sizeof(WireHeader) */ + TL_EMBED_CAP;
+
+// Publisher-side latched-cache state (process-local; the mapped segment is
+// the shared part). Guarded by UdsPublisher::cache_mutex; the sequence
+// number is assigned under the same lock so slot commit order equals
+// sequence order — the property that makes the puller's dedup watermark
+// sound. durable_segs parallels the slots: it owns the DurableShmSegment a
+// slot's descriptor points at, destroyed when that slot is overwritten.
+struct TlRingWriter
+{
+  int fd = -1;
+  uint8_t * base = nullptr;
+  size_t map_size = 0;
+  uint32_t slots = 0;
+  uint32_t slot_bytes = 0;
+  uint64_t next_index = 1;  // absolute record counter (drives per-slot seq)
+  std::string shm_name;
+  std::vector<std::unique_ptr<DurableShmSegment>> durable_segs;
+};
+
+// One sample pulled out of a latched cache.
+struct TlPulledRecord
+{
+  int64_t sequence_number;
+  uint8_t wire_header[37];      // verbatim WireHeader bytes
+  std::vector<uint8_t> payload; // inline CDR or a descriptor (per msg_type)
+};
+
+// Create the latched-cache segment for a TRANSIENT_LOCAL publisher. Called
+// BEFORE the publisher's registry_add, so a visible slot always names a
+// mappable, validated segment. The file is sized sparsely (ftruncate);
+// per-record ranges are committed by posix_fallocate at latch time, so an
+// idle publisher's ring costs an inode and a page, not depth x slot_bytes of
+// RAM. Returns false on failure — the publisher then runs latch-less (no
+// replay) and its slot publishes an empty name.
+bool tl_ring_create(
+  TlRingWriter & ring,
+  size_t domain_id,
+  const uint8_t * gid16,
+  size_t depth);
+
+// Latch one sample under the per-record seqlock. Caller holds the
+// publisher's cache_mutex and has already assigned hdr.sequence_number under
+// it. Payloads above TL_EMBED_CAP must be pre-staged BY THE CALLER (outside
+// the lock — staging is shm_open/fallocate/mmap, up to milliseconds) via
+// shm_stage_durable; pass its descriptor and segment here and the slot then
+// carries the 32-byte descriptor with SHM_PAYLOAD_FLAG. On success the ring
+// owns staged_seg (evicted with the slot); the previously-latched segment of
+// the overwritten slot is returned in evicted_out so the caller can destroy
+// it (munmap + shm_unlink) after releasing the lock. Returns false — and
+// leaves staged_seg destroyed, nothing latched, live sends unaffected — when
+// the ring is absent or the slot's pages cannot be committed (ENOSPC).
+bool tl_ring_latch(
+  TlRingWriter & ring,
+  const WireHeader & hdr,
+  const uint8_t * payload,
+  size_t payload_size,
+  const ShmPayloadDescriptor * staged_desc,
+  std::unique_ptr<DurableShmSegment> staged_seg,
+  std::unique_ptr<DurableShmSegment> & evicted_out);
+
+// Map, validate, and snapshot a publisher's latched cache. expected_gid16 is
+// the slot GID the name came from; a mismatched or malformed segment is
+// skipped silently (stale incarnation). Records are returned sorted by
+// sequence number, at most max_records newest. max_seq_out is the highest
+// sequence number observed among stable records — the subscriber's dedup
+// watermark. Per-slot seqlock reads are bounded (skip, never spin), so a
+// publisher killed mid-write cannot hang subscription creation.
+// *overlapped_out is set true when a writer latched DURING the scan (any
+// slot's seq moved by the end — skipped slots included, since those are the
+// ones a gap hides behind): the scan is then not a point-in-time snapshot
+// and a sequence gap in the result may hide a sample the scan missed — the
+// caller must not extend its dedup watermark across such a gap (the missed
+// sample's datagram is in flight and must not be dropped).
+bool tl_ring_pull(
+  const std::string & shm_name,
+  const uint8_t * expected_gid16,
+  size_t max_records,
+  std::vector<TlPulledRecord> & records_out,
+  int64_t & max_seq_out,
+  bool * overlapped_out);
+
+// Unmap + unlink the latched cache (publisher destruction / failed create).
+void tl_ring_close(TlRingWriter & ring);
 
 // Unmap + unlink the publisher's current segment (publisher destruction).
 void shm_writer_close(ShmRingWriter & ring);
