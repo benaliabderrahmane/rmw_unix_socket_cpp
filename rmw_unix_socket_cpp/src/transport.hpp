@@ -40,13 +40,23 @@ int create_send_socket();
 // ConfigError = EMSGSIZE (hard, surface to caller); SoftDrop = transient.
 enum class SendResult { Ok, SoftDrop, ConfigError };
 
-// Send a datagram (header + payload) to the given socket path.
+// Send a datagram (header + payload) to the given socket path. `peer_label`,
+// if non-null, is a human-readable peer identity (see make_peer_label) shown
+// in the drop/failure diagnostics; pass null when no identity is available.
 SendResult send_to(
   int send_fd,
   const std::string & dest_path,
   const WireHeader & header,
   const uint8_t * payload,
-  size_t payload_size);
+  size_t payload_size,
+  const char * peer_label = nullptr);
+
+// Build a human-readable peer identity for diagnostics, e.g.
+// "node '/ns/name' on topic '/topic'". Null/empty fields are omitted; a "/"
+// (root) namespace collapses to a single leading slash (ROS fully-qualified
+// name), so ("/", "name", ...) yields "/name" rather than "//name".
+std::string make_peer_label(
+  const char * node_namespace, const char * node_name, const char * topic);
 
 // Receive a single datagram from a non-blocking socket.
 // Returns true if a message was received, false if EAGAIN/EWOULDBLOCK or error.
