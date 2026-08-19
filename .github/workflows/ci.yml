@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ros_distro: [jazzy, kilted, rolling]
+        ros_distro: [jazzy, kilted, rolling, lyrical]
     container:
       image: ros:${{ matrix.ros_distro }}-ros-base
       # Default Docker /dev/shm is 64MB; one domain registry mmap is ~37MB
@@ -60,13 +60,14 @@ jobs:
             ros-${{ matrix.ros_distro }}-test-msgs \
             ros-${{ matrix.ros_distro }}-rosidl-typesupport-cpp \
             ros-${{ matrix.ros_distro }}-rosidl-runtime-cpp
-          # rosidl_buffer is a Rolling-only package (introduced after Jazzy/
-          # Kilted were branched) and test_msgs' exported imported targets
-          # reference it. CMake side: find_package(rosidl_buffer QUIET) in
-          # CMakeLists handles the apt-missing case on older distros.
-          if [ "${{ matrix.ros_distro }}" = "rolling" ]; then
+          # rosidl_buffer was introduced after Jazzy/Kilted were branched and
+          # test_msgs' exported imported targets reference it; Lyrical branched
+          # from Rolling after it landed, so both ship it. CMake side:
+          # find_package(rosidl_buffer QUIET) in CMakeLists handles the
+          # apt-missing case on older distros.
+          if [ "${{ matrix.ros_distro }}" = "rolling" ] || [ "${{ matrix.ros_distro }}" = "lyrical" ]; then
             apt-get install -y --no-install-recommends \
-              ros-rolling-rosidl-buffer
+              ros-${{ matrix.ros_distro }}-rosidl-buffer
           fi
 
       - name: Build
