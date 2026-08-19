@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 #include "test_msgs/msg/basic_types.hpp"
 
@@ -516,4 +517,273 @@ TEST_F(RmwUdsNodeTest, InfiniteWaitNeverTimesOutOnIgnoredLocalPublication)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(gc));
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub));
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
+}
+
+// The armed-fd cache survives across rmw_wait calls. A guard condition armed
+// by an earlier call but absent from THIS call's array (its node moved to
+// another executor, its callback group is busy) must not have its trigger
+// consumed by this wait: the wakeup belongs to whichever wait set holds the
+// GC now, and consuming it here loses it forever.
+TEST_F(RmwUdsNodeTest, WaitDoesNotStealTriggerOfGuardConditionNotWaitedOn)
+{
+  auto * g1 = rmw_create_guard_condition(&context);
+  auto * g2 = rmw_create_guard_condition(&context);
+  auto * ws = rmw_create_wait_set(&context, 2);
+  ASSERT_NE(nullptr, g1);
+  ASSERT_NE(nullptr, g2);
+  ASSERT_NE(nullptr, ws);
+
+  // Arm both fds in ws (neither is triggered, so this times out).
+  {
+    void * both[2] = {g1->data, g2->data};
+    rmw_guard_conditions_t gcs;
+    gcs.guard_conditions = both;
+    gcs.guard_condition_count = 2;
+    rmw_time_t t{0, 20000000};  // 20 ms
+    EXPECT_EQ(
+      RMW_RET_TIMEOUT,
+      rmw_wait(nullptr, &gcs, nullptr, nullptr, nullptr, ws, &t));
+  }
+
+  // Wait on g1 alone while g2 fires mid-wait. g2's still-armed fd reports
+  // ready in this wait set, but g2 is not in this call's array: the wait must
+  // neither consume the trigger nor end early on it.
+  std::thread trigger([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      auto _r [[maybe_unused]] = rmw_trigger_guard_condition(g2);
+    });
+  {
+    void * only_g1[1] = {g1->data};
+    rmw_guard_conditions_t gcs;
+    gcs.guard_conditions = only_g1;
+    gcs.guard_condition_count = 1;
+    rmw_time_t t{0, 300000000};  // 300 ms
+    auto t0 = std::chrono::steady_clock::now();
+    rmw_ret_t ret = rmw_wait(nullptr, &gcs, nullptr, nullptr, nullptr, ws, &t);
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+    trigger.join();
+    EXPECT_EQ(RMW_RET_TIMEOUT, ret) <<
+      "a guard condition outside this call's array ended the wait";
+    EXPECT_EQ(nullptr, gcs.guard_conditions[0]);
+    EXPECT_GE(elapsed_ms, 250) << "the wait did not re-block after g2 fired";
+  }
+
+  // The trigger must still be pending for a wait that DOES hold g2.
+  {
+    void * only_g2[1] = {g2->data};
+    rmw_guard_conditions_t gcs;
+    gcs.guard_conditions = only_g2;
+    gcs.guard_condition_count = 1;
+    rmw_time_t t{0, 100000000};  // 100 ms
+    EXPECT_EQ(
+      RMW_RET_OK,
+      rmw_wait(nullptr, &gcs, nullptr, nullptr, nullptr, ws, &t)) <<
+      "g2's trigger was consumed by a wait that was not waiting on it";
+    EXPECT_NE(nullptr, gcs.guard_conditions[0]);
+  }
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(g1));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(g2));
+}
+
+// The armed cache is keyed by fd; the uid comparison is what tells "the same
+// fd re-armed for the same entity" from "the fd number recycled to a new
+// entity after a close". Recycle an eventfd number into a new GC on the same
+// wait set: the new GC must be re-armed and still wake the wait.
+TEST_F(RmwUdsNodeTest, RecycledFdNumberIsRearmedForNewEntity)
+{
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+
+  auto wait_on = [&](rmw_guard_condition_t * gc, rmw_time_t t) {
+      void * arr[1] = {gc->data};
+      rmw_guard_conditions_t gcs;
+      gcs.guard_conditions = arr;
+      gcs.guard_condition_count = 1;
+      rmw_ret_t ret = rmw_wait(nullptr, &gcs, nullptr, nullptr, nullptr, ws, &t);
+      return ret == RMW_RET_OK && gcs.guard_conditions[0] != nullptr;
+    };
+
+  auto * g1 = rmw_create_guard_condition(&context);
+  ASSERT_NE(nullptr, g1);
+  const int fd1 = static_cast<rmw_uds::UdsGuardCondition *>(g1->data)->eventfd_fd;
+  EXPECT_FALSE(wait_on(g1, rmw_time_t{0, 20000000}));  // arms fd1 for g1
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(g1));
+
+  // Provoke fd-number reuse: the kernel hands out the lowest free descriptor,
+  // so the next eventfd normally lands on fd1 at once. Keep non-matching
+  // candidates alive so retries do not just get the same number back.
+  rmw_guard_condition_t * g2 = nullptr;
+  std::vector<rmw_guard_condition_t *> decoys;
+  for (int i = 0; i < 32 && !g2; ++i) {
+    auto * cand = rmw_create_guard_condition(&context);
+    ASSERT_NE(nullptr, cand);
+    if (static_cast<rmw_uds::UdsGuardCondition *>(cand->data)->eventfd_fd == fd1) {
+      g2 = cand;
+    } else {
+      decoys.push_back(cand);
+    }
+  }
+  for (auto * d : decoys) {
+    EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(d));
+  }
+  if (!g2) {
+    EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+    GTEST_SKIP() << "eventfd number was not recycled; nothing to pin";
+  }
+
+  std::thread trigger([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      auto _r [[maybe_unused]] = rmw_trigger_guard_condition(g2);
+    });
+  const bool woke = wait_on(g2, rmw_time_t{2, 0});
+  trigger.join();
+  EXPECT_TRUE(woke) <<
+    "a recycled fd number kept its stale arming; the new entity never wakes";
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(g2));
+}
+
+// When an entity already holds queued-but-untaken data, the wait makes one
+// non-blocking epoll pass instead of blocking: an entity whose data still
+// sits unread in its socket must be reported in this same call, and the
+// caller's timeout must not be consumed by a wait that already has work.
+TEST_F(RmwUdsNodeTest, QueuedBacklogStillReportsSocketDataWithoutBlocking)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  rmw_qos_profile_t qos = rmw_qos_profile_default;
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto sub_opts = rmw_get_default_subscription_options();
+
+  auto * pub_x = rmw_create_publisher(node, ts, "/backlog_x", &qos, &pub_opts);
+  auto * sub_x = rmw_create_subscription(node, ts, "/backlog_x", &qos, &sub_opts);
+  auto * pub_y = rmw_create_publisher(node, ts, "/backlog_y", &qos, &pub_opts);
+  auto * sub_y = rmw_create_subscription(node, ts, "/backlog_y", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub_x);
+  ASSERT_NE(nullptr, sub_x);
+  ASSERT_NE(nullptr, pub_y);
+  ASSERT_NE(nullptr, sub_y);
+
+  auto * ws = rmw_create_wait_set(&context, 2);
+  ASSERT_NE(nullptr, ws);
+
+  // Two messages for X; wait on X alone so both land in X's queue, take one.
+  test_msgs::msg::BasicTypes m;
+  m.int32_value = 1;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub_x, &m, nullptr));
+  m.int32_value = 2;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub_x, &m, nullptr));
+  {
+    rmw_subscriptions_t subs;
+    void * arr[1] = {sub_x->data};
+    subs.subscribers = arr;
+    subs.subscriber_count = 1;
+    rmw_time_t t{1, 0};
+    ASSERT_EQ(
+      RMW_RET_OK, rmw_wait(&subs, nullptr, nullptr, nullptr, nullptr, ws, &t));
+  }
+  test_msgs::msg::BasicTypes recv;
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take(sub_x, &recv, &taken, nullptr));
+  ASSERT_TRUE(taken);
+
+  // One message for Y, left sitting in Y's socket (Y was never waited on).
+  m.int32_value = 3;
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub_y, &m, nullptr));
+
+  // X's leftover queue makes the wait poll-only; Y's socket data must still be
+  // reported in this call, well before the 5 s deadline.
+  rmw_subscriptions_t subs;
+  void * arr[2] = {sub_x->data, sub_y->data};
+  subs.subscribers = arr;
+  subs.subscriber_count = 2;
+  rmw_time_t t{5, 0};
+  auto t0 = std::chrono::steady_clock::now();
+  rmw_ret_t ret = rmw_wait(&subs, nullptr, nullptr, nullptr, nullptr, ws, &t);
+  auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - t0).count();
+
+  EXPECT_EQ(RMW_RET_OK, ret);
+  EXPECT_NE(nullptr, subs.subscribers[0]) << "X's queued backlog went unreported";
+  EXPECT_NE(nullptr, subs.subscribers[1]) <<
+    "Y's socket data was missed by the poll-only pass";
+  EXPECT_LT(elapsed_ms, 1000) <<
+    "a wait with queued work blocked instead of polling";
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub_x));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub_y));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub_x));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub_y));
+}
+
+// A doorbell-only wake carries no caller-visible work: under continuous
+// registry churn a bounded wait must keep re-blocking and still time out at
+// the caller's deadline — not before it, and not spinning past it.
+TEST_F(RmwUdsNodeTest, BoundedWaitUnderRegistryChurnTimesOutOnSchedule)
+{
+  // Register the context's doorbell first: it is lazily registered by the
+  // first wait whose set holds one of this context's graph guard conditions.
+  const rmw_guard_condition_t * graph_gc = rmw_node_get_graph_guard_condition(node);
+  ASSERT_NE(nullptr, graph_gc);
+  auto * ws_reg = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws_reg);
+  {
+    void * arr[1] = {graph_gc->data};
+    rmw_guard_conditions_t gcs;
+    gcs.guard_conditions = arr;
+    gcs.guard_condition_count = 1;
+    rmw_time_t t{0, 20000000};  // 20 ms
+    auto _r [[maybe_unused]] = rmw_wait(
+      nullptr, &gcs, nullptr, nullptr, nullptr, ws_reg, &t);
+  }
+
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  rmw_qos_profile_t qos = rmw_qos_profile_default;
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/churn_quiet", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+
+  std::atomic<bool> stop{false};
+  std::thread churn([&] {
+      auto pub_opts = rmw_get_default_publisher_options();
+      auto * ts_c = rosidl_typesupport_cpp::get_message_type_support_handle<
+        test_msgs::msg::BasicTypes>();
+      rmw_qos_profile_t qos_c = rmw_qos_profile_default;
+      while (!stop.load()) {
+        auto * p = rmw_create_publisher(node, ts_c, "/churn_topic", &qos_c, &pub_opts);
+        if (p) {
+          auto _r [[maybe_unused]] = rmw_destroy_publisher(node, p);
+        }
+      }
+    });
+
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  rmw_subscriptions_t subs;
+  void * sub_arr[1] = {sub->data};
+  subs.subscribers = sub_arr;
+  subs.subscriber_count = 1;
+  rmw_time_t t{0, 600000000};  // 600 ms, no traffic on the subscription
+  auto t0 = std::chrono::steady_clock::now();
+  rmw_ret_t ret = rmw_wait(&subs, nullptr, nullptr, nullptr, nullptr, ws, &t);
+  auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+    std::chrono::steady_clock::now() - t0).count();
+  stop.store(true);
+  churn.join();
+
+  EXPECT_EQ(RMW_RET_TIMEOUT, ret) <<
+    "registry churn ended a wait with nothing ready";
+  EXPECT_EQ(nullptr, subs.subscribers[0]);
+  EXPECT_GE(elapsed_ms, 550) << "churn wakes ate into the caller's deadline";
+  EXPECT_LE(elapsed_ms, 1500) << "the wait overshot the deadline";
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws_reg));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub));
 }
