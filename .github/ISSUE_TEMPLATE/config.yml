@@ -1,0 +1,14 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 🔗 Not sure whether this RMW supports what you need?
+    url: https://github.com/benaliabderrahmane/rmw_unix_socket_cpp#limitations
+    about: The README lists the supported QoS policies and the known limitations.
+  - name: 🔗 Want to understand how it works internally?
+    url: https://github.com/benaliabderrahmane/rmw_unix_socket_cpp/blob/main/rmw_unix_socket_cpp/DESIGN.md
+    about: DESIGN.md documents the discovery registry, the transports and the wait set.
+  - name: 🔗 Have a general question on how to use ROS 2?
+    url: https://robotics.stackexchange.com/
+    about: The ROS community uses Robotics Stack Exchange for general project questions.
+  - name: 🔗 Looking for documentation on active ROS distros?
+    url: https://docs.ros.org/
+    about: The ROS documentation is available at docs.ros.org
