@@ -22,9 +22,9 @@ datagram sockets; the wait set is `epoll` + `eventfd`.
 
 ## Status
 
-- ROS 2 **Jazzy**, **Kilted**, and **Rolling** — built and tested in CI.
+- ROS 2 **Jazzy**, **Kilted**, **Rolling**, and **Lyrical** — built and tested in CI.
 - **Linux / x86_64 only** (uses `epoll`, `eventfd`, `/dev/shm`, `AF_UNIX`).
-- Version `0.1.0`, Apache-2.0.
+- Version `0.5.0`, Apache-2.0.
 
 ## Quick start
 
