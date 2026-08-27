@@ -14,6 +14,8 @@
 
 #include <sys/stat.h>
 
+#include <chrono>
+
 #include "identifier.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
@@ -129,6 +131,13 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
     domain_id = 0;
   }
   ctx->domain_id = domain_id;
+  try {
+    ctx->context_id = rmw_uds::generate_context_id();
+  } catch (...) {
+    delete ctx;
+    RMW_SET_ERROR_MSG("failed to generate context id");
+    return RMW_RET_ERROR;
+  }
 
   // Ensure socket directory exists. ensure_socket_dir swallows mkdir errors and
   // only returns the path, so validate the directory here (in-scope) rather than
@@ -165,6 +174,15 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
     rmw_uds::registry_cleanup_stale(init_header);
     rmw_uds::cleanup_orphan_socket_files(domain_id);
     rmw_uds::shm_cleanup_orphan_segments(domain_id);
+    // Date the sweep, or the first graph query — typically moments later,
+    // during node discovery — repeats the full stat-every-slot pass this one
+    // just paid for. Also keeps 0 unreachable as a live sentinel (steady_clock
+    // starts at boot, so a process starting within the first second of uptime
+    // would otherwise misread 0 as "swept just now").
+    ctx->last_cleanup_ns.store(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count(),
+      std::memory_order_relaxed);
   }
 
   rmw_uds::warn_if_sysctl_buffers_undersized();
@@ -184,8 +202,30 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
     "rmw_init: context up (domain_id=%zu, pid=%d)",
     domain_id, static_cast<int>(getpid()));
 
-  // Read initial generation
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
+
+  // Doorbell: bind the socket now so the fd is stable for every rmw_wait, but
+  // do NOT register the ENTRY_DOORBELL slot yet. Registration is lazy, from
+  // the first rmw_wait whose wait set holds a graph guard condition (see
+  // rmw_wait.cpp): with TRANSIENT_LOCAL replay pull-based, only graph-event
+  // consumers need registry wakeups, so plain pub/sub processes never ring —
+  // a fleet launch sends ~zero doorbell datagrams instead of mutations x
+  // processes. The lazy path replicates this bind-before-register ordering.
+  {
+    ctx->doorbell_path = rmw_uds::make_socket_path(domain_id, "ctl");
+    ctx->doorbell_fd = rmw_uds::create_bound_socket(ctx->doorbell_path);
+    if (ctx->doorbell_fd < 0) {
+      RMW_UDS_LOG_ERROR(
+        "rmw_init: failed to create doorbell socket (domain_id=%zu)", domain_id);
+      close(ctx->send_socket_fd);
+      rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);
+      delete ctx;
+      RMW_SET_ERROR_MSG("failed to create doorbell socket");
+      return RMW_RET_ERROR;
+    }
+  }
+
+  // Read initial generation
   ctx->last_registry_generation.store(
     rmw_uds::registry_generation(header), std::memory_order_relaxed);
 
@@ -195,6 +235,8 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
   if (options->enclave) {
     enclave_copy = rcutils_strdup(options->enclave, options->allocator);
     if (!enclave_copy) {
+      unlink(ctx->doorbell_path.c_str());  // doorbell not yet registered
+      close(ctx->doorbell_fd);
       close(ctx->send_socket_fd);
       rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);
       delete ctx;
@@ -220,6 +262,8 @@ rmw_ret_t rmw_init(const rmw_init_options_t * options, rmw_context_t * context)
     if (enclave_copy) {
       options->allocator.deallocate(enclave_copy, options->allocator.state);
     }
+    unlink(ctx->doorbell_path.c_str());  // doorbell not yet registered
+    close(ctx->doorbell_fd);
     close(ctx->send_socket_fd);
     rmw_uds::registry_close(ctx->registry_fd, ctx->registry_ptr, ctx->registry_size);
     delete ctx;
@@ -255,6 +299,18 @@ rmw_ret_t rmw_context_fini(rmw_context_t * context)
 
   auto * ctx = reinterpret_cast<rmw_uds::UdsContext *>(context->impl);
   if (ctx) {
+    // Doorbell teardown before the registry unmaps: registry_remove's slot
+    // teardown also unlinks the socket file. When the doorbell was never
+    // lazily registered there is no slot, so unlink the socket file here.
+    if (ctx->doorbell_registry_index >= 0 && ctx->registry_ptr) {
+      auto * header = rmw_uds::registry_header(ctx->registry_ptr);
+      rmw_uds::registry_remove(header, ctx->doorbell_registry_index);
+    } else if (!ctx->doorbell_path.empty()) {
+      unlink(ctx->doorbell_path.c_str());
+    }
+    if (ctx->doorbell_fd >= 0) {
+      close(ctx->doorbell_fd);
+    }
     if (ctx->send_socket_fd >= 0) {
       close(ctx->send_socket_fd);
     }

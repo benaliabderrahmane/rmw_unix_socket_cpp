@@ -44,6 +44,11 @@ enum RegistryEntryType : uint8_t
   ENTRY_SUBSCRIPTION,
   ENTRY_SERVICE,
   ENTRY_CLIENT,
+  // Per-context wakeup socket (see ring_doorbells in registry.cpp): rung with
+  // one octet after every registry mutation so a blocked rmw_wait re-checks
+  // the registry. Additive: no slot layout change, and type-filtered queries
+  // never match it, so it is invisible to graph introspection.
+  ENTRY_DOORBELL,
   // Transient claim state: a writer won the slot but has not yet committed its
   // payload. Readers treat it like ENTRY_EMPTY so they never observe a slot
   // before its payload is published. Never stored in a RegistryEntry; lives

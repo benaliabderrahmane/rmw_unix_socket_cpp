@@ -86,7 +86,7 @@ rmw_service_t * rmw_create_service(
     return nullptr;
   }
 
-  srv_data->gid.generate();
+  srv_data->gid.generate(ctx->context_id);
   srv_data->service_name = service_name;
   srv_data->type_name = rmw_uds::make_ros_type_name(sc.service_namespace, sc.service_name);
   srv_data->qos = resolve_qos(qos_profile);

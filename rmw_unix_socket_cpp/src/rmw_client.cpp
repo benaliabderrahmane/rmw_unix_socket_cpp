@@ -86,7 +86,7 @@ rmw_client_t * rmw_create_client(
     return nullptr;
   }
 
-  cli_data->gid.generate();
+  cli_data->gid.generate(ctx->context_id);
   cli_data->service_name = service_name;
   cli_data->type_name = rmw_uds::make_ros_type_name(sc.service_namespace, sc.service_name);
   cli_data->qos = resolve_qos(qos_policies);
