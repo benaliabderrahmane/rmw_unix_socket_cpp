@@ -525,3 +525,67 @@ TEST_F(ListenerCallbackTest, WaitAndListenerOnTheSameSubscriptionDoNotHang)
   auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
+
+// Services and clients reach the listener the same way subscriptions do, so
+// an EventsExecutor driving a service sees requests without anything calling
+// rmw_wait. Before this, only subscriptions were watched.
+TEST_F(ListenerCallbackTest, ServiceCallbackFiresWithNoThreadInWaitOrTake)
+{
+  auto * ts = rosidl_typesupport_cpp::get_service_type_support_handle<
+    test_msgs::srv::BasicTypes>();
+  auto * srv = rmw_create_service(node, ts, "/listener_srv_async", &qos);
+  auto * cli = rmw_create_client(node, ts, "/listener_srv_async", &qos);
+  ASSERT_NE(nullptr, srv);
+  ASSERT_NE(nullptr, cli);
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_service_set_on_new_request_callback(srv, CallbackCounter::fire, &counter));
+
+  test_msgs::srv::BasicTypes::Request request;
+  request.int32_value = 55;
+  int64_t seq_id = 0;
+  ASSERT_EQ(RMW_RET_OK, rmw_send_request(cli, &request, &seq_id));
+
+  EXPECT_TRUE(await_events(counter)) << "no request callback without rmw_wait";
+  EXPECT_FALSE(counter.saw_zero.load());
+
+  auto _c [[maybe_unused]] = rmw_destroy_client(node, cli);
+  auto _s [[maybe_unused]] = rmw_destroy_service(node, srv);
+}
+
+TEST_F(ListenerCallbackTest, ClientCallbackFiresWithNoThreadInWaitOrTake)
+{
+  auto * ts = rosidl_typesupport_cpp::get_service_type_support_handle<
+    test_msgs::srv::BasicTypes>();
+  auto * srv = rmw_create_service(node, ts, "/listener_cli_async", &qos);
+  auto * cli = rmw_create_client(node, ts, "/listener_cli_async", &qos);
+  ASSERT_NE(nullptr, srv);
+  ASSERT_NE(nullptr, cli);
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_client_set_on_new_response_callback(cli, CallbackCounter::fire, &counter));
+
+  test_msgs::srv::BasicTypes::Request request;
+  request.int32_value = 66;
+  int64_t seq_id = 0;
+  ASSERT_EQ(RMW_RET_OK, rmw_send_request(cli, &request, &seq_id));
+
+  test_msgs::srv::BasicTypes::Request recv_request;
+  rmw_service_info_t request_header;
+  std::memset(&request_header, 0, sizeof(request_header));
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_request(srv, &request_header, &recv_request, &taken));
+  ASSERT_TRUE(taken);
+
+  test_msgs::srv::BasicTypes::Response response;
+  response.int32_value = 77;
+  ASSERT_EQ(RMW_RET_OK, rmw_send_response(srv, &request_header.request_id, &response));
+
+  EXPECT_TRUE(await_events(counter)) << "no response callback without rmw_wait";
+  EXPECT_FALSE(counter.saw_zero.load());
+
+  auto _c [[maybe_unused]] = rmw_destroy_client(node, cli);
+  auto _s [[maybe_unused]] = rmw_destroy_service(node, srv);
+}

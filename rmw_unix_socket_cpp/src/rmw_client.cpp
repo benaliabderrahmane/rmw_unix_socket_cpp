@@ -14,6 +14,7 @@
 
 #include "drain.hpp"
 #include "identifier.hpp"
+#include "listener.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
 #include "serialization.hpp"
@@ -154,6 +155,9 @@ rmw_ret_t rmw_destroy_client(rmw_node_t * node, rmw_client_t * client)
 
   auto * cli_data = static_cast<rmw_uds::UdsClient *>(client->data);
   if (cli_data) {
+    // Stop the listener watching this socket first: listener_unwatch blocks
+    // until an in-flight drain has returned, so the delete below cannot race it.
+    rmw_uds::listener_unwatch(cli_data->context, cli_data->socket_fd);
     if (cli_data->context && cli_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(cli_data->context->registry_ptr);
       rmw_uds::registry_remove(header, cli_data->registry_index);
@@ -381,16 +385,28 @@ rmw_ret_t rmw_client_set_on_new_response_callback(
     client, client->implementation_identifier,
     rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * cli_data = static_cast<rmw_uds::UdsClient *>(client->data);
-  std::lock_guard<std::mutex> lock(cli_data->callback_mutex);
-  cli_data->on_new_response_cb = callback;
-  cli_data->on_new_response_user_data = user_data;
+  {
+    std::lock_guard<std::mutex> lock(cli_data->callback_mutex);
+    cli_data->on_new_response_cb = callback;
+    cli_data->on_new_response_user_data = user_data;
 
-  if (callback) {
-    std::lock_guard<std::mutex> qlock(cli_data->queue_mutex);
-    if (!cli_data->response_queue.empty()) {
-      callback(user_data, cli_data->response_queue.size());
+    if (callback) {
+      std::lock_guard<std::mutex> qlock(cli_data->queue_mutex);
+      if (!cli_data->response_queue.empty()) {
+        callback(user_data, cli_data->response_queue.size());
+      }
     }
   }
+
+  // Outside callback_mutex: the listener holds listener_mutex across a drain
+  // and takes callback_mutex inside it, so the reverse order would deadlock.
+  // The flush above covered the queue, the watch below covers the socket.
+  if (callback) {
+    return rmw_uds::listener_watch(
+      cli_data->context, cli_data->socket_fd, rmw_uds::ARMED_CLIENT,
+      cli_data, cli_data->uid);
+  }
+  rmw_uds::listener_unwatch(cli_data->context, cli_data->socket_fd);
   return RMW_RET_OK;
 }
 
