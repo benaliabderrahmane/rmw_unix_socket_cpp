@@ -1,0 +1,86 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main, devel]
+  pull_request:
+    branches: [main, devel]
+  schedule:
+    # Weekly, so a query-pack update finds existing code without waiting for
+    # the next push.
+    - cron: '31 4 * * 1'
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    name: analyze (c-cpp)
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload the SARIF results
+      contents: read
+      actions: read
+    container:
+      # Same base as CI: CodeQL has to observe the real compiler invocations,
+      # which means the real ROS headers and the real find_package results.
+      image: ros:jazzy-ros-base
+      options: --shm-size=1g
+
+    steps:
+      - name: Install build prerequisites
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git \
+            python3-colcon-common-extensions \
+            python3-rosdep
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve package dependencies
+        shell: bash
+        run: |
+          rosdep update --rosdistro=jazzy
+          # Mirrors the CI workflow: rosdep's --from-paths defaults exclude
+          # test deps, and BUILD_TESTING=ON (colcon build default) fails to
+          # configure without them. The tests are part of what gets analyzed.
+          rosdep install --from-paths rmw_unix_socket_cpp --ignore-src -r -y \
+            --rosdistro=jazzy \
+            --dependency-types=buildtool \
+            --dependency-types=build \
+            --dependency-types=build_export \
+            --dependency-types=exec \
+            --dependency-types=test
+          apt-get install -y --no-install-recommends \
+            ros-jazzy-test-msgs \
+            ros-jazzy-rosidl-typesupport-cpp \
+            ros-jazzy-rosidl-runtime-cpp
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          # Manual, not autobuild. Autobuild guesses at the build system and
+          # would run cmake without the ROS environment sourced, so
+          # find_package(rmw) fails and CodeQL ends up analyzing nothing.
+          build-mode: manual
+          # Superset of security-extended: adds the correctness and
+          # maintainability queries. security-extended alone is the leaner
+          # choice if the quality results turn out to be noise.
+          queries: security-and-quality
+
+      - name: Build
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          # Debug rather than Release: -O2 inlines and folds enough that some
+          # dataflow paths stop being visible to the extractor.
+          colcon build \
+            --paths rmw_unix_socket_cpp \
+            --event-handlers console_direct+ \
+            --cmake-args -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:c-cpp"
