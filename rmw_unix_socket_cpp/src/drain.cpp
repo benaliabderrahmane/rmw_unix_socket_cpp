@@ -62,6 +62,9 @@ DrainTarget drain_target(UdsService * srv)
   t.msg_type = 1;
   t.shm_cache = &srv->shm_cache;
   t.domain_id = srv->context->domain_id;
+  t.callback_mutex = &srv->callback_mutex;
+  t.callback = &srv->on_new_request_cb;
+  t.callback_user_data = &srv->on_new_request_user_data;
   t.log_name = srv->service_name.c_str();
   return t;
 }
@@ -76,6 +79,9 @@ DrainTarget drain_target(UdsClient * cli)
   t.msg_type = 2;
   t.shm_cache = &cli->shm_cache;
   t.domain_id = cli->context->domain_id;
+  t.callback_mutex = &cli->callback_mutex;
+  t.callback = &cli->on_new_response_cb;
+  t.callback_user_data = &cli->on_new_response_user_data;
   t.log_name = cli->service_name.c_str();
   return t;
 }
@@ -84,6 +90,8 @@ void drain_endpoint(const DrainTarget & t)
 {
   WireHeader hdr;
   std::vector<uint8_t> payload;
+  size_t enqueued = 0;
+  size_t dropped = 0;
 
   while (recv_from(t.fd, hdr, payload)) {
     if ((hdr.msg_type & ~SHM_PAYLOAD_FLAG) != t.msg_type) {
@@ -136,6 +144,7 @@ void drain_endpoint(const DrainTarget & t)
       // equivalent of "slow subscriber".
       while (t.queue->size() > t.max_depth) {
         t.queue->pop_front();
+        ++dropped;
         overflow = true;
       }
     }
@@ -147,17 +156,29 @@ void drain_endpoint(const DrainTarget & t)
         "Application is not calling take() fast enough.",
         t.log_name, t.max_depth);
     }
+    ++enqueued;
+  }
 
-    // Notify under callback_mutex, with queue_mutex already released: the
-    // set_on_new_*_callback() functions take callback_mutex and then
-    // queue_mutex to flush a backlog, so acquiring them the other way round
-    // while holding both would deadlock.
-    if (t.callback_mutex) {
-      std::lock_guard<std::mutex> lock(*t.callback_mutex);
-      if (*t.callback) {
-        (*t.callback)(*t.callback_user_data, 1);
-      }
-    }
+  // One notification for the whole batch. rmw_event_callback_t takes the
+  // number of events since it was last called and must never be handed zero
+  // (rmw/event_callback_type.h), so a drain that gained nothing stays silent
+  // and a drain that gained ten reports ten rather than calling ten times.
+  //
+  // The count is how much the queue GREW, not how many datagrams the socket
+  // handed over. number_of_events is a take credit - the executor calls take()
+  // once per event - so an overflow that pushed 100 and popped 90 must report
+  // 10, or the executor spends 90 takes finding nothing. At most one pop per
+  // push, so dropped never exceeds enqueued.
+  const size_t gained = enqueued - dropped;
+  if (gained == 0 || !t.callback_mutex) {
+    return;
+  }
+  // Notified with queue_mutex released. set_on_new_*_callback() takes
+  // callback_mutex and then queue_mutex to flush a backlog, so holding both
+  // in the other order here would deadlock.
+  std::lock_guard<std::mutex> lock(*t.callback_mutex);
+  if (*t.callback) {
+    (*t.callback)(*t.callback_user_data, gained);
   }
 }
 
