@@ -5,6 +5,91 @@ All notable changes to `rmw_unix_socket_cpp` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+The EventsExecutor release. `rclcpp`'s `EventsExecutor` — the default in
+`performance_test` and `ros2-benchmark-container` — crashed on every pub/sub
+topology, and fixing the crash only turned it into a silent hang: that executor
+never calls `rmw_wait`, and delivery happened exclusively inside `rmw_wait`, so
+nothing ever drained its sockets. Callback-driven delivery now works, and the
+four copies of the receive loop that hid the gap are one.
+
+### Added
+
+- **Listener thread for callback-driven delivery.** An endpoint that registers
+  a listener callback is watched by one per-context thread that drains its
+  socket and fires the callback with no application thread involved. It is
+  started **lazily**, by the first callback registration in the context, so an
+  executor that waits registers nothing and the process still starts no
+  background thread — the zero-thread property holds for
+  `SingleThreadedExecutor` and `MultiThreadedExecutor` exactly as before.
+  Joined in `rmw_shutdown`.
+- **`delivery_fd`, so a watched endpoint can still sit in a wait set.** The
+  listener signals this eventfd strictly *after* enqueueing and `rmw_wait`
+  drains it strictly *before* scanning its queues, which is what stops a wait
+  from sleeping on a socket the listener already emptied. Same ordering pair as
+  the registry doorbell. **One per wait set**, created in
+  `rmw_create_wait_set`: reading an eventfd drains its whole counter, so a
+  single shared fd is a single credit that whichever wait set wakes first
+  consumes — including one that gained no work and discards it. Creating it
+  with the wait set also means a callback registered while a wait is already
+  blocked still has an armed fd to signal.
+
+### Changed
+
+- **One socket drain instead of four.** `drain_endpoint` replaces
+  `drain_subscription`, `drain_socket`, and the inline copies in
+  `rmw_take_request` and `rmw_take_response`. Each copy had been deciding its
+  own policy, which is where the delivery gaps lived. `DrainTarget` now carries
+  that policy per endpoint.
+- **Listener callbacks report a batch count.** One notification per drain
+  carrying the number of entries the queue *gained*, rather than one call of
+  `1` per datagram. `rmw/event_callback_type.h` defines `number_of_events` as
+  the count since the callback was last called and allows `> 1`. The count is
+  growth rather than datagrams read, because it is a take credit: an overflow
+  that pushes 100 and pops 90 reports 10, not 100.
+- Request and response queues are capped at `SERVICE_QUEUE_DEPTH` (100)
+  wherever they are filled. `rmw_wait` always applied that bound; the take-path
+  drains had none.
+- `DESIGN.md` documents the listener thread and the `delivery_fd` ordering, and
+  narrows the no-background-threads claim to what it now guarantees.
+
+### Fixed
+
+- **Registering a callback while the context shut down could abort or hang.**
+  `listener_watch` read `is_shutdown` before taking `listener_mutex`, which
+  `listener_stop` must release in order to join. A registration landing in that
+  window restarted the listener: it move-assigned over a still-joinable
+  `std::thread` (`std::terminate`) and replaced the epoll and wake descriptors,
+  so the stop's wake-up went to an fd nobody polled and `rmw_shutdown` never
+  returned. Both are closed by a `listener_stopping` flag checked under the
+  mutex — `is_shutdown` alone does not cover it, because `rmw_context_fini`
+  reaches `listener_stop` without setting it.
+- **Concurrent drains of one endpoint could reorder a publisher's messages.**
+  `drain_endpoint` `recv`s outside `queue_mutex` and pushes inside it, so the
+  listener thread and an `rmw_wait`/`rmw_take` could interleave and break the
+  per-publisher FIFO ordering ROS 2 guarantees. A per-endpoint `drain_mutex`
+  held for the whole drain serialises them.
+- **Services and clients were callback-dead after registration** (#61
+  follow-up). `on_new_request_cb` and `on_new_response_cb` were stored and
+  flushed once against an existing backlog, then never fired again by any drain.
+- **The `rmw_wait` drain notified nobody.** Only the `rmw_take` path fired a
+  subscription's `on_new_message` callback, so a callback registered by an
+  executor was silent for every message that arrived while a thread sat in
+  `rmw_wait`. It also trimmed to the QoS depth without reporting the overflow.
+- **A backlog was flushed twice per registration.** `rclcpp` calls the rmw
+  setter twice in a row on purpose — a stack temporary, then its permanent
+  storage — so the flush in the three `set_on_new_*_callback` functions paid the
+  same queued messages out for both calls, and a TRANSIENT_LOCAL subscription
+  with ten replayed samples handed the executor twenty events. It now flushes
+  only when a callback takes over from none.
+- **The three callback setters left the callback installed after
+  `listener_watch` failed**, contradicting the error they returned. A failure
+  now means the callback is not set.
+- **`listener_start` could throw out of an `extern "C"` entry point.**
+  `std::thread` construction reports thread exhaustion as `std::system_error`;
+  it is now caught, and the running flag it had already set is cleared.
+
 ## [0.5.0] - 2026-08-27
 
 The wait/wakeup release. The 200 ms `rmw_wait` poll is gone, replaced by an
