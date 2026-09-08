@@ -1,0 +1,123 @@
+name: Sanitizers
+
+on:
+  push:
+    branches: [main, devel]
+  pull_request:
+    branches: [main, devel]
+  workflow_dispatch:
+
+jobs:
+  sanitize:
+    name: sanitize (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Two jobs, not two configurations of one: ASan and TSan cannot be
+        # linked into the same binary, so each needs its own build tree.
+        include:
+          - name: address,undefined
+            # -fno-sanitize-recover=all is what makes UBSan fail the job.
+            # Without it UBSan prints the diagnostic, continues, and the test
+            # still passes - a finding nobody sees.
+            cxx_flags: >-
+              -fsanitize=address,undefined -fno-sanitize-recover=all
+              -fno-omit-frame-pointer -g -O1
+            link_flags: -fsanitize=address,undefined
+          - name: thread
+            cxx_flags: -fsanitize=thread -g -O1
+            link_flags: -fsanitize=thread
+    container:
+      image: ros:jazzy-ros-base
+      # Default Docker /dev/shm is 64MB; one domain registry mmap is ~37MB
+      # and rmw_shutdown doesn't shm_unlink, so tests that init multiple
+      # domains across processes exhaust tmpfs and crash with SIGBUS.
+      options: --shm-size=1g
+
+    steps:
+      - name: Install build prerequisites
+        shell: bash
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git \
+            python3-colcon-common-extensions \
+            python3-rosdep
+
+      - uses: actions/checkout@v4
+
+      - name: Resolve package dependencies
+        shell: bash
+        run: |
+          rosdep update --rosdistro=jazzy
+          # Mirrors the CI workflow: rosdep's --from-paths defaults exclude
+          # test deps, and BUILD_TESTING=ON (colcon build default) fails to
+          # configure without them.
+          rosdep install --from-paths rmw_unix_socket_cpp --ignore-src -r -y \
+            --rosdistro=jazzy \
+            --dependency-types=buildtool \
+            --dependency-types=build \
+            --dependency-types=build_export \
+            --dependency-types=exec \
+            --dependency-types=test
+          apt-get install -y --no-install-recommends \
+            ros-jazzy-test-msgs \
+            ros-jazzy-rosidl-typesupport-cpp \
+            ros-jazzy-rosidl-runtime-cpp
+
+      - name: Relax ASLR entropy for the sanitizer runtimes
+        shell: bash
+        run: |
+          # Ubuntu 24.04 raised vm.mmap_rnd_bits to 32, which the ASan and
+          # TSan shadow-memory mappings cannot accommodate ("unexpected
+          # memory mapping" at startup). Harmless where it is already low
+          # enough, and a plain container cannot write sysctls at all - hence
+          # the fallback rather than a hard failure.
+          sysctl -w vm.mmap_rnd_bits=28 2>/dev/null \
+            || echo "could not lower vm.mmap_rnd_bits; continuing"
+
+      - name: Build
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build \
+            --paths rmw_unix_socket_cpp \
+            --event-handlers console_direct+ \
+            --cmake-args \
+              -DCMAKE_BUILD_TYPE=Debug \
+              -DCMAKE_CXX_FLAGS="${{ matrix.cxx_flags }}" \
+              -DCMAKE_EXE_LINKER_FLAGS="${{ matrix.link_flags }}" \
+              -DCMAKE_SHARED_LINKER_FLAGS="${{ matrix.link_flags }}"
+
+      - name: Test
+        shell: bash
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          source install/setup.bash
+          # All three are exported in both jobs; each runtime reads only its
+          # own, so the matrix does not need to carry them.
+          #
+          # detect_leaks is on deliberately: it is what proves the listener
+          # thread is joined and its epoll/eventfd descriptors closed, which
+          # no functional test can observe.
+          export ASAN_OPTIONS=detect_leaks=1:abort_on_error=1
+          export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
+          export TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
+          colcon test \
+            --paths rmw_unix_socket_cpp \
+            --event-handlers console_direct+ \
+            --return-code-on-test-failure
+
+      - name: Test summary
+        if: always()
+        shell: bash
+        run: colcon test-result --verbose
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sanitizer-logs-${{ matrix.name }}
+          path: log/
+          retention-days: 7
