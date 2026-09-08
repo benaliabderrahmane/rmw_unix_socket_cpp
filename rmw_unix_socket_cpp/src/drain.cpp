@@ -86,7 +86,7 @@ DrainTarget drain_target(UdsClient * cli)
   return t;
 }
 
-void drain_endpoint(const DrainTarget & t)
+size_t drain_endpoint(const DrainTarget & t)
 {
   WireHeader hdr;
   std::vector<uint8_t> payload;
@@ -155,7 +155,7 @@ void drain_endpoint(const DrainTarget & t)
   }
 
   if (enqueued == 0 || !t.callback_mutex) {
-    return;
+    return enqueued;
   }
   // One notification for the whole batch. rmw_event_callback_t takes the
   // number of events since it was last called and must never be handed zero
@@ -173,6 +173,7 @@ void drain_endpoint(const DrainTarget & t)
   if (*t.callback) {
     (*t.callback)(*t.callback_user_data, enqueued);
   }
+  return enqueued;
 }
 
 }  // namespace rmw_uds

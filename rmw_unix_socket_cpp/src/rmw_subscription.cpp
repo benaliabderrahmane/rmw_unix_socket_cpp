@@ -14,6 +14,7 @@
 
 #include "drain.hpp"
 #include "identifier.hpp"
+#include "listener.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
 #include "serialization.hpp"
@@ -276,6 +277,10 @@ rmw_ret_t rmw_destroy_subscription(
 
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
   if (sub_data) {
+    // Stop the listener watching this socket before anything is torn down.
+    // listener_unwatch blocks until an in-flight drain of this subscription
+    // has returned, so the delete below cannot race it.
+    rmw_uds::listener_unwatch(sub_data->context, sub_data->socket_fd);
     if (sub_data->context && sub_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(sub_data->context->registry_ptr);
       rmw_uds::registry_remove(header, sub_data->registry_index);
@@ -625,17 +630,34 @@ rmw_ret_t rmw_subscription_set_on_new_message_callback(
   RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
 
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
-  std::lock_guard<std::mutex> lock(sub_data->callback_mutex);
-  sub_data->on_new_message_cb = callback;
-  sub_data->on_new_message_user_data = user_data;
+  {
+    std::lock_guard<std::mutex> lock(sub_data->callback_mutex);
+    sub_data->on_new_message_cb = callback;
+    sub_data->on_new_message_user_data = user_data;
 
-  // If there are already messages queued, notify
-  if (callback) {
-    std::lock_guard<std::mutex> qlock(sub_data->queue_mutex);
-    if (!sub_data->message_queue.empty()) {
-      callback(user_data, sub_data->message_queue.size());
+    // If there are already messages queued, notify
+    if (callback) {
+      std::lock_guard<std::mutex> qlock(sub_data->queue_mutex);
+      if (!sub_data->message_queue.empty()) {
+        callback(user_data, sub_data->message_queue.size());
+      }
     }
   }
+
+  // Hand the socket to the listener thread, or take it back. Deliberately
+  // outside callback_mutex: the listener holds listener_mutex across a drain
+  // and takes callback_mutex inside it, so acquiring them in the other order
+  // here would deadlock against a drain already in flight.
+  //
+  // The flush above covered the queue; the watch below covers the socket,
+  // which epoll reports level-triggered, so datagrams that arrived between
+  // the two are delivered rather than dropped or double-reported.
+  if (callback) {
+    return rmw_uds::listener_watch(
+      sub_data->context, sub_data->socket_fd, rmw_uds::ARMED_SUBSCRIPTION,
+      sub_data, sub_data->uid);
+  }
+  rmw_uds::listener_unwatch(sub_data->context, sub_data->socket_fd);
   return RMW_RET_OK;
 }
 

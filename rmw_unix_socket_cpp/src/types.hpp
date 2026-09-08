@@ -26,6 +26,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -155,6 +156,26 @@ inline bool is_same_context(const WireHeader & hdr, uint64_t context_id)
   return sender_context_id == context_id;
 }
 
+// What a given epoll fd was armed for. Lets rmw_wait map an epoll result back
+// to its owner without scanning the wait set, and skip the epoll_ctl when the
+// fd is already armed for the same entity.
+enum ArmedKind : uint8_t
+{
+  ARMED_SUBSCRIPTION = 0,
+  ARMED_SERVICE,
+  ARMED_CLIENT,
+  ARMED_GUARD_CONDITION,
+  ARMED_DOORBELL,
+  ARMED_DELIVERY,
+};
+
+struct ArmedEntry
+{
+  uint8_t kind = ARMED_SUBSCRIPTION;  // ArmedKind
+  void * entity = nullptr;            // UdsSubscription * etc, for the drain
+  uint64_t uid = 0;                   // 0 for the doorbell, which has no entity
+};
+
 // Per-context implementation data
 struct UdsContext
 {
@@ -195,6 +216,31 @@ struct UdsContext
   // the mutex; rmw_destroy_node removes its entry before destroying the GC.
   std::mutex graph_gcs_mutex;
   std::vector<rmw_guard_condition_t *> graph_gcs;
+
+  // Listener thread: asynchronous delivery for endpoints that registered a
+  // listener callback (rclcpp's EventsExecutor never calls rmw_wait, so
+  // nothing else would ever move a datagram off their sockets). Started
+  // LAZILY by listener_watch() on the first registration in this context and
+  // joined in rmw_shutdown, so a process whose executor waits instead of
+  // listening still starts no thread at all — see DESIGN.md, "No background
+  // threads, and why".
+  //
+  // listener_targets maps a watched fd to its endpoint; listener_mutex is held
+  // across the drain so listener_unwatch() cannot return, and its caller
+  // cannot free the endpoint, while the listener is inside it.
+  //
+  // delivery_fd is an eventfd the listener signals strictly AFTER enqueueing.
+  // An rmw_wait in this process drains it strictly BEFORE checking its queues,
+  // which is what stops a wait from blocking on an empty socket whose datagram
+  // the listener already moved into the queue. Same ordering pair as the
+  // registry doorbell (see ring_doorbells in registry.cpp).
+  std::thread listener_thread;
+  int listener_epoll_fd = -1;
+  int listener_wake_fd = -1;
+  int delivery_fd = -1;
+  std::atomic<bool> listener_running{false};
+  std::mutex listener_mutex;
+  std::unordered_map<int, ArmedEntry> listener_targets;
 };
 
 // Node data
@@ -373,25 +419,6 @@ struct UdsGuardCondition
   // Wait-set arming identity; see next_entity_uid().
   uint64_t uid = next_entity_uid();
   int eventfd_fd = -1;
-};
-
-// What a given epoll fd was armed for. Lets rmw_wait map an epoll result back
-// to its owner without scanning the wait set, and skip the epoll_ctl when the
-// fd is already armed for the same entity.
-enum ArmedKind : uint8_t
-{
-  ARMED_SUBSCRIPTION = 0,
-  ARMED_SERVICE,
-  ARMED_CLIENT,
-  ARMED_GUARD_CONDITION,
-  ARMED_DOORBELL,
-};
-
-struct ArmedEntry
-{
-  uint8_t kind = ARMED_SUBSCRIPTION;  // ArmedKind
-  void * entity = nullptr;            // UdsSubscription * etc, for the drain
-  uint64_t uid = 0;                   // 0 for the doorbell, which has no entity
 };
 
 // Wait set data

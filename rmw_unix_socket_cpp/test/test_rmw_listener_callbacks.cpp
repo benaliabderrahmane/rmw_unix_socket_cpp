@@ -15,7 +15,11 @@
 #include "test_base.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <thread>
+
+#include <dirent.h>
 
 #include "test_msgs/msg/basic_types.hpp"
 #include "test_msgs/srv/basic_types.hpp"
@@ -44,6 +48,39 @@ struct CallbackCounter
     self->events.fetch_add(number_of_events);
   }
 };
+
+// Threads in this process, from /proc/self/task. Used to pin the listener's
+// lazy start: a process whose executor waits instead of listening must not
+// gain a thread.
+static size_t thread_count()
+{
+  DIR * dir = opendir("/proc/self/task");
+  if (!dir) {
+    return 0;
+  }
+  size_t n = 0;
+  while (const dirent * entry = readdir(dir)) {
+    if (entry->d_name[0] != '.') {
+      ++n;
+    }
+  }
+  closedir(dir);
+  return n;
+}
+
+// Spin until `counter` reports something or the budget runs out. Deliberately
+// calls neither rmw_wait nor rmw_take: the point is that delivery happens
+// without either.
+static bool await_events(const CallbackCounter & counter, int budget_ms = 2000)
+{
+  for (int waited = 0; waited < budget_ms; waited += 5) {
+    if (counter.events.load() > 0) {
+      return true;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return counter.events.load() > 0;
+}
 
 class ListenerCallbackTest : public RmwUdsNodeTest
 {
@@ -306,4 +343,185 @@ TEST_F(ListenerCallbackTest, ClientCallbackFiresOnResponse)
 
   auto _c [[maybe_unused]] = rmw_destroy_client(node, cli);
   auto _s [[maybe_unused]] = rmw_destroy_service(node, srv);
+}
+
+// The reason the listener thread exists. rclcpp's EventsExecutor never calls
+// rmw_wait, and only calls rmw_take once a callback has told it there is
+// something to take - so with delivery happening exclusively inside rmw_wait,
+// nothing ever moves the datagram off the socket and the executor waits
+// forever. This test calls neither.
+TEST_F(ListenerCallbackTest, CallbackFiresWithNoThreadInWaitOrTake)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/listener_async", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/listener_async", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+
+  test_msgs::msg::BasicTypes msg;
+  msg.int32_value = 99;
+  ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+
+  EXPECT_TRUE(await_events(counter)) << "no callback without rmw_wait/rmw_take";
+  EXPECT_FALSE(counter.saw_zero.load());
+
+  // The message really is queued, not merely announced.
+  test_msgs::msg::BasicTypes recv;
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+  EXPECT_TRUE(taken);
+  EXPECT_EQ(99, recv.int32_value);
+
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+// The listener starts on the first registration and only then, so the
+// zero-background-threads property still holds for every executor that waits.
+TEST_F(ListenerCallbackTest, NoListenerThreadUntilACallbackIsRegistered)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  auto sub_opts = rmw_get_default_subscription_options();
+
+  const size_t before = thread_count();
+  ASSERT_GT(before, 0u);
+
+  auto * sub = rmw_create_subscription(node, ts, "/listener_lazy", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+  EXPECT_EQ(before, thread_count()) << "creating a subscription started a thread";
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+  EXPECT_EQ(before + 1, thread_count()) << "registration did not start the listener";
+
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+}
+
+TEST_F(ListenerCallbackTest, ClearingTheCallbackStopsAsyncDelivery)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/listener_unwatch", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/listener_unwatch", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+  ASSERT_EQ(
+    RMW_RET_OK, rmw_subscription_set_on_new_message_callback(sub, nullptr, nullptr));
+
+  test_msgs::msg::BasicTypes msg;
+  msg.int32_value = 5;
+  ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  EXPECT_EQ(0u, counter.calls.load());
+
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+// listener_unwatch must not return while the listener is inside a drain of
+// this subscription, or the delete that follows frees it underneath the
+// listener. Run under -fsanitize=thread/address to make a regression loud.
+TEST_F(ListenerCallbackTest, DestroySubscriptionWhileMessagesArrive)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/listener_churn", &qos, &pub_opts);
+  ASSERT_NE(nullptr, pub);
+
+  for (int round = 0; round < 20; ++round) {
+    auto sub_opts = rmw_get_default_subscription_options();
+    auto * sub = rmw_create_subscription(node, ts, "/listener_churn", &qos, &sub_opts);
+    ASSERT_NE(nullptr, sub);
+    ASSERT_EQ(
+      RMW_RET_OK,
+      rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+
+    for (int i = 0; i < 5; ++i) {
+      test_msgs::msg::BasicTypes msg;
+      msg.int32_value = i;
+      ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+    }
+    // Destroy with datagrams very likely still in flight on the listener.
+    EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub));
+  }
+
+  EXPECT_FALSE(counter.saw_zero.load());
+  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+// The listener and a wait set can drain the same socket. If the listener wins
+// the race between a wait's queue scan and its epoll_wait, the socket is
+// already empty and epoll has nothing left to report - the wait would block
+// with a full queue. delivery_fd is what closes that window; this drives the
+// race repeatedly rather than trying to interleave it exactly.
+TEST_F(ListenerCallbackTest, WaitAndListenerOnTheSameSubscriptionDoNotHang)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/listener_race", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/listener_race", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+
+  rmw_subscriptions_t subs;
+  void * arr[1] = {sub->data};
+  subs.subscribers = arr;
+  subs.subscriber_count = 1;
+  rmw_time_t timeout;
+  timeout.sec = 2;
+  timeout.nsec = 0;
+
+  for (int round = 0; round < 50; ++round) {
+    std::atomic<bool> waiting{false};
+    std::atomic<rmw_ret_t> wait_ret{RMW_RET_ERROR};
+    std::thread waiter([&]() {
+        waiting.store(true);
+        wait_ret.store(
+          rmw_wait(&subs, nullptr, nullptr, nullptr, nullptr, ws, &timeout));
+      });
+    while (!waiting.load()) {
+      std::this_thread::yield();
+    }
+
+    test_msgs::msg::BasicTypes msg;
+    msg.int32_value = round;
+    ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+
+    waiter.join();
+    // A timeout here means the wait slept through a message that was already
+    // in the queue.
+    EXPECT_EQ(RMW_RET_OK, wait_ret.load()) << "round " << round;
+
+    bool taken = true;
+    while (taken) {
+      test_msgs::msg::BasicTypes recv;
+      ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    }
+  }
+
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }

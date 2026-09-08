@@ -71,9 +71,9 @@ DrainTarget drain_target(UdsSubscription * sub);
 DrainTarget drain_target(UdsService * srv);
 DrainTarget drain_target(UdsClient * cli);
 
-// Move every datagram waiting on the endpoint's socket into its queue. The
-// caller must not hold *queue_mutex.
-void drain_endpoint(const DrainTarget & target);
+// Move every datagram waiting on the endpoint's socket into its queue and
+// return how many were enqueued. The caller must not hold *queue_mutex.
+size_t drain_endpoint(const DrainTarget & target);
 
 }  // namespace rmw_uds
 

@@ -180,6 +180,12 @@ rmw_ret_t rmw_wait(
   }
 
   const int doorbell_fd = ctx ? ctx->doorbell_fd : -1;
+  // The listener thread's delivery eventfd, armed only while that thread runs.
+  // A process whose executor waits instead of listening never registers a
+  // callback, so this stays -1 and every wait below is exactly what it was.
+  const int delivery_fd =
+    (ctx && ctx->listener_running.load(std::memory_order_acquire)) ?
+    ctx->delivery_fd : -1;
   auto run_generation_check = [&]() {
       // Drain the doorbell strictly BEFORE reading the generation: paired with
       // ring_doorbells running strictly AFTER the bump, a mutation either lands
@@ -299,6 +305,12 @@ rmw_ret_t rmw_wait(
     // It has no entity, so uid 0 (never handed out by next_entity_uid) arms
     // it exactly once for the life of the wait set.
     register_fd(doorbell_fd, rmw_uds::ARMED_DOORBELL, nullptr, 0);
+    // The listener's delivery eventfd. Like the doorbell it has no entity, so
+    // uid 0 arms it once for the life of the wait set. It is signalled for any
+    // endpoint the listener drains, which need not be one this wait set holds
+    // — the dispatch below therefore re-checks the caller's queues instead of
+    // treating the wake itself as progress.
+    register_fd(delivery_fd, rmw_uds::ARMED_DELIVERY, nullptr, 0);
   }
 
   // Fallback for entities epoll cannot watch: drain their sockets directly so
@@ -332,45 +344,58 @@ rmw_ret_t rmw_wait(
   // rmw_take has consumed since. Those are invisible to epoll (their socket is
   // already empty), so the internal queues must be checked directly. This is a
   // mutex and a deque test per entity, no syscalls.
-  bool something_ready = false;
+  // Drain the delivery eventfd strictly BEFORE the queue scan below. Paired
+  // with the listener signalling strictly AFTER it enqueues, a message it took
+  // off a socket either shows up in this scan or leaves the level-triggered
+  // eventfd readable for the epoll below — the wait cannot end up blocked on
+  // an empty socket whose datagram is already sitting in the queue.
+  if (delivery_fd >= 0) {
+    uint64_t val;
+    while (read(delivery_fd, &val, sizeof(val)) == static_cast<ssize_t>(sizeof(val))) {
+    }
+  }
+
+  auto caller_queue_has_work = [&]() {
+      if (subscriptions) {
+        for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
+          if (!subscriptions->subscribers[i]) {continue;}
+          auto * sub =
+            static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
+          std::lock_guard<std::mutex> lock(sub->queue_mutex);
+          if (!sub->message_queue.empty()) {
+            return true;
+          }
+        }
+      }
+      if (services) {
+        for (size_t i = 0; i < services->service_count; ++i) {
+          if (!services->services[i]) {continue;}
+          auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
+          std::lock_guard<std::mutex> lock(srv->queue_mutex);
+          if (!srv->request_queue.empty()) {
+            return true;
+          }
+        }
+      }
+      if (clients) {
+        for (size_t i = 0; i < clients->client_count; ++i) {
+          if (!clients->clients[i]) {continue;}
+          auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
+          std::lock_guard<std::mutex> lock(cli->queue_mutex);
+          if (!cli->response_queue.empty()) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+  bool something_ready = caller_queue_has_work();
 
   // Per-GC readiness from the consuming read below, carried to the output
   // pass. One read drains the whole eventfd counter, so we never write it back
   // (a non-atomic read-back would race a concurrent trigger and inflate it).
   std::vector<bool> gc_triggered;
-
-  if (subscriptions) {
-    for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
-      if (!subscriptions->subscribers[i]) {continue;}
-      auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
-      std::lock_guard<std::mutex> lock(sub->queue_mutex);
-      if (!sub->message_queue.empty()) {
-        something_ready = true;
-      }
-    }
-  }
-
-  if (services) {
-    for (size_t i = 0; i < services->service_count; ++i) {
-      if (!services->services[i]) {continue;}
-      auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
-      std::lock_guard<std::mutex> lock(srv->queue_mutex);
-      if (!srv->request_queue.empty()) {
-        something_ready = true;
-      }
-    }
-  }
-
-  if (clients) {
-    for (size_t i = 0; i < clients->client_count; ++i) {
-      if (!clients->clients[i]) {continue;}
-      auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
-      std::lock_guard<std::mutex> lock(cli->queue_mutex);
-      if (!cli->response_queue.empty()) {
-        something_ready = true;
-      }
-    }
-  }
 
   if (guard_conditions) {
     gc_triggered.assign(guard_conditions->guard_condition_count, false);
@@ -465,6 +490,7 @@ rmw_ret_t rmw_wait(
       // such message.
       bool progressed = false;
       bool rang = false;
+      bool delivered = false;
       for (int e = 0; e < n; ++e) {
         const int rfd = ready_events[e].data.fd;
         auto it = ws_data->armed.find(rfd);
@@ -531,12 +557,30 @@ rmw_ret_t rmw_wait(
           case rmw_uds::ARMED_DOORBELL:
             rang = true;
             break;
+          case rmw_uds::ARMED_DELIVERY: {
+              // The listener enqueued for some endpoint in this context. Drain
+              // the counter so a level-triggered fd cannot spin this loop, and
+              // note that the caller's queues need re-checking.
+              uint64_t val;
+              while (read(rfd, &val, sizeof(val)) ==
+                static_cast<ssize_t>(sizeof(val)))
+              {
+              }
+              delivered = true;
+              break;
+            }
           default:
             break;
         }
       }
       if (rang) {
         run_generation_check();  // Drains the doorbell, triggers graph GCs.
+      }
+      if (delivered && !progressed) {
+        // The listener drains endpoints across the whole context, so the wake
+        // says nothing about whether THIS caller's entities gained work. Only
+        // a non-empty queue among them is progress.
+        progressed = caller_queue_has_work();
       }
       if (poll_only) {
         if (n == 64) {
