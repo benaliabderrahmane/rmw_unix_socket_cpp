@@ -51,6 +51,7 @@ set(CMAKE_REQUIRED_INCLUDES "${_rmw_probe_saved_inc}")
 
 add_library(rmw_unix_socket_cpp SHARED
   src/drain.cpp
+  src/listener.cpp
   src/registry.cpp
   src/serialization.cpp
   src/shm_transport.cpp
