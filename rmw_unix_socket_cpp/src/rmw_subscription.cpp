@@ -626,11 +626,15 @@ rmw_ret_t rmw_subscription_set_on_new_message_callback(
 
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
   std::lock_guard<std::mutex> lock(sub_data->callback_mutex);
+  // Flush the backlog only when a callback is taking over from none. rclcpp
+  // sets the callback twice in a row on purpose - a stack temporary, then its
+  // permanent storage (subscription_base.hpp) - and paying the same backlog
+  // out twice hands the executor two events per queued message.
+  const bool taking_over = !sub_data->on_new_message_cb;
   sub_data->on_new_message_cb = callback;
   sub_data->on_new_message_user_data = user_data;
 
-  // If there are already messages queued, notify
-  if (callback) {
+  if (callback && taking_over) {
     std::lock_guard<std::mutex> qlock(sub_data->queue_mutex);
     if (!sub_data->message_queue.empty()) {
       callback(user_data, sub_data->message_queue.size());
