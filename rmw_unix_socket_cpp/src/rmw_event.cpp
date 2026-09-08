@@ -29,6 +29,10 @@ rmw_ret_t rmw_publisher_event_init(
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(rmw_event, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(publisher, RMW_RET_INVALID_ARGUMENT);
+  if (!rmw_event_type_is_supported(event_type)) {
+    RMW_SET_ERROR_MSG("event type not supported");
+    return RMW_RET_UNSUPPORTED;
+  }
   // Initialize the event struct so rcl can add it to a wait set without crashing.
   // We don't actually generate events, but the struct must be valid.
   rmw_event->implementation_identifier = rmw_uds::identifier;
@@ -44,6 +48,10 @@ rmw_ret_t rmw_subscription_event_init(
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(rmw_event, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
+  if (!rmw_event_type_is_supported(event_type)) {
+    RMW_SET_ERROR_MSG("event type not supported");
+    return RMW_RET_UNSUPPORTED;
+  }
   rmw_event->implementation_identifier = rmw_uds::identifier;
   rmw_event->data = subscription->data;
   rmw_event->event_type = event_type;
