@@ -131,6 +131,24 @@ Tests the epoll-based wait set.
 | `WaitTimeoutWhenNoData` | Returns `RMW_RET_TIMEOUT` after specified duration, guard condition nulled out | Validates the timeout path. Without this, the executor would hang indefinitely when no messages arrive. |
 | `WaitWithSubscription` | Publish → wait on subscription → returns ready → take succeeds | End-to-end: message arrives on socket → epoll detects it → drain into queue → subscription marked ready → take succeeds. Tests the full executor wakeup path. |
 
+### test_rmw_listener_callbacks.cpp
+
+Tests the `on_new_message` / `on_new_request` / `on_new_response` listener
+callbacks, and the listener thread that fires them without a wait.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `SubscriptionCallbackFiresFromWait` | A callback registered on a subscription fires for a message drained by `rmw_wait` | Only the `rmw_take` path used to notify, so a callback was silent for every message that arrived while a thread sat in `rmw_wait` — which is every message, for an executor that waits before it takes. |
+| `SubscriptionCallbackReportsTheBatchCount` | Three messages in one drain produce one call with `number_of_events == 3` | `rmw/event_callback_type.h` defines the count as events since the last call and allows `> 1`. One call per batch beats one per datagram. |
+| `EmptyDrainDoesNotNotify` | A drain that enqueues nothing fires nothing | The contract says the count "should never be 0", so notifying on an empty drain would report an event that did not happen. |
+| `ClearingTheCallbackStopsNotifications` | Registering `nullptr` stops notification | `callback == NULL` is the documented way to clear a callback. |
+| `ServiceCallbackFiresOnRequest` / `ClientCallbackFiresOnResponse` | Request and response callbacks fire on arrival | Both were stored by their setters and flushed once against an existing backlog, then never fired again by any drain. |
+| `CallbackFiresWithNoThreadInWaitOrTake` | A published message reaches the callback with neither `rmw_wait` nor `rmw_take` ever called | The whole reason the listener thread exists. `EventsExecutor` calls neither until a callback tells it to, so without this it waits forever. Fails by timing out on the pre-listener code. |
+| `ServiceCallbackFiresWithNoThreadInWaitOrTake` / `ClientCallbackFiresWithNoThreadInWaitOrTake` | The same for a service request and a client response | Services and clients reach the listener the same way subscriptions do. |
+| `NoListenerThreadUntilACallbackIsRegistered` | `/proc/self/task` is unchanged by creating a subscription, and grows by exactly one on registration | Pins the lazy start. An executor that waits must still get the zero-background-thread behavior the design promises. |
+| `DestroySubscriptionWhileMessagesArrive` | 20 rounds of register → publish → destroy with datagrams in flight | `listener_unwatch` must not return while the listener is inside a drain, or the `delete` that follows frees the endpoint underneath it. Run under TSan/ASan to make a regression loud. |
+| `WaitAndListenerOnTheSameSubscriptionDoNotHang` | 50 rounds of publishing into a blocked `rmw_wait` on a watched subscription | If the listener empties the socket between a wait's queue scan and its `epoll_wait`, `epoll` has nothing left to report and the wait would sleep on a full queue. `delivery_fd` closes that window; this drives the race rather than interleaving it exactly. |
+
 ### test_rmw_graph.cpp
 
 Tests graph introspection (discovery queries).
@@ -167,7 +185,8 @@ Tests QoS policies, TRANSIENT_LOCAL (latched), and multi-endpoint scenarios.
 | Network flow endpoints | Not applicable — AF_UNIX has no IP endpoints. Returns `RMW_RET_UNSUPPORTED`. |
 | Content filtering | Not implemented. Returns `RMW_RET_UNSUPPORTED`. |
 | Cross-process tests | All tests run in a single process. Cross-process communication works via the same shared-memory registry and socket paths, but testing it requires launching separate processes (integration test territory). |
-| Deadline / lifespan QoS | Not enforced — these are timer-based policies that require background monitoring. Accepted as a known limitation for this lightweight implementation. |
+| Deadline / lifespan QoS | Not enforced — these are timer-based policies that require background monitoring. The listener thread is edge-driven (socket readiness, never a clock), so it does not make them enforceable. Accepted as a known limitation for this lightweight implementation. |
+| QoS status events (`matched`, incompatible-QoS, incompatible-type, `message_lost`) | Not generated. `test_rmw_event.cpp` tests the refusal instead: `rmw_event_type_is_supported` returns `false` for every type and both `*_event_init` functions reject with `RMW_RET_UNSUPPORTED`, which is what `rclcpp` handles cleanly. |
 | Stress / scale tests (200+ nodes) | Requires a launch file and process management. Can be tested with the `test200.launch.xml` launch file separately. |
 
 ---
