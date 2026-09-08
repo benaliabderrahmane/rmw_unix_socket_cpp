@@ -345,7 +345,7 @@ TEST_F(PubSubTest, TakeSequenceSkipsMidBatchCorruptContiguously)
 }
 
 // subscription_options.ignore_local_publications is enforced in
-// drain_subscription() (rmw_subscription.cpp), which drops any message whose
+// drain_endpoint() (drain.cpp), which drops any message whose
 // sender context id — embedded in WireHeader::gid by UdsGid::generate() —
 // matches the subscription's owning rmw_context_t, before it reaches the queue.
 TEST_F(PubSubTest, IgnoreLocalPublicationsDropsSameProcessMessage)
