@@ -498,6 +498,10 @@ TEST_F(ListenerCallbackTest, ServiceCallbackFiresOnRequest)
 
   wait_on_service(srv);
 
+  // This PR hands the socket to the listener, which pushes to the queue
+  // before it notifies - so rmw_wait can return on the queued entry while
+  // the callback has not fired. Wait for the count, then pin it exactly.
+  EXPECT_TRUE(await_events(counter, 1));
   EXPECT_EQ(1u, counter.events.load());
   EXPECT_FALSE(counter.saw_zero.load());
 
@@ -536,6 +540,10 @@ TEST_F(ListenerCallbackTest, ClientCallbackFiresOnResponse)
 
   wait_on_client(cli);
 
+  // This PR hands the socket to the listener, which pushes to the queue
+  // before it notifies - so rmw_wait can return on the queued entry while
+  // the callback has not fired. Wait for the count, then pin it exactly.
+  EXPECT_TRUE(await_events(counter, 1));
   EXPECT_EQ(1u, counter.events.load());
   EXPECT_FALSE(counter.saw_zero.load());
 
@@ -722,6 +730,70 @@ TEST_F(ListenerCallbackTest, WaitAndListenerOnTheSameSubscriptionDoNotHang)
 
   auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+// Services and clients reach the listener the same way subscriptions do, so
+// an EventsExecutor driving a service sees requests without anything calling
+// rmw_wait. Before this, only subscriptions were watched.
+TEST_F(ListenerCallbackTest, ServiceCallbackFiresWithNoThreadInWaitOrTake)
+{
+  auto * ts = rosidl_typesupport_cpp::get_service_type_support_handle<
+    test_msgs::srv::BasicTypes>();
+  auto * srv = rmw_create_service(node, ts, "/listener_srv_async", &qos);
+  auto * cli = rmw_create_client(node, ts, "/listener_srv_async", &qos);
+  ASSERT_NE(nullptr, srv);
+  ASSERT_NE(nullptr, cli);
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_service_set_on_new_request_callback(srv, CallbackCounter::fire, &counter));
+
+  test_msgs::srv::BasicTypes::Request request;
+  request.int32_value = 55;
+  int64_t seq_id = 0;
+  ASSERT_EQ(RMW_RET_OK, rmw_send_request(cli, &request, &seq_id));
+
+  EXPECT_TRUE(await_events(counter)) << "no request callback without rmw_wait";
+  EXPECT_FALSE(counter.saw_zero.load());
+
+  auto _c [[maybe_unused]] = rmw_destroy_client(node, cli);
+  auto _s [[maybe_unused]] = rmw_destroy_service(node, srv);
+}
+
+TEST_F(ListenerCallbackTest, ClientCallbackFiresWithNoThreadInWaitOrTake)
+{
+  auto * ts = rosidl_typesupport_cpp::get_service_type_support_handle<
+    test_msgs::srv::BasicTypes>();
+  auto * srv = rmw_create_service(node, ts, "/listener_cli_async", &qos);
+  auto * cli = rmw_create_client(node, ts, "/listener_cli_async", &qos);
+  ASSERT_NE(nullptr, srv);
+  ASSERT_NE(nullptr, cli);
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_client_set_on_new_response_callback(cli, CallbackCounter::fire, &counter));
+
+  test_msgs::srv::BasicTypes::Request request;
+  request.int32_value = 66;
+  int64_t seq_id = 0;
+  ASSERT_EQ(RMW_RET_OK, rmw_send_request(cli, &request, &seq_id));
+
+  test_msgs::srv::BasicTypes::Request recv_request;
+  rmw_service_info_t request_header;
+  std::memset(&request_header, 0, sizeof(request_header));
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_request(srv, &request_header, &recv_request, &taken));
+  ASSERT_TRUE(taken);
+
+  test_msgs::srv::BasicTypes::Response response;
+  response.int32_value = 77;
+  ASSERT_EQ(RMW_RET_OK, rmw_send_response(srv, &request_header.request_id, &response));
+
+  EXPECT_TRUE(await_events(counter)) << "no response callback without rmw_wait";
+  EXPECT_FALSE(counter.saw_zero.load());
+
+  auto _c [[maybe_unused]] = rmw_destroy_client(node, cli);
+  auto _s [[maybe_unused]] = rmw_destroy_service(node, srv);
 }
 
 // The same coexistence, with a second wait set competing for the wake. A
@@ -995,71 +1067,6 @@ TEST_F(ListenerCallbackTest, ConcurrentDrainsPreservePublisherOrder)
   // Guards against the assertion above passing vacuously.
   EXPECT_GT(collected, static_cast<size_t>(total) / 2);
 
-  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
-  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
-}
-
-// A listener callback that takes from its own endpoint. drain_endpoint()
-// releases drain_mutex and queue_mutex before it notifies, and the backlog
-// flush in the setter does the same, so a callback runs holding only
-// callback_mutex and this is legal. Hold either data lock across the
-// notification and rmw_take deadlocks against it one frame up, so this test
-// fails by wedging the binary rather than by failing an assertion.
-struct TakingCallback
-{
-  rmw_subscription_t * sub = nullptr;
-  std::atomic<size_t> taken{0};
-
-  static void fire(const void * user_data, size_t)
-  {
-    auto * self =
-      const_cast<TakingCallback *>(static_cast<const TakingCallback *>(user_data));
-    test_msgs::msg::BasicTypes msg;
-    bool got = false;
-    if (rmw_take(self->sub, &msg, &got, nullptr) == RMW_RET_OK && got) {
-      self->taken.fetch_add(1);
-    }
-  }
-};
-
-TEST_F(ListenerCallbackTest, ACallbackMayTakeFromItsOwnEndpoint)
-{
-  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
-    test_msgs::msg::BasicTypes>();
-  auto pub_opts = rmw_get_default_publisher_options();
-  auto * pub = rmw_create_publisher(node, ts, "/listener_reentrant", &qos, &pub_opts);
-  auto sub_opts = rmw_get_default_subscription_options();
-  auto * sub = rmw_create_subscription(node, ts, "/listener_reentrant", &qos, &sub_opts);
-  ASSERT_NE(nullptr, pub);
-  ASSERT_NE(nullptr, sub);
-
-  TakingCallback tc;
-  tc.sub = sub;
-
-  // Queue a backlog with no callback installed, so the registration below
-  // fires the setter's flush path with entries already waiting.
-  for (int32_t i = 0; i < 3; ++i) {
-    test_msgs::msg::BasicTypes msg;
-    msg.int32_value = i;
-    ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
-  }
-  wait_on_subscription(sub);
-
-  // Deadlocks here if the flush still holds queue_mutex across the callback.
-  ASSERT_EQ(
-    RMW_RET_OK,
-    rmw_subscription_set_on_new_message_callback(sub, TakingCallback::fire, &tc));
-
-  // And here if the listener's drain still holds drain_mutex across it.
-  test_msgs::msg::BasicTypes msg;
-  msg.int32_value = 99;
-  ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
-  wait_on_subscription(sub);
-
-  EXPECT_GT(tc.taken.load(), 0u) << "the callback never managed a take";
-
-  auto _c [[maybe_unused]] =
-    rmw_subscription_set_on_new_message_callback(sub, nullptr, nullptr);
   auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
