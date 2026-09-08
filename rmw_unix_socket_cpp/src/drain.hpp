@@ -49,6 +49,10 @@ static constexpr size_t SERVICE_QUEUE_DEPTH = 100;
 struct DrainTarget
 {
   int fd = -1;
+  // Held across the receive loop only - released before the notification - so
+  // two drains of one endpoint cannot interleave their recv/push pairs and
+  // reorder the queue, and no user code runs under it. See UdsSubscription.
+  std::mutex * drain_mutex = nullptr;
   std::mutex * queue_mutex = nullptr;
   std::deque<ReceivedMessage> * queue = nullptr;
   // Trim the queue to this many entries after each push.
@@ -79,9 +83,9 @@ DrainTarget drain_target(UdsSubscription * sub);
 DrainTarget drain_target(UdsService * srv);
 DrainTarget drain_target(UdsClient * cli);
 
-// Move every datagram waiting on the endpoint's socket into its queue. The
-// caller must not hold *queue_mutex.
-void drain_endpoint(const DrainTarget & target);
+// Move every datagram waiting on the endpoint's socket into its queue and
+// return how many were enqueued. The caller must not hold *queue_mutex.
+size_t drain_endpoint(const DrainTarget & target);
 
 }  // namespace rmw_uds
 
