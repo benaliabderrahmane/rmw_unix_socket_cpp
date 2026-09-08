@@ -14,10 +14,12 @@
 
 #include "test_base.hpp"
 
+#include <cstdint>
 #include <cstring>
 
 #include "test_msgs/msg/basic_types.hpp"
 
+#include "rmw/error_handling.h"
 #include "rmw/event.h"
 #include "rmw/qos_profiles.h"
 #include "rosidl_typesupport_cpp/message_type_support.hpp"
@@ -54,7 +56,20 @@ protected:
   {
     if (sub) { auto _r [[maybe_unused]] = rmw_destroy_subscription(node, sub); }
     if (pub) { auto _r [[maybe_unused]] = rmw_destroy_publisher(node, pub); }
+    rmw_reset_error();
     RmwUdsNodeTest::TearDown();
+  }
+
+  // An event handle stamped as ours, for the entry points that validate one.
+  // *_event_init() cannot produce it: it rejects every event type, which is
+  // the behavior the tests below pin.
+  rmw_event_t our_event(rmw_event_type_t type) const
+  {
+    rmw_event_t event = rmw_get_zero_initialized_event();
+    event.implementation_identifier = uds_id();
+    event.data = sub->data;
+    event.event_type = type;
+    return event;
   }
 };
 
@@ -65,22 +80,162 @@ protected:
 // rclcpp constructs a live event handler for it, and the failure only
 // surfaces later - unhandled - when the executor registers its callback,
 // crashing with "failed to set the on new message callback for Event".
-TEST_F(EventTest, SubscriptionEventInitRejectsUnsupportedEventType)
+//
+// Iterating the whole enum rather than naming types keeps this honest across
+// the distro matrix: rmw_event_type_t has no explicit initializers, so both
+// the ordinals and RMW_EVENT_INVALID shift as upstream adds event types.
+TEST_F(EventTest, SubscriptionEventInitRejectsEveryEventType)
 {
-  ASSERT_FALSE(rmw_event_type_is_supported(RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE));
+  for (int i = 0; i <= RMW_EVENT_INVALID; ++i) {
+    const auto type = static_cast<rmw_event_type_t>(i);
+    ASSERT_FALSE(rmw_event_type_is_supported(type)) << "event type " << i;
 
-  rmw_event_t event = rmw_get_zero_initialized_event();
-  EXPECT_EQ(
-    RMW_RET_UNSUPPORTED,
-    rmw_subscription_event_init(&event, sub, RMW_EVENT_REQUESTED_QOS_INCOMPATIBLE));
+    rmw_event_t event = rmw_get_zero_initialized_event();
+    EXPECT_EQ(RMW_RET_UNSUPPORTED, rmw_subscription_event_init(&event, sub, type))
+      << "event type " << i;
+    // rcl logs whatever the RMW left behind, so a bare return code is a
+    // dead end for anyone debugging the rejection.
+    EXPECT_TRUE(rmw_error_is_set()) << "event type " << i;
+    rmw_reset_error();
+  }
 }
 
-TEST_F(EventTest, PublisherEventInitRejectsUnsupportedEventType)
+TEST_F(EventTest, PublisherEventInitRejectsEveryEventType)
 {
-  ASSERT_FALSE(rmw_event_type_is_supported(RMW_EVENT_OFFERED_QOS_INCOMPATIBLE));
+  for (int i = 0; i <= RMW_EVENT_INVALID; ++i) {
+    const auto type = static_cast<rmw_event_type_t>(i);
+    ASSERT_FALSE(rmw_event_type_is_supported(type)) << "event type " << i;
 
+    rmw_event_t event = rmw_get_zero_initialized_event();
+    EXPECT_EQ(RMW_RET_UNSUPPORTED, rmw_publisher_event_init(&event, pub, type))
+      << "event type " << i;
+    EXPECT_TRUE(rmw_error_is_set()) << "event type " << i;
+    rmw_reset_error();
+  }
+}
+
+// A rejected init leaves the handle exactly as rmw_get_zero_initialized_event()
+// made it, so a failed EventHandler construction cannot leave rcl holding a
+// handle that looks like ours.
+TEST_F(EventTest, RejectedEventInitLeavesTheHandleZeroInitialized)
+{
+  rmw_event_t event = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_UNSUPPORTED, rmw_subscription_event_init(&event, sub, RMW_EVENT_MESSAGE_LOST));
+  rmw_reset_error();
+
+  EXPECT_EQ(nullptr, event.implementation_identifier);
+  EXPECT_EQ(nullptr, event.data);
+}
+
+TEST_F(EventTest, EventInitRejectsForeignEndpoints)
+{
+  rmw_subscription_t foreign_sub = *sub;
+  foreign_sub.implementation_identifier = "rmw_bogus_cpp";
   rmw_event_t event = rmw_get_zero_initialized_event();
   EXPECT_EQ(
-    RMW_RET_UNSUPPORTED,
-    rmw_publisher_event_init(&event, pub, RMW_EVENT_OFFERED_QOS_INCOMPATIBLE));
+    RMW_RET_INCORRECT_RMW_IMPLEMENTATION,
+    rmw_subscription_event_init(&event, &foreign_sub, RMW_EVENT_MESSAGE_LOST));
+  rmw_reset_error();
+
+  rmw_publisher_t foreign_pub = *pub;
+  foreign_pub.implementation_identifier = "rmw_bogus_cpp";
+  event = rmw_get_zero_initialized_event();
+  EXPECT_EQ(
+    RMW_RET_INCORRECT_RMW_IMPLEMENTATION,
+    rmw_publisher_event_init(&event, &foreign_pub, RMW_EVENT_LIVELINESS_LOST));
+  rmw_reset_error();
+}
+
+TEST_F(EventTest, EventInitRejectsNullArguments)
+{
+  rmw_event_t event = rmw_get_zero_initialized_event();
+  EXPECT_EQ(
+    RMW_RET_INVALID_ARGUMENT,
+    rmw_subscription_event_init(nullptr, sub, RMW_EVENT_MESSAGE_LOST));
+  rmw_reset_error();
+  EXPECT_EQ(
+    RMW_RET_INVALID_ARGUMENT,
+    rmw_subscription_event_init(&event, nullptr, RMW_EVENT_MESSAGE_LOST));
+  rmw_reset_error();
+  EXPECT_EQ(
+    RMW_RET_INVALID_ARGUMENT,
+    rmw_publisher_event_init(nullptr, pub, RMW_EVENT_LIVELINESS_LOST));
+  rmw_reset_error();
+  EXPECT_EQ(
+    RMW_RET_INVALID_ARGUMENT,
+    rmw_publisher_event_init(&event, nullptr, RMW_EVENT_LIVELINESS_LOST));
+  rmw_reset_error();
+}
+
+// rmw_take_event() may only write into the caller's status struct when it
+// reports taken. rcl reuses that buffer across calls, so scribbling in it on
+// the nothing-taken path would hand the application a stale status it never
+// asked for.
+TEST_F(EventTest, TakeEventTakesNothingAndLeavesEventInfoUntouched)
+{
+  rmw_event_t event = our_event(RMW_EVENT_MESSAGE_LOST);
+
+  uint8_t info[128];
+  std::memset(info, 0xAB, sizeof(info));
+  uint8_t expected[128];
+  std::memset(expected, 0xAB, sizeof(expected));
+
+  bool taken = true;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_event(&event, info, &taken));
+  EXPECT_FALSE(taken);
+  EXPECT_EQ(0, std::memcmp(info, expected, sizeof(info)));
+}
+
+TEST_F(EventTest, TakeEventRejectsBadArguments)
+{
+  rmw_event_t event = our_event(RMW_EVENT_MESSAGE_LOST);
+  uint8_t info[16] = {};
+  bool taken = false;
+
+  EXPECT_EQ(RMW_RET_INVALID_ARGUMENT, rmw_take_event(nullptr, info, &taken));
+  rmw_reset_error();
+  EXPECT_EQ(RMW_RET_INVALID_ARGUMENT, rmw_take_event(&event, info, nullptr));
+  rmw_reset_error();
+
+  rmw_event_t foreign = event;
+  foreign.implementation_identifier = "rmw_bogus_cpp";
+  EXPECT_EQ(RMW_RET_INCORRECT_RMW_IMPLEMENTATION, rmw_take_event(&foreign, info, &taken));
+  rmw_reset_error();
+}
+
+// rmw_event_fini has nothing to validate and nothing to free. rcl_event_fini
+// skips it whenever event->impl is NULL, and that is precisely what
+// rcl_*_event_init leaves behind when it frees impl on our
+// RMW_RET_UNSUPPORTED - so no handle we could reject ever arrives.
+TEST_F(EventTest, EventFiniIsANoOp)
+{
+  rmw_event_t zero = rmw_get_zero_initialized_event();
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&zero));
+
+  rmw_event_t ours = our_event(RMW_EVENT_MESSAGE_LOST);
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ours));
+
+  EXPECT_FALSE(rmw_error_is_set());
+}
+
+// The original EventsExecutor crash surfaced as "failed to set the on new
+// message callback for Event: error not set" - the ": error not set" half
+// being this function returning a failure with no message behind it.
+TEST_F(EventTest, EventSetCallbackReportsUnsupportedWithAMessage)
+{
+  rmw_event_t event = our_event(RMW_EVENT_MESSAGE_LOST);
+  EXPECT_EQ(RMW_RET_UNSUPPORTED, rmw_event_set_callback(&event, nullptr, nullptr));
+  EXPECT_TRUE(rmw_error_is_set());
+  rmw_reset_error();
+
+  EXPECT_EQ(RMW_RET_INVALID_ARGUMENT, rmw_event_set_callback(nullptr, nullptr, nullptr));
+  rmw_reset_error();
+
+  // The identifier check the other event entry points already had.
+  rmw_event_t foreign = our_event(RMW_EVENT_MESSAGE_LOST);
+  foreign.implementation_identifier = "rmw_bogus_cpp";
+  EXPECT_EQ(
+    RMW_RET_INCORRECT_RMW_IMPLEMENTATION,
+    rmw_event_set_callback(&foreign, nullptr, nullptr));
+  rmw_reset_error();
 }
