@@ -14,6 +14,7 @@
 
 #include "drain.hpp"
 #include "identifier.hpp"
+#include "listener.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
 #include "serialization.hpp"
@@ -154,6 +155,9 @@ rmw_ret_t rmw_destroy_service(rmw_node_t * node, rmw_service_t * service)
 
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
   if (srv_data) {
+    // Stop the listener watching this socket first: listener_unwatch blocks
+    // until an in-flight drain has returned, so the delete below cannot race it.
+    rmw_uds::listener_unwatch(srv_data->context, srv_data->socket_fd);
     if (srv_data->context && srv_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(srv_data->context->registry_ptr);
       rmw_uds::registry_remove(header, srv_data->registry_index);
@@ -357,26 +361,38 @@ rmw_ret_t rmw_service_set_on_new_request_callback(
     service, service->implementation_identifier,
     rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
-  std::lock_guard<std::recursive_mutex> lock(srv_data->callback_mutex);
-  // Only when a callback takes over from none - rclcpp sets it twice in a row
-  // and the backlog must not be paid out for both calls.
-  const bool taking_over = !srv_data->on_new_request_cb;
-  srv_data->on_new_request_cb = callback;
-  srv_data->on_new_request_user_data = user_data;
+  {
+    std::lock_guard<std::recursive_mutex> lock(srv_data->callback_mutex);
+    // Only when a callback takes over from none - rclcpp sets it twice in a row
+    // and the backlog must not be paid out for both calls.
+    const bool taking_over = !srv_data->on_new_request_cb;
+    srv_data->on_new_request_cb = callback;
+    srv_data->on_new_request_user_data = user_data;
 
-  if (callback && taking_over) {
-    size_t backlog = 0;
-    {
-      std::lock_guard<std::mutex> qlock(srv_data->queue_mutex);
-      backlog = srv_data->request_queue.size();
-    }
-    // Fired with queue_mutex released. A callback is user code: holding the
-    // queue lock across it means a callback that calls rmw_take on its own
-    // endpoint deadlocks against itself. drain_endpoint() notifies the same way.
-    if (backlog > 0) {
-      callback(user_data, backlog);
+    if (callback && taking_over) {
+      size_t backlog = 0;
+      {
+        std::lock_guard<std::mutex> qlock(srv_data->queue_mutex);
+        backlog = srv_data->request_queue.size();
+      }
+      // Fired with queue_mutex released. A callback is user code: holding the
+      // queue lock across it means a callback that calls rmw_take on its own
+      // endpoint deadlocks against itself. drain_endpoint() notifies the same way.
+      if (backlog > 0) {
+        callback(user_data, backlog);
+      }
     }
   }
+
+  // Outside callback_mutex: the listener holds listener_mutex across a drain
+  // and takes callback_mutex inside it, so the reverse order would deadlock.
+  // The flush above covered the queue, the watch below covers the socket.
+  if (callback) {
+    return rmw_uds::listener_watch(
+      srv_data->context, srv_data->socket_fd, rmw_uds::ARMED_SERVICE,
+      srv_data, srv_data->uid);
+  }
+  rmw_uds::listener_unwatch(srv_data->context, srv_data->socket_fd);
   return RMW_RET_OK;
 }
 
