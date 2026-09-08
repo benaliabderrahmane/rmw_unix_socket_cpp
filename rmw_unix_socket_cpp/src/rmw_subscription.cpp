@@ -700,6 +700,9 @@ rmw_ret_t rmw_subscription_set_on_new_message_callback(
   const void * user_data)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    subscription, subscription->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
   std::lock_guard<std::mutex> lock(sub_data->callback_mutex);
