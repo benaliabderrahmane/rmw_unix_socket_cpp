@@ -15,6 +15,7 @@
 #include "identifier.hpp"
 #include "types.hpp"
 
+#include "rmw/check_type_identifiers_match.h"
 #include "rmw/error_handling.h"
 #include "rmw/event.h"
 #include "rmw/rmw.h"
@@ -29,6 +30,9 @@ rmw_ret_t rmw_publisher_event_init(
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(rmw_event, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(publisher, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    publisher, publisher->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   if (!rmw_event_type_is_supported(event_type)) {
     RMW_SET_ERROR_MSG("event type not supported");
     return RMW_RET_UNSUPPORTED;
@@ -48,6 +52,9 @@ rmw_ret_t rmw_subscription_event_init(
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(rmw_event, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    subscription, subscription->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   if (!rmw_event_type_is_supported(event_type)) {
     RMW_SET_ERROR_MSG("event type not supported");
     return RMW_RET_UNSUPPORTED;
@@ -63,21 +70,50 @@ rmw_ret_t rmw_take_event(
   void * event_info,
   bool * taken)
 {
-  (void)event_handle;
-  (void)event_info;
+  RMW_CHECK_ARGUMENT_FOR_NULL(event_handle, RMW_RET_INVALID_ARGUMENT);
   RMW_CHECK_ARGUMENT_FOR_NULL(taken, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    event_handle, event_handle->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+
+  // No event type is supported, so there is never anything to take. Leave
+  // `event_info` untouched: a taker may only write into the caller's status
+  // struct when it reports `taken`, and rcl reuses that buffer across calls.
+  (void)event_info;
   *taken = false;
   return RMW_RET_OK;
 }
 
 rmw_ret_t rmw_event_fini(rmw_event_t * event)
 {
-  (void)event;
+  RMW_CHECK_ARGUMENT_FOR_NULL(event, RMW_RET_INVALID_ARGUMENT);
+
+  // Finalizing an event that was never initialized is not an error. rclcpp's
+  // EventHandler destructor still runs when its constructor bailed out on the
+  // RMW_RET_UNSUPPORTED that *_event_init reports for every event type, and
+  // that leaves the handle as rmw_get_zero_initialized_event() made it. Only a
+  // handle stamped by another implementation is a caller mistake.
+  if (!event->implementation_identifier) {
+    return RMW_RET_OK;
+  }
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    event, event->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+
+  // rmw_event_t::data aliases the publisher's or subscription's impl struct,
+  // which the endpoint owns and frees in rmw_destroy_publisher /
+  // rmw_destroy_subscription. There is no per-event state to release.
   return RMW_RET_OK;
 }
 
 bool rmw_event_type_is_supported(rmw_event_type_t event_type)
 {
+  // No QoS status event is reported. matched, incompatible-QoS and
+  // incompatible-type would need cross-process endpoint diffing the registry
+  // generation counter does not provide, and deadline and liveliness need a
+  // periodic timer there is no thread to run (see DESIGN.md, "No background
+  // threads, and why"). Reporting false here is what makes *_event_init reject
+  // the type, which is the only refusal rclcpp handles cleanly.
   (void)event_type;
   return false;
 }
@@ -87,9 +123,16 @@ rmw_ret_t rmw_event_set_callback(
   rmw_event_callback_t callback,
   const void * user_data)
 {
-  (void)event;
+  RMW_CHECK_ARGUMENT_FOR_NULL(event, RMW_RET_INVALID_ARGUMENT);
   (void)callback;
   (void)user_data;
+
+  // Unreachable through rclcpp, which cannot hold an initialized event handle
+  // now that *_event_init rejects every type. Set an error message anyway:
+  // returning a failure without one is what made the original EventsExecutor
+  // crash unreadable ("failed to set the on new message callback for Event:
+  // error not set").
+  RMW_SET_ERROR_MSG("event callbacks are not supported: no event type is reported");
   return RMW_RET_UNSUPPORTED;
 }
 
