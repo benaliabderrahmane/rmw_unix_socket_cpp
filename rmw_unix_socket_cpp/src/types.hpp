@@ -229,18 +229,28 @@ struct UdsContext
   // across the drain so listener_unwatch() cannot return, and its caller
   // cannot free the endpoint, while the listener is inside it.
   //
-  // delivery_fd is an eventfd the listener signals strictly AFTER enqueueing.
-  // An rmw_wait in this process drains it strictly BEFORE checking its queues,
-  // which is what stops a wait from blocking on an empty socket whose datagram
-  // the listener already moved into the queue. Same ordering pair as the
-  // registry doorbell (see ring_doorbells in registry.cpp).
+  // delivery_fds holds one eventfd per live wait set, which the listener
+  // signals strictly AFTER enqueueing. An rmw_wait drains its own fd strictly
+  // BEFORE checking its queues, which is what stops a wait from blocking on an
+  // empty socket whose datagram the listener already moved into the queue.
+  // Same ordering pair as the registry doorbell (see ring_doorbells in
+  // registry.cpp).
+  //
+  // One fd PER WAIT SET, not one per context: an eventfd read drains the whole
+  // counter, so a single shared fd is one credit that whichever wait set wakes
+  // first consumes - including one that gained no work of its own and simply
+  // discards it. The fds are created in rmw_create_wait_set, before any
+  // listener exists, so a callback registered while a wait is already blocked
+  // still reaches it. Guarded by listener_mutex, which rmw_destroy_wait_set
+  // takes to deregister before it closes the fd - otherwise the listener
+  // writes 8 bytes into a recycled fd number.
   std::thread listener_thread;
   int listener_epoll_fd = -1;
   int listener_wake_fd = -1;
-  int delivery_fd = -1;
   std::atomic<bool> listener_running{false};
   std::mutex listener_mutex;
   std::unordered_map<int, ArmedEntry> listener_targets;
+  std::vector<int> delivery_fds;
 };
 
 // Node data
@@ -425,6 +435,10 @@ struct UdsGuardCondition
 struct UdsWaitSet
 {
   int epoll_fd = -1;
+  // This wait set's own delivery eventfd, created in rmw_create_wait_set and
+  // registered in context->delivery_fds so the listener signals it. Private to
+  // this wait set, so no other wait set can consume the wake.
+  int delivery_fd = -1;
   // Set at rmw_create_wait_set. The top-of-wait replay/graph check needs the
   // context even when the wait set holds only guard conditions (rclcpp's
   // GraphListener), so it cannot be scavenged from the waited-on entities.

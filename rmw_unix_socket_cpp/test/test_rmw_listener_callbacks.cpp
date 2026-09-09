@@ -153,7 +153,11 @@ protected:
 // callback registered by an executor heard nothing about messages that
 // arrived while a thread sat in rmw_wait - which is every message, for an
 // executor that waits before it takes.
-TEST_F(ListenerCallbackTest, SubscriptionCallbackFiresFromWait)
+//
+// Registering the callback also hands the socket to the listener, so either it
+// or the wait may be the one that delivers. The invariant is the count: the
+// message is reported exactly once, by whichever path got there first.
+TEST_F(ListenerCallbackTest, SubscriptionCallbackFiresExactlyOnceOnDelivery)
 {
   auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
     test_msgs::msg::BasicTypes>();
@@ -181,9 +185,14 @@ TEST_F(ListenerCallbackTest, SubscriptionCallbackFiresFromWait)
   auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
-// One notification per drain carrying the batch size, not one per message.
-// rmw/event_callback_type.h documents number_of_events as the count since the
-// callback was last called and explicitly allows > 1.
+// Batched, not one call per message: rmw/event_callback_type.h documents
+// number_of_events as the count since the callback was last called and
+// explicitly allows > 1.
+//
+// Asserts the event total, not the number of calls. The listener thread splits
+// a burst into however many batches its epoll reports, so the call count is
+// not the middleware's to promise - but the events always sum to the number of
+// messages, because each batch reports what it added to the queue.
 TEST_F(ListenerCallbackTest, SubscriptionCallbackReportsTheBatchCount)
 {
   auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
@@ -210,7 +219,6 @@ TEST_F(ListenerCallbackTest, SubscriptionCallbackReportsTheBatchCount)
   wait_on_subscription(sub);
 
   EXPECT_EQ(3u, counter.events.load());
-  EXPECT_EQ(1u, counter.calls.load());
   EXPECT_FALSE(counter.saw_zero.load());
 
   auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
@@ -218,10 +226,15 @@ TEST_F(ListenerCallbackTest, SubscriptionCallbackReportsTheBatchCount)
 }
 
 // number_of_events is a take credit: the executor calls take() once per event
-// it is told about. A drain that overflows the queue must therefore report
-// what the queue kept, not what the socket handed it, or the executor spends
-// the difference on takes that find nothing.
-TEST_F(ListenerCallbackTest, BatchCountExcludesDatagramsDroppedByOverflow)
+// it was told about. So the events reported for a burst must equal the number
+// of messages rmw_take can actually return - counting datagrams the socket
+// handed over rather than datagrams the queue kept spends the difference on
+// takes that find nothing.
+//
+// Asserts credits against takes rather than against qos.depth. How much of a
+// 15-message burst survives the socket buffer and the QoS trim is timing, and
+// not what this is pinning; that the two numbers agree is.
+TEST_F(ListenerCallbackTest, BatchCountMatchesWhatCanBeTaken)
 {
   auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
     test_msgs::msg::BasicTypes>();
@@ -236,7 +249,7 @@ TEST_F(ListenerCallbackTest, BatchCountExcludesDatagramsDroppedByOverflow)
     RMW_RET_OK,
     rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
 
-  // qos.depth is 10, so a single drain of 15 keeps the last 10 and drops 5.
+  // More than qos.depth (10), so the drain has to trim and report the trim.
   for (int32_t i = 0; i < 15; ++i) {
     test_msgs::msg::BasicTypes msg;
     msg.int32_value = i;
@@ -244,8 +257,24 @@ TEST_F(ListenerCallbackTest, BatchCountExcludesDatagramsDroppedByOverflow)
   }
 
   wait_on_subscription(sub);
+  // Nothing publishes any more, so this lets the listener finish whatever it
+  // still had in flight before the two counts are compared.
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-  EXPECT_EQ(qos.depth, counter.events.load());
+  const size_t events = counter.events.load();
+  size_t takeable = 0;
+  bool taken = true;
+  while (taken) {
+    test_msgs::msg::BasicTypes recv;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    if (taken) {
+      ++takeable;
+    }
+  }
+
+  EXPECT_EQ(takeable, events);
+  EXPECT_GT(takeable, 0u);
+  EXPECT_LE(takeable, qos.depth);
   EXPECT_FALSE(counter.saw_zero.load());
 
   auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
@@ -663,4 +692,139 @@ TEST_F(ListenerCallbackTest, ClientCallbackFiresWithNoThreadInWaitOrTake)
 
   auto _c [[maybe_unused]] = rmw_destroy_client(node, cli);
   auto _s [[maybe_unused]] = rmw_destroy_service(node, srv);
+}
+
+// The same coexistence, with a second wait set competing for the wake. A
+// delivery eventfd read drains the whole counter, so one shared per-context fd
+// made this a single credit: a wait set that gained no work of its own still
+// consumed it and threw it away, and the wait set that needed it slept on a
+// socket the listener had already emptied. One fd per wait set removes the
+// sharing, so the thief below cannot affect the victim at all.
+TEST_F(ListenerCallbackTest, ASecondWaitSetDoesNotStealTheDeliveryWakeup)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/listener_steal", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/listener_steal", &qos, &sub_opts);
+  // Held only by the thief wait set, and nothing ever publishes to it.
+  auto * idle = rmw_create_subscription(node, ts, "/listener_steal_idle", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+  ASSERT_NE(nullptr, idle);
+
+  rmw_wait_set_t * thief_ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, thief_ws);
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+
+  rmw_subscriptions_t subs;
+  void * arr[1] = {sub->data};
+  subs.subscribers = arr;
+  subs.subscriber_count = 1;
+  rmw_time_t timeout;
+  timeout.sec = 2;
+  timeout.nsec = 0;
+
+  // Spins rmw_wait on its own wait set for the whole test, so every delivery
+  // the listener signals has a competitor racing to consume it.
+  std::atomic<bool> stop{false};
+  std::thread thief([&]() {
+      rmw_subscriptions_t idle_subs;
+      void * idle_arr[1] = {idle->data};
+      idle_subs.subscribers = idle_arr;
+      idle_subs.subscriber_count = 1;
+      rmw_time_t brief;
+      brief.sec = 0;
+      brief.nsec = 2 * 1000 * 1000;
+      while (!stop.load()) {
+        (void)rmw_wait(&idle_subs, nullptr, nullptr, nullptr, nullptr, thief_ws, &brief);
+      }
+    });
+
+  for (int round = 0; round < 50; ++round) {
+    std::atomic<bool> waiting{false};
+    std::atomic<rmw_ret_t> wait_ret{RMW_RET_ERROR};
+    std::thread waiter([&]() {
+        waiting.store(true);
+        wait_ret.store(
+          rmw_wait(&subs, nullptr, nullptr, nullptr, nullptr, ws, &timeout));
+      });
+    while (!waiting.load()) {
+      std::this_thread::yield();
+    }
+
+    test_msgs::msg::BasicTypes msg;
+    msg.int32_value = round;
+    ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+
+    waiter.join();
+    EXPECT_EQ(RMW_RET_OK, wait_ret.load()) << "round " << round;
+
+    bool taken = true;
+    while (taken) {
+      test_msgs::msg::BasicTypes recv;
+      ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    }
+  }
+
+  stop.store(true);
+  thief.join();
+
+  auto _w [[maybe_unused]] = rmw_destroy_wait_set(thief_ws);
+  auto _i [[maybe_unused]] = rmw_destroy_subscription(node, idle);
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+// A wait set's delivery fd has to leave context->delivery_fds before it is
+// closed. The other order leaves the listener holding a stale fd number that
+// the next open() in the process reuses, and its 8-byte write lands in whatever
+// that turns out to be. Churns wait sets against a listener that is delivering
+// the whole time; the payoff is under the sanitizer jobs.
+TEST_F(ListenerCallbackTest, DestroyingWaitSetsWhileTheListenerDeliversIsSafe)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/listener_wschurn", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/listener_wschurn", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+
+  std::atomic<bool> stop{false};
+  std::thread publisher([&]() {
+      int32_t i = 0;
+      while (!stop.load()) {
+        test_msgs::msg::BasicTypes msg;
+        msg.int32_value = i++;
+        (void)rmw_publish(pub, &msg, nullptr);
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+      }
+    });
+
+  for (int round = 0; round < 200; ++round) {
+    rmw_wait_set_t * churn = rmw_create_wait_set(&context, 1);
+    ASSERT_NE(nullptr, churn) << "round " << round;
+    ASSERT_EQ(RMW_RET_OK, rmw_destroy_wait_set(churn)) << "round " << round;
+  }
+
+  stop.store(true);
+  publisher.join();
+
+  // The listener was the only thing draining, so this also confirms it kept
+  // running across the churn.
+  EXPECT_GT(counter.events.load(), 0u);
+  EXPECT_FALSE(counter.saw_zero.load());
+
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
