@@ -31,6 +31,14 @@ namespace rmw_uds
 // rmw_wait has always applied to both queues; drain_target() now hands it to
 // the take path too, so a caller that only ever calls rmw_take_request()
 // cannot grow one without limit.
+//
+// Deliberate: this makes the take path drop-oldest where it used to be
+// unbounded, so a client with >100 outstanding responses can lose the one it
+// is waiting on. rclcpp always waits before it takes, and rmw_wait was
+// already trimming to this bound on every call, so nothing that goes through
+// an executor changes. The only caller affected is one that polls
+// rmw_take_response() and never waits - and for that caller unbounded growth
+// is the worse failure of the two.
 static constexpr size_t SERVICE_QUEUE_DEPTH = 100;
 
 // Everything drain_endpoint() needs to move datagrams off one endpoint's
