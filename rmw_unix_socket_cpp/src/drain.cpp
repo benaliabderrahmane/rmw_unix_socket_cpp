@@ -91,6 +91,7 @@ void drain_endpoint(const DrainTarget & t)
   WireHeader hdr;
   std::vector<uint8_t> payload;
   size_t enqueued = 0;
+  size_t dropped = 0;
 
   while (recv_from(t.fd, hdr, payload)) {
     if ((hdr.msg_type & ~SHM_PAYLOAD_FLAG) != t.msg_type) {
@@ -140,6 +141,7 @@ void drain_endpoint(const DrainTarget & t)
       // equivalent of "slow subscriber".
       while (t.queue->size() > t.max_depth) {
         t.queue->pop_front();
+        ++dropped;
         overflow = true;
       }
     }
@@ -154,24 +156,26 @@ void drain_endpoint(const DrainTarget & t)
     ++enqueued;
   }
 
-  if (enqueued == 0 || !t.callback_mutex) {
-    return;
-  }
   // One notification for the whole batch. rmw_event_callback_t takes the
   // number of events since it was last called and must never be handed zero
-  // (rmw/event_callback_type.h), so a drain that enqueued nothing stays
-  // silent and a drain that enqueued ten reports ten rather than calling ten
-  // times. The count is datagrams enqueued, not datagrams retained: on an
-  // overflow the executor is told about deliveries the queue no longer holds
-  // and its extra take() calls report nothing taken, which is the same benign
-  // race rmw_wait already has when another thread takes first.
+  // (rmw/event_callback_type.h), so a drain that gained nothing stays silent
+  // and a drain that gained ten reports ten rather than calling ten times.
   //
+  // The count is how much the queue GREW, not how many datagrams the socket
+  // handed over. number_of_events is a take credit - the executor calls take()
+  // once per event - so an overflow that pushed 100 and popped 90 must report
+  // 10, or the executor spends 90 takes finding nothing. At most one pop per
+  // push, so dropped never exceeds enqueued.
+  const size_t gained = enqueued - dropped;
+  if (gained == 0 || !t.callback_mutex) {
+    return;
+  }
   // Notified with queue_mutex released. set_on_new_*_callback() takes
   // callback_mutex and then queue_mutex to flush a backlog, so holding both
   // in the other order here would deadlock.
   std::lock_guard<std::mutex> lock(*t.callback_mutex);
   if (*t.callback) {
-    (*t.callback)(*t.callback_user_data, enqueued);
+    (*t.callback)(*t.callback_user_data, gained);
   }
 }
 

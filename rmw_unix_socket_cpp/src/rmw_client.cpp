@@ -382,10 +382,13 @@ rmw_ret_t rmw_client_set_on_new_response_callback(
     rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * cli_data = static_cast<rmw_uds::UdsClient *>(client->data);
   std::lock_guard<std::mutex> lock(cli_data->callback_mutex);
+  // Only when a callback takes over from none - rclcpp sets it twice in a row
+  // and the backlog must not be paid out for both calls.
+  const bool taking_over = !cli_data->on_new_response_cb;
   cli_data->on_new_response_cb = callback;
   cli_data->on_new_response_user_data = user_data;
 
-  if (callback) {
+  if (callback && taking_over) {
     std::lock_guard<std::mutex> qlock(cli_data->queue_mutex);
     if (!cli_data->response_queue.empty()) {
       callback(user_data, cli_data->response_queue.size());
