@@ -632,11 +632,15 @@ rmw_ret_t rmw_subscription_set_on_new_message_callback(
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
   {
     std::lock_guard<std::mutex> lock(sub_data->callback_mutex);
+    // Flush the backlog only when a callback is taking over from none. rclcpp
+    // sets the callback twice in a row on purpose - a stack temporary, then
+    // its permanent storage (subscription_base.hpp) - and paying the same
+    // backlog out twice hands the executor two events per queued message.
+    const bool taking_over = !sub_data->on_new_message_cb;
     sub_data->on_new_message_cb = callback;
     sub_data->on_new_message_user_data = user_data;
 
-    // If there are already messages queued, notify
-    if (callback) {
+    if (callback && taking_over) {
       std::lock_guard<std::mutex> qlock(sub_data->queue_mutex);
       if (!sub_data->message_queue.empty()) {
         callback(user_data, sub_data->message_queue.size());
@@ -653,9 +657,19 @@ rmw_ret_t rmw_subscription_set_on_new_message_callback(
   // which epoll reports level-triggered, so datagrams that arrived between
   // the two are delivered rather than dropped or double-reported.
   if (callback) {
-    return rmw_uds::listener_watch(
+    const rmw_ret_t ret = rmw_uds::listener_watch(
       sub_data->context, sub_data->socket_fd, rmw_uds::ARMED_SUBSCRIPTION,
       sub_data, sub_data->uid);
+    if (ret != RMW_RET_OK) {
+      // Report a failure only for a callback that is not installed. Leaving it
+      // in place behind an error is the worst of both: the caller sees a
+      // failure and still gets fired at, and an rclcpp caller that turns the
+      // return into a throw would be lied to either way.
+      std::lock_guard<std::mutex> lock(sub_data->callback_mutex);
+      sub_data->on_new_message_cb = nullptr;
+      sub_data->on_new_message_user_data = nullptr;
+    }
+    return ret;
   }
   rmw_uds::listener_unwatch(sub_data->context, sub_data->socket_fd);
   return RMW_RET_OK;
