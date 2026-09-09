@@ -86,23 +86,13 @@ rmw_ret_t rmw_take_event(
 
 rmw_ret_t rmw_event_fini(rmw_event_t * event)
 {
-  RMW_CHECK_ARGUMENT_FOR_NULL(event, RMW_RET_INVALID_ARGUMENT);
-
-  // Finalizing an event that was never initialized is not an error. rclcpp's
-  // EventHandler destructor still runs when its constructor bailed out on the
-  // RMW_RET_UNSUPPORTED that *_event_init reports for every event type, and
-  // that leaves the handle as rmw_get_zero_initialized_event() made it. Only a
-  // handle stamped by another implementation is a caller mistake.
-  if (!event->implementation_identifier) {
-    return RMW_RET_OK;
-  }
-  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
-    event, event->implementation_identifier,
-    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
-
-  // rmw_event_t::data aliases the publisher's or subscription's impl struct,
-  // which the endpoint owns and frees in rmw_destroy_publisher /
-  // rmw_destroy_subscription. There is no per-event state to release.
+  // Left unvalidated on purpose. rcl_event_fini skips this call entirely when
+  // event->impl is NULL, which is exactly what rcl_*_event_init leaves behind
+  // after it frees impl on our RMW_RET_UNSUPPORTED - so a rejected init never
+  // reaches here. There is nothing to release either: rmw_event_t::data
+  // aliases the endpoint's impl struct, owned by rmw_destroy_publisher /
+  // rmw_destroy_subscription.
+  (void)event;
   return RMW_RET_OK;
 }
 
@@ -124,6 +114,9 @@ rmw_ret_t rmw_event_set_callback(
   const void * user_data)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(event, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    event, event->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   (void)callback;
   (void)user_data;
 

@@ -203,30 +203,19 @@ TEST_F(EventTest, TakeEventRejectsBadArguments)
   rmw_reset_error();
 }
 
-// rclcpp's EventHandler destructor runs even when its constructor bailed out
-// on the RMW_RET_UNSUPPORTED from *_event_init, and that leaves the handle
-// zero-initialized. Finalizing it must not be reported as a caller error, or
-// every swallowed UnsupportedEventTypeException produces a spurious failure
-// on the way out.
-TEST_F(EventTest, EventFiniAcceptsAZeroInitializedHandle)
+// rmw_event_fini has nothing to validate and nothing to free. rcl_event_fini
+// skips it whenever event->impl is NULL, and that is precisely what
+// rcl_*_event_init leaves behind when it frees impl on our
+// RMW_RET_UNSUPPORTED - so no handle we could reject ever arrives.
+TEST_F(EventTest, EventFiniIsANoOp)
 {
-  rmw_event_t event = rmw_get_zero_initialized_event();
-  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&event));
-  EXPECT_FALSE(rmw_error_is_set());
-}
-
-TEST_F(EventTest, EventFiniValidatesItsArgument)
-{
-  EXPECT_EQ(RMW_RET_INVALID_ARGUMENT, rmw_event_fini(nullptr));
-  rmw_reset_error();
+  rmw_event_t zero = rmw_get_zero_initialized_event();
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&zero));
 
   rmw_event_t ours = our_event(RMW_EVENT_MESSAGE_LOST);
   EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ours));
 
-  rmw_event_t foreign = our_event(RMW_EVENT_MESSAGE_LOST);
-  foreign.implementation_identifier = "rmw_bogus_cpp";
-  EXPECT_EQ(RMW_RET_INCORRECT_RMW_IMPLEMENTATION, rmw_event_fini(&foreign));
-  rmw_reset_error();
+  EXPECT_FALSE(rmw_error_is_set());
 }
 
 // The original EventsExecutor crash surfaced as "failed to set the on new
@@ -240,5 +229,13 @@ TEST_F(EventTest, EventSetCallbackReportsUnsupportedWithAMessage)
   rmw_reset_error();
 
   EXPECT_EQ(RMW_RET_INVALID_ARGUMENT, rmw_event_set_callback(nullptr, nullptr, nullptr));
+  rmw_reset_error();
+
+  // The identifier check the other event entry points already had.
+  rmw_event_t foreign = our_event(RMW_EVENT_MESSAGE_LOST);
+  foreign.implementation_identifier = "rmw_bogus_cpp";
+  EXPECT_EQ(
+    RMW_RET_INCORRECT_RMW_IMPLEMENTATION,
+    rmw_event_set_callback(&foreign, nullptr, nullptr));
   rmw_reset_error();
 }
