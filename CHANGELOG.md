@@ -25,10 +25,15 @@ four copies of the receive loop that hid the gap are one.
   `SingleThreadedExecutor` and `MultiThreadedExecutor` exactly as before.
   Joined in `rmw_shutdown`.
 - **`delivery_fd`, so a watched endpoint can still sit in a wait set.** The
-  listener signals this per-context eventfd strictly *after* enqueueing and
-  `rmw_wait` drains it strictly *before* scanning its queues, which is what
-  stops a wait from sleeping on a socket the listener already emptied. Same
-  ordering pair as the registry doorbell; armed only while the thread runs.
+  listener signals this eventfd strictly *after* enqueueing and `rmw_wait`
+  drains it strictly *before* scanning its queues, which is what stops a wait
+  from sleeping on a socket the listener already emptied. Same ordering pair as
+  the registry doorbell. **One per wait set**, created in
+  `rmw_create_wait_set`: reading an eventfd drains its whole counter, so a
+  single shared fd is a single credit that whichever wait set wakes first
+  consumes — including one that gained no work and discards it. Creating it
+  with the wait set also means a callback registered while a wait is already
+  blocked still has an armed fd to signal.
 
 ### Changed
 
@@ -38,9 +43,11 @@ four copies of the receive loop that hid the gap are one.
   own policy, which is where the delivery gaps lived. `DrainTarget` now carries
   that policy per endpoint.
 - **Listener callbacks report a batch count.** One notification per drain
-  carrying the number of datagrams enqueued, rather than one call of `1` per
-  datagram. `rmw/event_callback_type.h` defines `number_of_events` as the count
-  since the callback was last called and allows `> 1`.
+  carrying the number of entries the queue *gained*, rather than one call of
+  `1` per datagram. `rmw/event_callback_type.h` defines `number_of_events` as
+  the count since the callback was last called and allows `> 1`. The count is
+  growth rather than datagrams read, because it is a take credit: an overflow
+  that pushes 100 and pops 90 reports 10, not 100.
 - Request and response queues are capped at `SERVICE_QUEUE_DEPTH` (100)
   wherever they are filled. `rmw_wait` always applied that bound; the take-path
   drains had none.
@@ -56,16 +63,18 @@ four copies of the receive loop that hid the gap are one.
   subscription's `on_new_message` callback, so a callback registered by an
   executor was silent for every message that arrived while a thread sat in
   `rmw_wait`. It also trimmed to the QoS depth without reporting the overflow.
-- **QoS status events are refused honestly.** `rmw_event_set_callback` returned
-  a failure with no error message behind it — the `": error not set"` half of
-  the original crash report. `rmw_take_event` and `rmw_event_fini` validated
-  neither their handle nor its implementation identifier, and the missing
-  `RMW_CHECK_TYPE_IDENTIFIERS_MATCH` is added to both `*_event_init` functions
-  and to `rmw_subscription_set_on_new_message_callback`. `rmw_event_fini`
-  deliberately accepts a zero-initialized handle: `rclcpp`'s `EventHandler`
-  destructor runs after a rejected construction, and reporting an error there
-  would turn every swallowed `UnsupportedEventTypeException` into a spurious
-  failure.
+- **A backlog was flushed twice per registration.** `rclcpp` calls the rmw
+  setter twice in a row on purpose — a stack temporary, then its permanent
+  storage — so the flush in the three `set_on_new_*_callback` functions paid the
+  same queued messages out for both calls, and a TRANSIENT_LOCAL subscription
+  with ten replayed samples handed the executor twenty events. It now flushes
+  only when a callback takes over from none.
+- **The three callback setters left the callback installed after
+  `listener_watch` failed**, contradicting the error they returned. A failure
+  now means the callback is not set.
+- **`listener_start` could throw out of an `extern "C"` entry point.**
+  `std::thread` construction reports thread exhaustion as `std::system_error`;
+  it is now caught, and the running flag it had already set is cleared.
 
 ## [0.5.0] - 2026-08-27
 
