@@ -19,9 +19,11 @@
 
 #include "rmw/error_handling.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <mutex>
+#include <system_error>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -72,51 +74,70 @@ static void listener_loop(UdsContext * ctx)
         continue;  // Watch-list change or stop; the loop condition re-checks.
       }
 
+      // Held across the drain: listener_unwatch() takes this mutex, so a
+      // thread destroying an endpoint blocks here until the drain - and the
+      // callback it fires - has returned. It also guards delivery_fds, so a
+      // wait set cannot be deregistered and closed between the enqueue and
+      // the signal below.
+      std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+      auto it = ctx->listener_targets.find(fd);
+      if (it == ctx->listener_targets.end()) {
+        continue;  // Unwatched between the wake and this lookup.
+      }
       size_t enqueued = 0;
-      {
-        // Held across the drain: listener_unwatch() takes this mutex, so a
-        // thread destroying an endpoint blocks here until the drain - and the
-        // callback it fires - has returned.
-        std::lock_guard<std::mutex> lock(ctx->listener_mutex);
-        auto it = ctx->listener_targets.find(fd);
-        if (it == ctx->listener_targets.end()) {
-          continue;  // Unwatched between the wake and this lookup.
-        }
-        const ArmedEntry & entry = it->second;
-        switch (entry.kind) {
-          case ARMED_SUBSCRIPTION:
-            enqueued = drain_endpoint(
-              drain_target(static_cast<UdsSubscription *>(entry.entity)));
-            break;
-          case ARMED_SERVICE:
-            enqueued = drain_endpoint(
-              drain_target(static_cast<UdsService *>(entry.entity)));
-            break;
-          case ARMED_CLIENT:
-            enqueued = drain_endpoint(
-              drain_target(static_cast<UdsClient *>(entry.entity)));
-            break;
-          default:
-            break;
-        }
+      const ArmedEntry & entry = it->second;
+      switch (entry.kind) {
+        case ARMED_SUBSCRIPTION:
+          enqueued = drain_endpoint(
+            drain_target(static_cast<UdsSubscription *>(entry.entity)));
+          break;
+        case ARMED_SERVICE:
+          enqueued = drain_endpoint(
+            drain_target(static_cast<UdsService *>(entry.entity)));
+          break;
+        case ARMED_CLIENT:
+          enqueued = drain_endpoint(
+            drain_target(static_cast<UdsClient *>(entry.entity)));
+          break;
+        default:
+          break;
       }
 
-      // Signal strictly AFTER the enqueue. An rmw_wait in this process drains
-      // delivery_fd strictly BEFORE checking its queues, so this datagram
-      // either lands in that queue check or leaves the level-triggered
-      // eventfd readable for its epoll — a wait cannot block on a socket this
-      // thread already emptied. Same ordering pair as ring_doorbells.
-      if (enqueued > 0 && ctx->delivery_fd >= 0) {
+      // Signal strictly AFTER the enqueue, and signal EVERY live wait set. An
+      // rmw_wait drains its own delivery fd strictly BEFORE checking its
+      // queues, so this datagram either lands in that queue check or leaves
+      // the level-triggered eventfd readable for its epoll — a wait cannot
+      // block on a socket this thread already emptied. Same ordering pair as
+      // ring_doorbells. One fd per wait set rather than one shared fd, since
+      // a read drains the whole counter and would otherwise let the first wait
+      // set to wake consume a credit another one needed.
+      if (enqueued > 0) {
         uint64_t val = 1;
-        ssize_t ret = write(ctx->delivery_fd, &val, sizeof(val));
-        (void)ret;
+        for (const int delivery_fd : ctx->delivery_fds) {
+          ssize_t ret = write(delivery_fd, &val, sizeof(val));
+          (void)ret;
+        }
       }
     }
   }
 }
 
-// Create the epoll instance, the wake eventfd and the delivery eventfd, then
-// start the thread. Called with listener_mutex held.
+static void listener_release_fds(UdsContext * ctx)
+{
+  if (ctx->listener_wake_fd >= 0) {
+    close(ctx->listener_wake_fd);
+    ctx->listener_wake_fd = -1;
+  }
+  if (ctx->listener_epoll_fd >= 0) {
+    close(ctx->listener_epoll_fd);
+    ctx->listener_epoll_fd = -1;
+  }
+}
+
+// Create the epoll instance and the wake eventfd, then start the thread.
+// Called with listener_mutex held. The delivery eventfds are not created here:
+// they belong to the wait sets and already exist by the time a callback is
+// registered.
 static rmw_ret_t listener_start(UdsContext * ctx)
 {
   ctx->listener_epoll_fd = epoll_create1(EPOLL_CLOEXEC);
@@ -125,18 +146,8 @@ static rmw_ret_t listener_start(UdsContext * ctx)
     return RMW_RET_ERROR;
   }
   ctx->listener_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-  ctx->delivery_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-  if (ctx->listener_wake_fd < 0 || ctx->delivery_fd < 0) {
-    if (ctx->listener_wake_fd >= 0) {
-      close(ctx->listener_wake_fd);
-      ctx->listener_wake_fd = -1;
-    }
-    if (ctx->delivery_fd >= 0) {
-      close(ctx->delivery_fd);
-      ctx->delivery_fd = -1;
-    }
-    close(ctx->listener_epoll_fd);
-    ctx->listener_epoll_fd = -1;
+  if (ctx->listener_wake_fd < 0) {
+    listener_release_fds(ctx);
     RMW_SET_ERROR_MSG("failed to create listener eventfd");
     return RMW_RET_ERROR;
   }
@@ -146,19 +157,46 @@ static rmw_ret_t listener_start(UdsContext * ctx)
   ev.events = EPOLLIN;
   ev.data.fd = ctx->listener_wake_fd;
   if (epoll_ctl(ctx->listener_epoll_fd, EPOLL_CTL_ADD, ctx->listener_wake_fd, &ev) != 0) {
-    close(ctx->delivery_fd);
-    ctx->delivery_fd = -1;
-    close(ctx->listener_wake_fd);
-    ctx->listener_wake_fd = -1;
-    close(ctx->listener_epoll_fd);
-    ctx->listener_epoll_fd = -1;
+    listener_release_fds(ctx);
     RMW_SET_ERROR_MSG("failed to watch the listener wake eventfd");
     return RMW_RET_ERROR;
   }
 
+  // The flag has to be set before the thread exists, or the loop condition
+  // can read false and the thread exits immediately - so it is cleared again
+  // if the construction throws. std::thread throws std::system_error when the
+  // process is out of threads, and this runs under an extern "C" entry point
+  // where an escaping exception is undefined behavior.
   ctx->listener_running.store(true, std::memory_order_release);
-  ctx->listener_thread = std::thread(listener_loop, ctx);
+  try {
+    ctx->listener_thread = std::thread(listener_loop, ctx);
+  } catch (const std::system_error & e) {
+    ctx->listener_running.store(false, std::memory_order_release);
+    listener_release_fds(ctx);
+    RMW_UDS_LOG_ERROR("failed to start the listener thread: %s", e.what());
+    RMW_SET_ERROR_MSG("failed to start the listener thread");
+    return RMW_RET_ERROR;
+  }
   return RMW_RET_OK;
+}
+
+void listener_add_delivery_fd(UdsContext * ctx, int fd)
+{
+  if (!ctx || fd < 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  ctx->delivery_fds.push_back(fd);
+}
+
+void listener_remove_delivery_fd(UdsContext * ctx, int fd)
+{
+  if (!ctx || fd < 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  auto & fds = ctx->delivery_fds;
+  fds.erase(std::remove(fds.begin(), fds.end(), fd), fds.end());
 }
 
 rmw_ret_t listener_watch(
@@ -245,18 +283,8 @@ void listener_stop(UdsContext * ctx)
 
   std::lock_guard<std::mutex> lock(ctx->listener_mutex);
   ctx->listener_targets.clear();
-  if (ctx->listener_wake_fd >= 0) {
-    close(ctx->listener_wake_fd);
-    ctx->listener_wake_fd = -1;
-  }
-  if (ctx->delivery_fd >= 0) {
-    close(ctx->delivery_fd);
-    ctx->delivery_fd = -1;
-  }
-  if (ctx->listener_epoll_fd >= 0) {
-    close(ctx->listener_epoll_fd);
-    ctx->listener_epoll_fd = -1;
-  }
+  // delivery_fds are the wait sets' own fds, closed by rmw_destroy_wait_set.
+  listener_release_fds(ctx);
 }
 
 }  // namespace rmw_uds
