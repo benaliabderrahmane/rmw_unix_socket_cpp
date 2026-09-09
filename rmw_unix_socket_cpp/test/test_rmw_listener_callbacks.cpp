@@ -217,6 +217,81 @@ TEST_F(ListenerCallbackTest, SubscriptionCallbackReportsTheBatchCount)
   auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
 
+// number_of_events is a take credit: the executor calls take() once per event
+// it is told about. A drain that overflows the queue must therefore report
+// what the queue kept, not what the socket handed it, or the executor spends
+// the difference on takes that find nothing.
+TEST_F(ListenerCallbackTest, BatchCountExcludesDatagramsDroppedByOverflow)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/listener_overflow", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/listener_overflow", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+
+  // qos.depth is 10, so a single drain of 15 keeps the last 10 and drops 5.
+  for (int32_t i = 0; i < 15; ++i) {
+    test_msgs::msg::BasicTypes msg;
+    msg.int32_value = i;
+    ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+  }
+
+  wait_on_subscription(sub);
+
+  EXPECT_EQ(qos.depth, counter.events.load());
+  EXPECT_FALSE(counter.saw_zero.load());
+
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+// rclcpp sets the callback twice in a row on purpose - once against a stack
+// temporary, then again against its permanent storage - to close the gap where
+// the std::function is replaced but the middleware still holds the old pointer
+// (subscription_base.hpp). The backlog flush must not pay out twice for it, or
+// a TRANSIENT_LOCAL subscription reports every replayed sample two times.
+TEST_F(ListenerCallbackTest, ReRegisteringTheCallbackDoesNotReflushTheBacklog)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/listener_reflush", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/listener_reflush", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  // Queue three messages with no callback installed, so the wait drains them
+  // into the queue silently and both setter calls below see the same backlog.
+  for (int32_t i = 0; i < 3; ++i) {
+    test_msgs::msg::BasicTypes msg;
+    msg.int32_value = i;
+    ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+  }
+  wait_on_subscription(sub);
+  ASSERT_EQ(0u, counter.calls.load());
+
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+
+  EXPECT_EQ(3u, counter.events.load());
+  EXPECT_EQ(1u, counter.calls.load());
+
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
 // A drain that enqueues nothing must stay silent: the callback contract has
 // no zero, so notifying on an empty drain would report an event that did not
 // happen.
