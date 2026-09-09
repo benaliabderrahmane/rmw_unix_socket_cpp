@@ -108,12 +108,33 @@ int create_send_socket()
   return fd;
 }
 
+std::string make_peer_label(
+  const char * node_namespace, const char * node_name, const char * topic)
+{
+  std::string out = "node '";
+  // ROS fully-qualified node name: namespace + '/' + name, with a "/" (root)
+  // namespace collapsing so we emit "/name" rather than "//name".
+  if (node_namespace && node_namespace[0] && std::strcmp(node_namespace, "/") != 0) {
+    out += node_namespace;
+  }
+  out += '/';
+  out += (node_name && node_name[0]) ? node_name : "<unknown>";
+  out += '\'';
+  if (topic && topic[0]) {
+    out += " on topic '";
+    out += topic;
+    out += '\'';
+  }
+  return out;
+}
+
 SendResult send_to(
   int send_fd,
   const std::string & dest_path,
   const WireHeader & header,
   const uint8_t * payload,
-  size_t payload_size)
+  size_t payload_size,
+  const char * peer_label)
 {
   struct sockaddr_un addr;
   std::memset(&addr, 0, sizeof(addr));
@@ -139,9 +160,9 @@ SendResult send_to(
   }
 
   // Classify the failure. Hot path — every category is throttled so a
-  // persistently-failing peer can't drown the log. The destination path
-  // encodes the peer's prefix+pid (see make_socket_path) which is enough
-  // to identify the offending subscriber from the message alone.
+  // persistently-failing peer can't drown the log. `peer_label` (when the
+  // caller supplies one) names the offending subscriber; the destination
+  // path also encodes its prefix+pid (see make_socket_path).
   const int err = errno;
   const size_t total = sizeof(WireHeader) + payload_size;
   SendResult result = SendResult::SoftDrop;
@@ -164,12 +185,15 @@ SendResult send_to(
     case ENOBUFS:
       // Peer's receive queue is full (or our send queue, briefly). This
       // is the classic "slow subscriber" symptom — the subscriber isn't
-      // calling rmw_take fast enough to drain its socket.
+      // calling rmw_take fast enough to drain its socket. The byte count is
+      // this dropped message's size, not the buffer's fill level.
       RMW_UDS_LOG_WARN_THROTTLE(
         1000,
-        "UDS send to '%s' dropped: subscriber recv buffer full (%zu bytes, errno=%s). "
+        "UDS send to %s (socket '%s') dropped: subscriber recv queue full — "
+        "dropped a %zu-byte message (recv buf configured %d MB, errno=%s). "
         "Slow subscriber or undersized SO_RCVBUF.",
-        dest_path.c_str(), total, std::strerror(err));
+        peer_label ? peer_label : "peer", dest_path.c_str(), total,
+        RECV_BUF_SIZE / (1024 * 1024), std::strerror(err));
       break;
     case ENOENT:
     case ECONNREFUSED:

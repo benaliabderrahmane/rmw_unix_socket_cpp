@@ -201,13 +201,14 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
   return RMW_RET_OK;
 }
 
-// Refresh the generation-keyed subscriber-path cache if `current_gen` moved,
-// and return the (possibly shared) path list. The memoization invariant that
-// keeps the pull-based replay proof sound: cached_generation only ever
+// Refresh the generation-keyed subscriber cache if `current_gen` moved, and
+// return the (possibly shared) subscriber list. The memoization invariant
+// that keeps the pull-based replay proof sound: cached_generation only ever
 // advances to a value loaded BEFORE the query ran, under sub_cache_mutex —
 // so current_gen == cached_generation implies the cache already saw every
 // subscriber whose registration that generation covers.
-static std::shared_ptr<const std::vector<std::string>> refresh_sub_paths(
+static std::shared_ptr<const std::vector<rmw_uds::CachedSubscriber>>
+refresh_subscribers(
   rmw_uds::UdsPublisher * pub_data,
   rmw_uds::RegistryHeader * header,
   uint64_t current_gen)
@@ -222,17 +223,21 @@ static std::shared_ptr<const std::vector<std::string>> refresh_sub_paths(
     auto subs = rmw_uds::registry_query(
       header, rmw_uds::ENTRY_SUBSCRIPTION, pub_data->topic_name.c_str(),
       nullptr, nullptr);
-    auto fresh = std::make_shared<std::vector<std::string>>();
+    auto fresh = std::make_shared<std::vector<rmw_uds::CachedSubscriber>>();
     fresh->reserve(subs.size());
     for (const auto & s : subs) {
       if (!s.socket_path.empty()) {
-        fresh->push_back(s.socket_path);
+        fresh->push_back(
+          {s.socket_path,
+            rmw_uds::make_peer_label(
+              s.node_namespace.c_str(), s.node_name.c_str(),
+              pub_data->topic_name.c_str())});
       }
     }
     pub_data->cached_generation = current_gen;
-    pub_data->cached_subscriber_paths = std::move(fresh);
+    pub_data->cached_subscribers = std::move(fresh);
   }
-  return pub_data->cached_subscriber_paths;
+  return pub_data->cached_subscribers;
 }
 
 // Latch a TRANSIENT_LOCAL sample into the pull cache and fan it out live.
@@ -296,7 +301,7 @@ static rmw_ret_t transient_local_publish(
 
     auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
     const uint64_t current_gen = rmw_uds::registry_generation(header);
-    auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
+    auto targets = refresh_subscribers(pub_data, header, current_gen);
 
     // Live fan-out: payloads at or above the datagram threshold reuse the
     // durable segment the latch just committed (same bytes, same
@@ -311,11 +316,12 @@ static rmw_ret_t transient_local_publish(
       wire_size = sizeof(staged_desc);
     }
 
-    if (sub_paths) {
-      for (const auto & path : *sub_paths) {
+    if (targets) {
+      for (const auto & t : *targets) {
         if (rmw_uds::send_to(
             pub_data->context->send_socket_fd,
-            path, hdr, wire_data, wire_size) == rmw_uds::SendResult::ConfigError)
+            t.socket_path, hdr, wire_data, wire_size,
+            t.label.c_str()) == rmw_uds::SendResult::ConfigError)
         {
           config_error = true;
         }
@@ -380,7 +386,7 @@ rmw_ret_t rmw_publish(
   // since we last cached the subscriber list. The hot path is purely local.
   auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
   uint64_t current_gen = rmw_uds::registry_generation(header);
-  auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
+  auto targets = refresh_subscribers(pub_data, header, current_gen);
 
   // Non-latched path: serialize once, choosing the destination by size — a
   // large payload is written directly into the reserved ring record (no heap
@@ -404,11 +410,12 @@ rmw_ret_t rmw_publish(
 
   // Surface EMSGSIZE; soft drops (EAGAIN/ENOENT) are logged in send_to.
   bool config_error = false;
-  if (sub_paths) {
-    for (const auto & path : *sub_paths) {
+  if (targets) {
+    for (const auto & t : *targets) {
       if (rmw_uds::send_to(
           pub_data->context->send_socket_fd,
-          path, hdr, wire.data, wire.size) == rmw_uds::SendResult::ConfigError)
+          t.socket_path, hdr, wire.data, wire.size,
+          t.label.c_str()) == rmw_uds::SendResult::ConfigError)
       {
         config_error = true;
       }
@@ -463,7 +470,7 @@ rmw_ret_t rmw_publish_serialized_message(
   // Reuse the cached subscriber list (refresh only on graph change)
   auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
   uint64_t current_gen = rmw_uds::registry_generation(header);
-  auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
+  auto targets = refresh_subscribers(pub_data, header, current_gen);
 
   // Large non-TL payloads: stage once into the cycling ring, fan out descriptors.
   rmw_uds::ShmPayloadDescriptor desc;
@@ -472,11 +479,12 @@ rmw_ret_t rmw_publish_serialized_message(
     serialized_message->buffer, serialized_message->buffer_length, hdr, desc);
 
   bool config_error = false;
-  if (sub_paths) {
-    for (const auto & path : *sub_paths) {
+  if (targets) {
+    for (const auto & t : *targets) {
       if (rmw_uds::send_to(
           pub_data->context->send_socket_fd,
-          path, hdr, wire.data, wire.size) == rmw_uds::SendResult::ConfigError)
+          t.socket_path, hdr, wire.data, wire.size,
+          t.label.c_str()) == rmw_uds::SendResult::ConfigError)
       {
         config_error = true;
       }
