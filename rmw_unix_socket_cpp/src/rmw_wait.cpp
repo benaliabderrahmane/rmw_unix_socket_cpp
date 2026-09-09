@@ -14,6 +14,7 @@
 
 #include "drain.hpp"
 #include "identifier.hpp"
+#include "listener.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
 #include "types.hpp"
@@ -66,13 +67,27 @@ rmw_wait_set_t * rmw_create_wait_set(rmw_context_t * context, size_t max_conditi
     return nullptr;
   }
 
+  // Created here, before any listener exists, so a callback registered while
+  // this wait set is already blocked in epoll_wait still has an armed fd to
+  // signal. Resolving it at the top of rmw_wait instead would read a
+  // listener-running flag that is still false and arm nothing at all.
+  ws_data->delivery_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (ws_data->delivery_fd < 0) {
+    close(ws_data->epoll_fd);
+    delete ws_data;
+    RMW_SET_ERROR_MSG("failed to create the wait set's delivery eventfd");
+    return nullptr;
+  }
+
   auto * ws = rmw_wait_set_allocate();
   if (!ws) {
+    close(ws_data->delivery_fd);
     close(ws_data->epoll_fd);
     delete ws_data;
     RMW_SET_ERROR_MSG("failed to allocate rmw_wait_set_t");
     return nullptr;
   }
+  rmw_uds::listener_add_delivery_fd(ws_data->context, ws_data->delivery_fd);
 
   ws->implementation_identifier = rmw_uds::identifier;
   ws->data = ws_data;
@@ -89,6 +104,12 @@ rmw_ret_t rmw_destroy_wait_set(rmw_wait_set_t * wait_set)
 
   auto * ws_data = static_cast<rmw_uds::UdsWaitSet *>(wait_set->data);
   if (ws_data) {
+    // Deregister strictly BEFORE the close, under listener_mutex: the other
+    // order lets the listener write 8 bytes into a recycled fd number.
+    rmw_uds::listener_remove_delivery_fd(ws_data->context, ws_data->delivery_fd);
+    if (ws_data->delivery_fd >= 0) {
+      close(ws_data->delivery_fd);
+    }
     if (ws_data->epoll_fd >= 0) {
       close(ws_data->epoll_fd);
     }
@@ -180,12 +201,12 @@ rmw_ret_t rmw_wait(
   }
 
   const int doorbell_fd = ctx ? ctx->doorbell_fd : -1;
-  // The listener thread's delivery eventfd, armed only while that thread runs.
-  // A process whose executor waits instead of listening never registers a
-  // callback, so this stays -1 and every wait below is exactly what it was.
-  const int delivery_fd =
-    (ctx && ctx->listener_running.load(std::memory_order_acquire)) ?
-    ctx->delivery_fd : -1;
+  // This wait set's own delivery eventfd. Armed unconditionally: gating it on
+  // a listener-running flag read here would arm nothing for a wait that
+  // blocked before the first callback was registered, and rmw.h allows that
+  // registration from any thread at any time. A process that never registers
+  // one just holds an eventfd nobody writes.
+  const int delivery_fd = ws_data->delivery_fd;
   auto run_generation_check = [&]() {
       // Drain the doorbell strictly BEFORE reading the generation: paired with
       // ring_doorbells running strictly AFTER the bump, a mutation either lands
@@ -305,10 +326,10 @@ rmw_ret_t rmw_wait(
     // It has no entity, so uid 0 (never handed out by next_entity_uid) arms
     // it exactly once for the life of the wait set.
     register_fd(doorbell_fd, rmw_uds::ARMED_DOORBELL, nullptr, 0);
-    // The listener's delivery eventfd. Like the doorbell it has no entity, so
-    // uid 0 arms it once for the life of the wait set. It is signalled for any
-    // endpoint the listener drains, which need not be one this wait set holds
-    // — the dispatch below therefore re-checks the caller's queues instead of
+    // This wait set's delivery eventfd. Like the doorbell it has no entity, so
+    // uid 0 arms it once for the life of the wait set. The listener signals it
+    // for any endpoint it drains, which need not be one this wait set holds —
+    // the dispatch below therefore re-checks the caller's queues instead of
     // treating the wake itself as progress.
     register_fd(delivery_fd, rmw_uds::ARMED_DELIVERY, nullptr, 0);
   }
