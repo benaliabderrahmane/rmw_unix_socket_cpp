@@ -205,13 +205,18 @@ rmw_ret_t listener_watch(
   if (!ctx || fd < 0) {
     return RMW_RET_INVALID_ARGUMENT;
   }
-  // A context past rmw_shutdown has already joined its thread; restarting it
-  // for an endpoint that is on its way out would leak the thread.
-  if (ctx->is_shutdown.load(std::memory_order_acquire)) {
+  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  // Both read under the mutex. A context past rmw_shutdown has already joined
+  // its thread, and restarting it for an endpoint on its way out would leak
+  // the thread. Reading is_shutdown before taking the mutex - and without
+  // listener_stopping beside it - let a registration slip into the window
+  // where listener_stop has released the mutex but not yet joined, and
+  // listener_start there either terminates the process or loses the stop's
+  // wake-up forever. See UdsContext::listener_stopping.
+  if (ctx->is_shutdown.load(std::memory_order_acquire) || ctx->listener_stopping) {
     return RMW_RET_OK;
   }
 
-  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
   if (!ctx->listener_running.load(std::memory_order_relaxed)) {
     const rmw_ret_t ret = listener_start(ctx);
     if (ret != RMW_RET_OK) {
@@ -272,6 +277,8 @@ void listener_stop(UdsContext * ctx)
     {
       return;
     }
+    // Closes the window below against a concurrent listener_watch.
+    ctx->listener_stopping = true;
     ctx->listener_running.store(false, std::memory_order_release);
     wake_listener(ctx);
   }
@@ -285,6 +292,7 @@ void listener_stop(UdsContext * ctx)
   ctx->listener_targets.clear();
   // delivery_fds are the wait sets' own fds, closed by rmw_destroy_wait_set.
   listener_release_fds(ctx);
+  ctx->listener_stopping = false;
 }
 
 }  // namespace rmw_uds

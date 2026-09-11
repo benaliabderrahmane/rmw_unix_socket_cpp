@@ -244,10 +244,22 @@ struct UdsContext
   // still reaches it. Guarded by listener_mutex, which rmw_destroy_wait_set
   // takes to deregister before it closes the fd - otherwise the listener
   // writes 8 bytes into a recycled fd number.
+  //
+  // listener_stopping is set while listener_stop() is between releasing
+  // listener_mutex and finishing its join - it has to release it, because the
+  // loop takes that mutex per event and joining under it would deadlock.
+  // listener_watch() must not start a listener in that window: listener_start
+  // resets listener_running and REPLACES listener_epoll_fd and
+  // listener_wake_fd, so the stop's wake-up is delivered to an fd nobody is
+  // polling and its join never returns; and it move-assigns over a
+  // still-joinable std::thread, which calls std::terminate. Guarded by
+  // listener_mutex. is_shutdown does not cover this on its own, because
+  // rmw_context_fini reaches listener_stop without ever setting it.
   std::thread listener_thread;
   int listener_epoll_fd = -1;
   int listener_wake_fd = -1;
   std::atomic<bool> listener_running{false};
+  bool listener_stopping = false;
   std::mutex listener_mutex;
   std::unordered_map<int, ArmedEntry> listener_targets;
   std::vector<int> delivery_fds;
@@ -314,6 +326,13 @@ struct UdsSubscription
   const message_type_support_callbacks_t * callbacks = nullptr;
   int socket_fd = -1;
   std::string socket_path;
+  // Serialises drains of this endpoint. drain_endpoint() recv()s outside
+  // queue_mutex and push_back()s inside it, so two concurrent drains - the
+  // listener thread and an rmw_wait/rmw_take on an application thread - could
+  // otherwise interleave as recv A / recv B / push B / push A and land
+  // same-publisher datagrams out of order. queue_mutex prevents corruption,
+  // not reordering, and ROS 2 guarantees per-publisher FIFO.
+  std::mutex drain_mutex;
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> message_queue;
   size_t queue_depth = 10;
@@ -361,6 +380,13 @@ struct UdsService
   const message_type_support_callbacks_t * response_callbacks = nullptr;
   int socket_fd = -1;
   std::string socket_path;
+  // Serialises drains of this endpoint. drain_endpoint() recv()s outside
+  // queue_mutex and push_back()s inside it, so two concurrent drains - the
+  // listener thread and an rmw_wait/rmw_take on an application thread - could
+  // otherwise interleave as recv A / recv B / push B / push A and land
+  // same-publisher datagrams out of order. queue_mutex prevents corruption,
+  // not reordering, and ROS 2 guarantees per-publisher FIFO.
+  std::mutex drain_mutex;
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> request_queue;
   int32_t registry_index = -1;
@@ -397,6 +423,13 @@ struct UdsClient
   const message_type_support_callbacks_t * response_callbacks = nullptr;
   int socket_fd = -1;
   std::string socket_path;
+  // Serialises drains of this endpoint. drain_endpoint() recv()s outside
+  // queue_mutex and push_back()s inside it, so two concurrent drains - the
+  // listener thread and an rmw_wait/rmw_take on an application thread - could
+  // otherwise interleave as recv A / recv B / push B / push A and land
+  // same-publisher datagrams out of order. queue_mutex prevents corruption,
+  // not reordering, and ROS 2 guarantees per-publisher FIFO.
+  std::mutex drain_mutex;
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> response_queue;
   std::atomic<int64_t> sequence_number{1};

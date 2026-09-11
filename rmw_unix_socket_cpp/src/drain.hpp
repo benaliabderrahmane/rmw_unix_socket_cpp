@@ -48,6 +48,9 @@ static constexpr size_t SERVICE_QUEUE_DEPTH = 100;
 struct DrainTarget
 {
   int fd = -1;
+  // Held for the whole drain, so two drains of one endpoint cannot interleave
+  // their recv/push pairs and reorder the queue. See UdsSubscription.
+  std::mutex * drain_mutex = nullptr;
   std::mutex * queue_mutex = nullptr;
   std::deque<ReceivedMessage> * queue = nullptr;
   // Trim the queue to this many entries after each push.

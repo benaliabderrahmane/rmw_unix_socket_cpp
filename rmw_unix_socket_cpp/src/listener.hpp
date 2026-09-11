@@ -38,9 +38,11 @@ namespace rmw_uds
 // context-wide, not endpoint-local: a callback must not block, and must not
 // destroy, register on, or clear the callback of ANY endpoint in the context,
 // nor create or destroy a wait set - each of those takes listener_mutex and
-// would deadlock against the drain it was called from. rclcpp's callbacks only
-// push to a queue, which is what the contract in rmw/event_callback_type.h
-// expects.
+// would deadlock against the drain it was called from. It must not call
+// rmw_take on its own endpoint either: the callback fires inside
+// drain_endpoint, which holds that endpoint's drain_mutex. rclcpp's callbacks
+// only push to a queue, which is what the contract in
+// rmw/event_callback_type.h expects.
 
 // Watch `fd` on the context's listener thread, starting the thread if this is
 // the first watch. Re-watching a live fd replaces its entry. Returns
