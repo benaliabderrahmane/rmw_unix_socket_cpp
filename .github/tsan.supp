@@ -1,0 +1,16 @@
+# ThreadSanitizer suppressions for rmw_unix_socket_cpp.
+#
+# Keep this file as short as it is. Every entry here is a place TSan cannot
+# see the synchronisation, NOT a place we have decided to tolerate a race.
+#
+# The shared-memory discovery registry is a seqlock (registry.cpp). A reader
+# copies a slot's payload with plain, unsynchronised loads and then validates
+# the copy by re-reading an atomic sequence counter, retrying if the writer
+# touched the slot meanwhile. That torn read is the design, not a defect - the
+# comment above snapshot_slot says so - but TSan has no seqlock model and
+# reports every reader/writer pair it sees.
+#
+# Only the READER is suppressed. Two threads writing the same slot at once is
+# a genuine bug that a seqlock does not permit, and those reports
+# (write_slot_payload against teardown_slot) are deliberately left visible.
+race:snapshot_slot
