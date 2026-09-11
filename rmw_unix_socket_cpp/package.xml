@@ -10,6 +10,10 @@
   <maintainer email="benaliabderrahmen88@gmail.com">Abderahmane BENALI</maintainer>
   <license>Apache-2.0</license>
 
+  <url type="repository">https://github.com/benaliabderrahmane/rmw_unix_socket_cpp</url>
+  <url type="bugtracker">https://github.com/benaliabderrahmane/rmw_unix_socket_cpp/issues</url>
+  <url type="website">https://github.com/benaliabderrahmane/rmw_unix_socket_cpp#readme</url>
+
   <buildtool_depend>ament_cmake</buildtool_depend>
 
   <depend>rcutils</depend>
