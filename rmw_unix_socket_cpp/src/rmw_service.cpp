@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "drain.hpp"
 #include "identifier.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
@@ -188,25 +189,7 @@ rmw_ret_t rmw_take_request(
   *taken = false;
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
 
-  // Drain socket
-  rmw_uds::WireHeader hdr;
-  std::vector<uint8_t> payload;
-  while (rmw_uds::recv_from(srv_data->socket_fd, hdr, payload)) {
-    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 1) {payload.clear(); continue;}
-    if (!rmw_uds::shm_resolve_incoming(
-        srv_data->shm_cache, srv_data->context->domain_id, hdr, payload))
-    {
-      payload.clear();
-      continue;
-    }
-    rmw_uds::ReceivedMessage msg;
-    msg.header = hdr;
-    msg.payload = std::move(payload);
-    msg.received_timestamp_ns = system_now_ns();
-    std::lock_guard<std::mutex> lock(srv_data->queue_mutex);
-    srv_data->request_queue.push_back(std::move(msg));
-    payload.clear();
-  }
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(srv_data));
 
   std::lock_guard<std::mutex> lock(srv_data->queue_mutex);
   // Drop-garbage-and-continue: one corrupt datagram must not destroy a
@@ -375,13 +358,23 @@ rmw_ret_t rmw_service_set_on_new_request_callback(
     rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
   std::lock_guard<std::mutex> lock(srv_data->callback_mutex);
+  // Only when a callback takes over from none - rclcpp sets it twice in a row
+  // and the backlog must not be paid out for both calls.
+  const bool taking_over = !srv_data->on_new_request_cb;
   srv_data->on_new_request_cb = callback;
   srv_data->on_new_request_user_data = user_data;
 
-  if (callback) {
-    std::lock_guard<std::mutex> qlock(srv_data->queue_mutex);
-    if (!srv_data->request_queue.empty()) {
-      callback(user_data, srv_data->request_queue.size());
+  if (callback && taking_over) {
+    size_t backlog = 0;
+    {
+      std::lock_guard<std::mutex> qlock(srv_data->queue_mutex);
+      backlog = srv_data->request_queue.size();
+    }
+    // Fired with queue_mutex released. A callback is user code: holding the
+    // queue lock across it means a callback that calls rmw_take on its own
+    // endpoint deadlocks against itself. drain_endpoint() notifies the same way.
+    if (backlog > 0) {
+      callback(user_data, backlog);
     }
   }
   return RMW_RET_OK;
