@@ -180,6 +180,60 @@ static rmw_ret_t listener_start(UdsContext * ctx)
   return RMW_RET_OK;
 }
 
+rmw_ret_t listener_set_callback(
+  UdsContext * ctx, const DrainTarget & t, uint8_t kind, void * entity,
+  uint64_t uid, rmw_event_callback_t callback, const void * user_data)
+{
+  {
+    std::lock_guard<std::recursive_mutex> lock(*t.callback_mutex);
+    // Flush the backlog only when a callback is taking over from none. rclcpp
+    // sets the callback twice in a row on purpose - a stack temporary, then
+    // its permanent storage (subscription_base.hpp) - and paying the same
+    // backlog out twice hands the executor two events per queued message.
+    const bool taking_over = !*t.callback;
+    *t.callback = callback;
+    *t.callback_user_data = user_data;
+
+    if (callback && taking_over) {
+      size_t backlog = 0;
+      {
+        std::lock_guard<std::mutex> qlock(*t.queue_mutex);
+        backlog = t.queue->size();
+      }
+      // Fired with queue_mutex released. A callback is user code: holding the
+      // queue lock across it means a callback that calls rmw_take on its own
+      // endpoint deadlocks against itself. drain_endpoint() notifies the same
+      // way.
+      if (backlog > 0) {
+        callback(user_data, backlog);
+      }
+    }
+  }
+
+  // Hand the socket to the listener, or take it back. Deliberately outside
+  // callback_mutex: the listener holds listener_mutex across a drain and takes
+  // callback_mutex inside it, so acquiring them in the other order here would
+  // deadlock against a drain already in flight.
+  //
+  // The flush above covered the queue; the watch below covers the socket,
+  // which epoll reports level-triggered, so datagrams that arrived between the
+  // two are delivered rather than dropped or double-reported.
+  if (!callback) {
+    listener_unwatch(ctx, t.fd);
+    return RMW_RET_OK;
+  }
+  const rmw_ret_t ret = listener_watch(ctx, t.fd, kind, entity, uid);
+  if (ret != RMW_RET_OK) {
+    // A failure has to mean the callback is not set. Leaving it installed
+    // behind an error is the worst of both: the caller is told the
+    // registration failed and still gets fired at.
+    std::lock_guard<std::recursive_mutex> lock(*t.callback_mutex);
+    *t.callback = nullptr;
+    *t.callback_user_data = nullptr;
+  }
+  return ret;
+}
+
 void listener_add_delivery_fd(UdsContext * ctx, int fd)
 {
   if (!ctx || fd < 0) {
