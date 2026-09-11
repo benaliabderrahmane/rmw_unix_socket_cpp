@@ -45,12 +45,18 @@ Only this first rosdistro PR gets real scrutiny.
 ## Every release after that
 
 ```bash
-catkin_generate_changelog     # appends unreleased commits to rmw_unix_socket_cpp/CHANGELOG.rst
+catkin_generate_changelog             # appends unreleased commits to rmw_unix_socket_cpp/CHANGELOG.rst
 $EDITOR rmw_unix_socket_cpp/CHANGELOG.rst
 git commit -am "Update changelog"
-catkin_prepare_release        # bumps package.xml, commits, tags, pushes
+catkin_prepare_release --tag-prefix v # bumps package.xml, commits, tags, pushes
 bloom-release --rosdistro jazzy --track jazzy rmw_unix_socket_cpp
 ```
+
+`--tag-prefix v` is not optional. `catkin_prepare_release` builds its tag as
+`tag_prefix + version` and the prefix defaults to empty, so without it you get
+`0.6.0` — which the `v:{version}` bloom track will not find, and which
+`release.yml` ignores because it only triggers on `v*`. It pushes the commit and
+the tag itself; `--no-push` opts out.
 
 No `--new-track` — bloom reuses the answers above. The resulting rosdistro PR
 changes one line, the `version:` field.
