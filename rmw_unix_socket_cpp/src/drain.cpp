@@ -173,9 +173,10 @@ void drain_endpoint(const DrainTarget & t)
   if (gained == 0 || !t.callback_mutex) {
     return;
   }
-  // Notified with queue_mutex released. set_on_new_*_callback() takes
-  // callback_mutex and then queue_mutex to flush a backlog, so holding both
-  // in the other order here would deadlock.
+  // Notified with queue_mutex released. A callback is user code, and one that
+  // calls rmw_take on its own endpoint would deadlock against a queue lock
+  // held across it. The set_on_new_*_callback() backlog flush follows the same
+  // rule, so neither path ever runs user code under queue_mutex.
   std::lock_guard<std::mutex> lock(*t.callback_mutex);
   if (*t.callback) {
     (*t.callback)(*t.callback_user_data, gained);

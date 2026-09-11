@@ -389,9 +389,16 @@ rmw_ret_t rmw_client_set_on_new_response_callback(
   cli_data->on_new_response_user_data = user_data;
 
   if (callback && taking_over) {
-    std::lock_guard<std::mutex> qlock(cli_data->queue_mutex);
-    if (!cli_data->response_queue.empty()) {
-      callback(user_data, cli_data->response_queue.size());
+    size_t backlog = 0;
+    {
+      std::lock_guard<std::mutex> qlock(cli_data->queue_mutex);
+      backlog = cli_data->response_queue.size();
+    }
+    // Fired with queue_mutex released. A callback is user code: holding the
+    // queue lock across it means a callback that calls rmw_take on its own
+    // endpoint deadlocks against itself. drain_endpoint() notifies the same way.
+    if (backlog > 0) {
+      callback(user_data, backlog);
     }
   }
   return RMW_RET_OK;
