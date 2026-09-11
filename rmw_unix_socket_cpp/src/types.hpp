@@ -26,6 +26,7 @@
 #include <mutex>
 #include <random>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
@@ -155,6 +156,26 @@ inline bool is_same_context(const WireHeader & hdr, uint64_t context_id)
   return sender_context_id == context_id;
 }
 
+// What a given epoll fd was armed for. Lets rmw_wait map an epoll result back
+// to its owner without scanning the wait set, and skip the epoll_ctl when the
+// fd is already armed for the same entity.
+enum ArmedKind : uint8_t
+{
+  ARMED_SUBSCRIPTION = 0,
+  ARMED_SERVICE,
+  ARMED_CLIENT,
+  ARMED_GUARD_CONDITION,
+  ARMED_DOORBELL,
+  ARMED_DELIVERY,
+};
+
+struct ArmedEntry
+{
+  uint8_t kind = ARMED_SUBSCRIPTION;  // ArmedKind
+  void * entity = nullptr;            // UdsSubscription * etc, for the drain
+  uint64_t uid = 0;                   // 0 for the doorbell, which has no entity
+};
+
 // Per-context implementation data
 struct UdsContext
 {
@@ -195,6 +216,53 @@ struct UdsContext
   // the mutex; rmw_destroy_node removes its entry before destroying the GC.
   std::mutex graph_gcs_mutex;
   std::vector<rmw_guard_condition_t *> graph_gcs;
+
+  // Listener thread: asynchronous delivery for endpoints that registered a
+  // listener callback (rclcpp's EventsExecutor never calls rmw_wait, so
+  // nothing else would ever move a datagram off their sockets). Started
+  // LAZILY by listener_watch() on the first registration in this context and
+  // joined in rmw_shutdown, so a process whose executor waits instead of
+  // listening still starts no thread at all — see DESIGN.md, "No background
+  // threads, and why".
+  //
+  // listener_targets maps a watched fd to its endpoint; listener_mutex is held
+  // across the drain so listener_unwatch() cannot return, and its caller
+  // cannot free the endpoint, while the listener is inside it.
+  //
+  // delivery_fds holds one eventfd per live wait set, which the listener
+  // signals strictly AFTER enqueueing. An rmw_wait drains its own fd strictly
+  // BEFORE checking its queues, which is what stops a wait from blocking on an
+  // empty socket whose datagram the listener already moved into the queue.
+  // Same ordering pair as the registry doorbell (see ring_doorbells in
+  // registry.cpp).
+  //
+  // One fd PER WAIT SET, not one per context: an eventfd read drains the whole
+  // counter, so a single shared fd is one credit that whichever wait set wakes
+  // first consumes - including one that gained no work of its own and simply
+  // discards it. The fds are created in rmw_create_wait_set, before any
+  // listener exists, so a callback registered while a wait is already blocked
+  // still reaches it. Guarded by listener_mutex, which rmw_destroy_wait_set
+  // takes to deregister before it closes the fd - otherwise the listener
+  // writes 8 bytes into a recycled fd number.
+  //
+  // listener_stopping is set while listener_stop() is between releasing
+  // listener_mutex and finishing its join - it has to release it, because the
+  // loop takes that mutex per event and joining under it would deadlock.
+  // listener_watch() must not start a listener in that window: listener_start
+  // resets listener_running and REPLACES listener_epoll_fd and
+  // listener_wake_fd, so the stop's wake-up is delivered to an fd nobody is
+  // polling and its join never returns; and it move-assigns over a
+  // still-joinable std::thread, which calls std::terminate. Guarded by
+  // listener_mutex. is_shutdown does not cover this on its own, because
+  // rmw_context_fini reaches listener_stop without ever setting it.
+  std::thread listener_thread;
+  int listener_epoll_fd = -1;
+  int listener_wake_fd = -1;
+  std::atomic<bool> listener_running{false};
+  bool listener_stopping = false;
+  std::mutex listener_mutex;
+  std::unordered_map<int, ArmedEntry> listener_targets;
+  std::vector<int> delivery_fds;
 };
 
 // Node data
@@ -258,6 +326,13 @@ struct UdsSubscription
   const message_type_support_callbacks_t * callbacks = nullptr;
   int socket_fd = -1;
   std::string socket_path;
+  // Serialises drains of this endpoint. drain_endpoint() recv()s outside
+  // queue_mutex and push_back()s inside it, so two concurrent drains - the
+  // listener thread and an rmw_wait/rmw_take on an application thread - could
+  // otherwise interleave as recv A / recv B / push B / push A and land
+  // same-publisher datagrams out of order. queue_mutex prevents corruption,
+  // not reordering, and ROS 2 guarantees per-publisher FIFO.
+  std::mutex drain_mutex;
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> message_queue;
   size_t queue_depth = 10;
@@ -266,14 +341,14 @@ struct UdsSubscription
   UdsContext * context = nullptr;
   UdsNode * node = nullptr;
   // rmw_subscription_options_t::ignore_local_publications, copied at creation
-  // time (used by drain_subscription()/drain_socket()).
+  // time (used by drain_endpoint()).
   bool ignore_local_publications = false;
   // TRANSIENT_LOCAL dedup: highest sequence number pulled from each latched
   // publisher's cache at creation, keyed by the FULL 16-byte GID (the trailing
   // context_id bytes are what distinguish a respawned publisher under a
   // recycled pid — anything less would blackhole its fresh samples). Frozen at
-  // pull time; the drains drop an inbound datagram whose (gid, seq) is at or
-  // below its watermark. Guarded by queue_mutex. One small entry per latched
+  // pull time; drain_endpoint() drops an inbound datagram whose (gid, seq) is
+  // at or below its watermark. Guarded by queue_mutex. One small entry per latched
   // publisher ever pulled — subscription-lifetime state, never pruned.
   std::map<std::array<uint8_t, 16>, int64_t> replayed_watermarks;
   // Callback support
@@ -305,6 +380,13 @@ struct UdsService
   const message_type_support_callbacks_t * response_callbacks = nullptr;
   int socket_fd = -1;
   std::string socket_path;
+  // Serialises drains of this endpoint. drain_endpoint() recv()s outside
+  // queue_mutex and push_back()s inside it, so two concurrent drains - the
+  // listener thread and an rmw_wait/rmw_take on an application thread - could
+  // otherwise interleave as recv A / recv B / push B / push A and land
+  // same-publisher datagrams out of order. queue_mutex prevents corruption,
+  // not reordering, and ROS 2 guarantees per-publisher FIFO.
+  std::mutex drain_mutex;
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> request_queue;
   int32_t registry_index = -1;
@@ -341,6 +423,13 @@ struct UdsClient
   const message_type_support_callbacks_t * response_callbacks = nullptr;
   int socket_fd = -1;
   std::string socket_path;
+  // Serialises drains of this endpoint. drain_endpoint() recv()s outside
+  // queue_mutex and push_back()s inside it, so two concurrent drains - the
+  // listener thread and an rmw_wait/rmw_take on an application thread - could
+  // otherwise interleave as recv A / recv B / push B / push A and land
+  // same-publisher datagrams out of order. queue_mutex prevents corruption,
+  // not reordering, and ROS 2 guarantees per-publisher FIFO.
+  std::mutex drain_mutex;
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> response_queue;
   std::atomic<int64_t> sequence_number{1};
@@ -375,29 +464,14 @@ struct UdsGuardCondition
   int eventfd_fd = -1;
 };
 
-// What a given epoll fd was armed for. Lets rmw_wait map an epoll result back
-// to its owner without scanning the wait set, and skip the epoll_ctl when the
-// fd is already armed for the same entity.
-enum ArmedKind : uint8_t
-{
-  ARMED_SUBSCRIPTION = 0,
-  ARMED_SERVICE,
-  ARMED_CLIENT,
-  ARMED_GUARD_CONDITION,
-  ARMED_DOORBELL,
-};
-
-struct ArmedEntry
-{
-  uint8_t kind = ARMED_SUBSCRIPTION;  // ArmedKind
-  void * entity = nullptr;            // UdsSubscription * etc, for the drain
-  uint64_t uid = 0;                   // 0 for the doorbell, which has no entity
-};
-
 // Wait set data
 struct UdsWaitSet
 {
   int epoll_fd = -1;
+  // This wait set's own delivery eventfd, created in rmw_create_wait_set and
+  // registered in context->delivery_fds so the listener signals it. Private to
+  // this wait set, so no other wait set can consume the wake.
+  int delivery_fd = -1;
   // Set at rmw_create_wait_set. The top-of-wait replay/graph check needs the
   // context even when the wait set holds only guard conditions (rclcpp's
   // GraphListener), so it cannot be scavenged from the waited-on entities.

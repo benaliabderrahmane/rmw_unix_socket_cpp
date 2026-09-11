@@ -50,6 +50,8 @@ int main() {
 set(CMAKE_REQUIRED_INCLUDES "${_rmw_probe_saved_inc}")
 
 add_library(rmw_unix_socket_cpp SHARED
+  src/drain.cpp
+  src/listener.cpp
   src/registry.cpp
   src/serialization.cpp
   src/shm_transport.cpp
@@ -215,6 +217,12 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rmw_event test/test_rmw_event.cpp)
   target_link_libraries(test_rmw_event ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_event PRIVATE src)
+
+  # RMW API: on_new_message / on_new_request / on_new_response listener
+  # callbacks, which every drain path must fire.
+  ament_add_gtest(test_rmw_listener_callbacks test/test_rmw_listener_callbacks.cpp)
+  target_link_libraries(test_rmw_listener_callbacks ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_listener_callbacks PRIVATE src)
 
   # Integration: fork()-based two-process tests pushing >4 MB payloads across
   # a real PID boundary through the shared-memory path.
