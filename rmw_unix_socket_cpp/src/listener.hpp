@@ -15,6 +15,7 @@
 #ifndef RMW_UNIX_SOCKET_CPP__LISTENER_HPP_
 #define RMW_UNIX_SOCKET_CPP__LISTENER_HPP_
 
+#include "drain.hpp"
 #include "types.hpp"
 
 #include <cstdint>
@@ -38,11 +39,11 @@ namespace rmw_uds
 // context-wide, not endpoint-local: a callback must not block, and must not
 // destroy, register on, or clear the callback of ANY endpoint in the context,
 // nor create or destroy a wait set - each of those takes listener_mutex and
-// would deadlock against the drain it was called from. It must not call
-// rmw_take on its own endpoint either: the callback fires inside
-// drain_endpoint, which holds that endpoint's drain_mutex. rclcpp's callbacks
-// only push to a queue, which is what the contract in
-// rmw/event_callback_type.h expects.
+// would deadlock against the drain it was called from. Calling rmw_take on its
+// own endpoint IS allowed: drain_endpoint releases both drain_mutex and
+// queue_mutex before it notifies, so a callback runs holding only
+// callback_mutex. rclcpp's callbacks only push to a queue, which is what the
+// contract in rmw/event_callback_type.h expects.
 
 // Watch `fd` on the context's listener thread, starting the thread if this is
 // the first watch. Re-watching a live fd replaces its entry. Returns
@@ -56,6 +57,19 @@ rmw_ret_t listener_watch(
 // endpoint, since listener_mutex is per context - so the caller may destroy
 // the endpoint afterwards. A no-op for an fd that was never watched.
 void listener_unwatch(UdsContext * ctx, int fd);
+
+// Install or clear an endpoint's listener callback and hand its socket to the
+// listener thread, or take it back. `t` supplies the endpoint's fd, queue and
+// callback slots - drain_target() already assembles exactly those - while
+// `kind`, `entity` and `uid` are what listener_watch needs to dispatch a wake.
+//
+// One implementation for all three endpoint kinds. The protocol is fiddly in
+// the same three ways every time (flush only on takeover, watch outside
+// callback_mutex, roll the callback back if the watch fails), and it was three
+// copies that had already drifted once.
+rmw_ret_t listener_set_callback(
+  UdsContext * ctx, const DrainTarget & t, uint8_t kind, void * entity,
+  uint64_t uid, rmw_event_callback_t callback, const void * user_data);
 
 // Add/remove a wait set's delivery eventfd to the set the listener signals
 // after each enqueue. Called from rmw_create_wait_set and
