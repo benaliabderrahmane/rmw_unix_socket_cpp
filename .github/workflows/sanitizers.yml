@@ -98,12 +98,27 @@ jobs:
           # All three are exported in both jobs; each runtime reads only its
           # own, so the matrix does not need to carry them.
           #
-          # detect_leaks is on deliberately: it is what proves the listener
-          # thread is joined and its epoll/eventfd descriptors closed, which
-          # no functional test can observe.
+          # detect_leaks covers leaked HEAP allocations, and nothing else.
+          # LeakSanitizer does not track file descriptors or unjoined threads:
+          # a program that leaks an epoll fd and an eventfd and detaches a
+          # thread that never joins exits 0 under it. Those two properties are
+          # covered by tests instead - NoListenerThreadUntilACallbackIsRegistered
+          # counts /proc/self/task, and the wait-set churn test exercises the
+          # descriptor teardown path.
           export ASAN_OPTIONS=detect_leaks=1:abort_on_error=1
           export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
-          export TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
+          # second_deadlock_stack makes a lock-order-inversion report name both
+          # lock sites rather than one. Deadlock detection itself is on by
+          # default in libtsan.
+          #
+          # The registry is a seqlock: readers deliberately read payload fields
+          # without synchronisation and validate with a sequence counter
+          # (snapshot_slot in registry.cpp). TSan has no model for that, so it
+          # reports every reader/writer pair as a race. The suppression file
+          # silences the READER side only, which leaves genuine writer-vs-writer
+          # races - two threads inside write_slot_payload/teardown_slot on one
+          # slot - fully reported.
+          export TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1:suppressions=$GITHUB_WORKSPACE/.github/tsan.supp
           colcon test \
             --paths rmw_unix_socket_cpp \
             --event-handlers console_direct+ \
