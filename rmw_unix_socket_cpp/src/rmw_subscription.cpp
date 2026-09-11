@@ -625,7 +625,7 @@ rmw_ret_t rmw_subscription_set_on_new_message_callback(
   RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
 
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
-  std::lock_guard<std::mutex> lock(sub_data->callback_mutex);
+  std::lock_guard<std::recursive_mutex> lock(sub_data->callback_mutex);
   // Flush the backlog only when a callback is taking over from none. rclcpp
   // sets the callback twice in a row on purpose - a stack temporary, then its
   // permanent storage (subscription_base.hpp) - and paying the same backlog
@@ -635,9 +635,16 @@ rmw_ret_t rmw_subscription_set_on_new_message_callback(
   sub_data->on_new_message_user_data = user_data;
 
   if (callback && taking_over) {
-    std::lock_guard<std::mutex> qlock(sub_data->queue_mutex);
-    if (!sub_data->message_queue.empty()) {
-      callback(user_data, sub_data->message_queue.size());
+    size_t backlog = 0;
+    {
+      std::lock_guard<std::mutex> qlock(sub_data->queue_mutex);
+      backlog = sub_data->message_queue.size();
+    }
+    // Fired with queue_mutex released. A callback is user code: holding the
+    // queue lock across it means a callback that calls rmw_take on its own
+    // endpoint deadlocks against itself. drain_endpoint() notifies the same way.
+    if (backlog > 0) {
+      callback(user_data, backlog);
     }
   }
   return RMW_RET_OK;
