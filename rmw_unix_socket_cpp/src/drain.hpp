@@ -68,7 +68,7 @@ struct DrainTarget
   std::map<std::array<uint8_t, 16>, int64_t> * replay_watermarks = nullptr;
   // Fired under *callback_mutex once per drain that grew the queue, with the
   // number of entries it gained. Null on endpoints with no listener callback.
-  std::mutex * callback_mutex = nullptr;
+  std::recursive_mutex * callback_mutex = nullptr;
   rmw_event_callback_t * callback = nullptr;
   const void ** callback_user_data = nullptr;
   // Topic or service name, named in the queue-overflow warning.
