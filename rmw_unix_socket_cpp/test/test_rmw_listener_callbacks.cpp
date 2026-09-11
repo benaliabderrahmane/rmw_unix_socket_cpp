@@ -72,15 +72,16 @@ static size_t thread_count()
 // Spin until `counter` reports something or the budget runs out. Deliberately
 // calls neither rmw_wait nor rmw_take: the point is that delivery happens
 // without either.
-static bool await_events(const CallbackCounter & counter, int budget_ms = 2000)
+static bool await_events(
+  const CallbackCounter & counter, size_t target = 1, int budget_ms = 2000)
 {
   for (int waited = 0; waited < budget_ms; waited += 5) {
-    if (counter.events.load() > 0) {
+    if (counter.events.load() >= target) {
       return true;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
-  return counter.events.load() > 0;
+  return counter.events.load() >= target;
 }
 
 class ListenerCallbackTest : public RmwUdsNodeTest
@@ -179,6 +180,10 @@ TEST_F(ListenerCallbackTest, SubscriptionCallbackFiresExactlyOnceOnDelivery)
 
   wait_on_subscription(sub);
 
+  // The listener pushes to the queue before it notifies, so rmw_wait can
+  // return on the queued message while the callback has not fired yet.
+  // Wait for the count, then pin it exactly - an over-count still fails.
+  EXPECT_TRUE(await_events(counter, 1));
   EXPECT_EQ(1u, counter.events.load());
   EXPECT_FALSE(counter.saw_zero.load());
 
@@ -219,6 +224,10 @@ TEST_F(ListenerCallbackTest, SubscriptionCallbackReportsTheBatchCount)
 
   wait_on_subscription(sub);
 
+  // The listener pushes to the queue before it notifies, so rmw_wait can
+  // return on the queued message while the callback has not fired yet.
+  // Wait for the count, then pin it exactly - an over-count still fails.
+  EXPECT_TRUE(await_events(counter, 3));
   EXPECT_EQ(3u, counter.events.load());
   EXPECT_FALSE(counter.saw_zero.load());
 
