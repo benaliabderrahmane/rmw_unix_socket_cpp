@@ -564,7 +564,9 @@ Two limits are accepted. A build that predates the doorbell bumps the generation
 
 ### In-process concurrency
 
-All socket I/O happens inside `rmw_wait()`, but the per-entity data structures are still guarded so a `MultiThreadedExecutor` can call into the RMW from several threads at once. Each subscription, service, and client guards its own message queue with a per-entity `queue_mutex`, each publisher guards its subscriber cache (`sub_cache_mutex`) and its TRANSIENT_LOCAL cache (`cache_mutex`), services and clients guard their caches (`svc_cache_mutex`, `client_cache_mutex`), and each endpoint guards its user-callback pointer with a `callback_mutex`. The locking is per-entity, so concurrent `rmw_take()` and `rmw_publish()` on different entities do not contend; the supported granularity is one thread per entity, not one global lock.
+Socket I/O happens on the caller's thread — inside `rmw_wait()` or an `rmw_take*` — and, for an endpoint with a listener callback registered, also on the context's listener thread. The per-entity data structures are guarded so a `MultiThreadedExecutor` can call into the RMW from several threads at once. Each subscription, service, and client guards its own message queue with a per-entity `queue_mutex` and serialises drains of itself with a per-entity `drain_mutex`, each publisher guards its subscriber cache (`sub_cache_mutex`) and its TRANSIENT_LOCAL cache (`cache_mutex`), services and clients guard their caches (`svc_cache_mutex`, `client_cache_mutex`), and each endpoint guards its user-callback pointer with a `callback_mutex`. The only context-wide lock is `listener_mutex`, which the listener holds across a drain and which the watch/unwatch and wait-set registration paths take.
+
+The locking is otherwise per-entity, so concurrent `rmw_take()` and `rmw_publish()` on different entities do not contend; the supported granularity is one thread per entity, not one global lock. Two callers draining the *same* endpoint do now serialise on its `drain_mutex` — that is what keeps a publisher's samples in order when the listener and an executor thread drain the same socket.
 
 The one shared resource on the send side is the single per-process send socket (one unbound `AF_UNIX` datagram socket shared by every publisher and client in the process). Concurrent `sendmsg()` calls on it are relied upon to be atomic at the datagram level, which the kernel guarantees for `SOCK_DGRAM`: each datagram is written whole, so interleaved senders never produce a torn datagram.
 
@@ -749,9 +751,9 @@ The per-endpoint cost is what scales with the system. Each node, publisher, subs
 | Registry slot | 1 per node, publisher, subscription, service, and client |
 | Receive socket | 1 fd + 1 file in `/tmp/ros2_uds/` per subscription, service, and client |
 | Send socket | 1 fd per process, shared by all publishers/clients/services |
-| epoll fd | 1 per wait set |
-| eventfd | 1 per guard condition |
-| Background threads | 0 |
+| epoll fd | 1 per wait set, plus 1 per context that starts a listener |
+| eventfd | 1 per guard condition, 1 per wait set (its delivery fd), plus 1 per context that starts a listener (its wake fd) |
+| Background threads | 0, unless an endpoint in the context registers a listener callback — then exactly 1 for that context, for the rest of its life |
 
 ### Limitations and unsupported features
 
