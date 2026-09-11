@@ -120,11 +120,14 @@ void drain_endpoint(const DrainTarget & t)
         continue;
       }
     }
-    if (!shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload)) {
-      continue;  // shm descriptor unresolvable (sender gone / ring lapped)
-    }
+    // Checked before the descriptor resolve, for the same reason the dedup
+    // above is: is_same_context() reads only WireHeader::gid, so an ignored
+    // large payload need never be mapped and copied out of the sender's ring.
     if (t.ignore_local && is_same_context(hdr, t.context_id)) {
       continue;  // ignore_local_publications: drop same-context publications
+    }
+    if (!shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload)) {
+      continue;  // shm descriptor unresolvable (sender gone / ring lapped)
     }
 
     ReceivedMessage msg;
