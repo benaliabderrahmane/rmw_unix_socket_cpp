@@ -56,6 +56,20 @@ four copies of the receive loop that hid the gap are one.
 
 ### Fixed
 
+- **Registering a callback while the context shut down could abort or hang.**
+  `listener_watch` read `is_shutdown` before taking `listener_mutex`, which
+  `listener_stop` must release in order to join. A registration landing in that
+  window restarted the listener: it move-assigned over a still-joinable
+  `std::thread` (`std::terminate`) and replaced the epoll and wake descriptors,
+  so the stop's wake-up went to an fd nobody polled and `rmw_shutdown` never
+  returned. Both are closed by a `listener_stopping` flag checked under the
+  mutex — `is_shutdown` alone does not cover it, because `rmw_context_fini`
+  reaches `listener_stop` without setting it.
+- **Concurrent drains of one endpoint could reorder a publisher's messages.**
+  `drain_endpoint` `recv`s outside `queue_mutex` and pushes inside it, so the
+  listener thread and an `rmw_wait`/`rmw_take` could interleave and break the
+  per-publisher FIFO ordering ROS 2 guarantees. A per-endpoint `drain_mutex`
+  held for the whole drain serialises them.
 - **Services and clients were callback-dead after registration** (#61
   follow-up). `on_new_request_cb` and `on_new_response_cb` were stored and
   flushed once against an existing backlog, then never fired again by any drain.
