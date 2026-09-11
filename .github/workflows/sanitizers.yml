@@ -101,10 +101,9 @@ jobs:
           # detect_leaks covers leaked HEAP allocations, and nothing else.
           # LeakSanitizer does not track file descriptors or unjoined threads:
           # a program that leaks an epoll fd and an eventfd and detaches a
-          # thread that never joins exits 0 under it. Those two properties are
-          # covered by tests instead - NoListenerThreadUntilACallbackIsRegistered
-          # counts /proc/self/task, and the wait-set churn test exercises the
-          # descriptor teardown path.
+          # thread that never joins exits 0 under it, while an unreachable
+          # malloc exits 1. Descriptor and thread lifetime therefore need
+          # explicit test coverage; this job does not provide it.
           export ASAN_OPTIONS=detect_leaks=1:abort_on_error=1
           export UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1
           # second_deadlock_stack makes a lock-order-inversion report name both
