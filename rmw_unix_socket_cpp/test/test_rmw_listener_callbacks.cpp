@@ -414,6 +414,10 @@ TEST_F(ListenerCallbackTest, ServiceCallbackFiresOnRequest)
 
   wait_on_service(srv);
 
+  // This PR hands the socket to the listener, which pushes to the queue
+  // before it notifies - so rmw_wait can return on the queued entry while
+  // the callback has not fired. Wait for the count, then pin it exactly.
+  EXPECT_TRUE(await_events(counter, 1));
   EXPECT_EQ(1u, counter.events.load());
   EXPECT_FALSE(counter.saw_zero.load());
 
@@ -452,6 +456,10 @@ TEST_F(ListenerCallbackTest, ClientCallbackFiresOnResponse)
 
   wait_on_client(cli);
 
+  // This PR hands the socket to the listener, which pushes to the queue
+  // before it notifies - so rmw_wait can return on the queued entry while
+  // the callback has not fired. Wait for the count, then pin it exactly.
+  EXPECT_TRUE(await_events(counter, 1));
   EXPECT_EQ(1u, counter.events.load());
   EXPECT_FALSE(counter.saw_zero.load());
 
