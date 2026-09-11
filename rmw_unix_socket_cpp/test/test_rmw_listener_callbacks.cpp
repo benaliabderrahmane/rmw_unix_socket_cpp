@@ -15,7 +15,9 @@
 #include "test_base.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "test_msgs/msg/basic_types.hpp"
 #include "test_msgs/srv/basic_types.hpp"
@@ -311,6 +313,90 @@ TEST_F(ListenerCallbackTest, ClearingTheCallbackStopsNotifications)
 
   EXPECT_EQ(0u, counter.calls.load());
 
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+// Takes from its own subscription inside the callback, publishing first on the
+// initial call so the take's nested drain is guaranteed to gain a datagram.
+struct PublishThenTakeCallback
+{
+  rmw_publisher_t * pub = nullptr;
+  rmw_subscription_t * sub = nullptr;
+  std::atomic<size_t> calls{0};
+  std::atomic<size_t> events{0};
+  std::atomic<size_t> taken{0};
+
+  static void fire(const void * user_data, size_t number_of_events)
+  {
+    auto * self =
+      const_cast<PublishThenTakeCallback *>(static_cast<const PublishThenTakeCallback *>(user_data));
+    self->events.fetch_add(number_of_events);
+    if (self->calls.fetch_add(1) == 0) {
+      test_msgs::msg::BasicTypes again;
+      again.int32_value = 2;
+      auto _r [[maybe_unused]] = rmw_publish(self->pub, &again, nullptr);
+    }
+    test_msgs::msg::BasicTypes msg;
+    bool taken = false;
+    if (rmw_take(self->sub, &msg, &taken, nullptr) == RMW_RET_OK && taken) {
+      self->taken.fetch_add(1);
+    }
+  }
+};
+
+// rmw_take drains before it pops, so a callback that takes from its own
+// endpoint re-enters drain_endpoint() on the thread that is already inside the
+// callback. When that nested drain gains a datagram it notifies again, and
+// with a plain std::mutex the thread deadlocked against itself on
+// callback_mutex. Fails by hanging until the ctest timeout, not by assertion.
+TEST_F(ListenerCallbackTest, ACallbackMayTakeWhileItsOwnEndpointGainsMessages)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/listener_reentrant", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/listener_reentrant", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  PublishThenTakeCallback taking;
+  taking.pub = pub;
+  taking.sub = sub;
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, PublishThenTakeCallback::fire, &taking));
+
+  test_msgs::msg::BasicTypes msg;
+  msg.int32_value = 1;
+  ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+
+  // Not wait_on_subscription(): the callback empties the queue before rmw_wait
+  // looks at it, so a timeout is a correct answer. Only the drain matters here.
+  rmw_subscriptions_t subs;
+  void * arr[1] = {sub->data};
+  subs.subscribers = arr;
+  subs.subscriber_count = 1;
+  const rmw_time_t timeout = {0, 100000000};
+  const rmw_ret_t waited =
+    rmw_wait(&subs, nullptr, nullptr, nullptr, nullptr, ws, &timeout);
+  EXPECT_TRUE(waited == RMW_RET_OK || waited == RMW_RET_TIMEOUT);
+
+  // Awaited rather than read straight after the wait: once a listener thread
+  // owns the socket the callback runs there, not inside rmw_wait.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (taking.taken.load() < 2 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  // The outer call reports the first message, the nested one the second.
+  EXPECT_EQ(2u, taking.calls.load());
+  EXPECT_EQ(2u, taking.events.load());
+  EXPECT_EQ(2u, taking.taken.load());
+
+  ASSERT_EQ(
+    RMW_RET_OK, rmw_subscription_set_on_new_message_callback(sub, nullptr, nullptr));
   auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }

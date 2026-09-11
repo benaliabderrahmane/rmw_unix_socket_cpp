@@ -357,7 +357,7 @@ rmw_ret_t rmw_service_set_on_new_request_callback(
     service, service->implementation_identifier,
     rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
-  std::lock_guard<std::mutex> lock(srv_data->callback_mutex);
+  std::lock_guard<std::recursive_mutex> lock(srv_data->callback_mutex);
   // Only when a callback takes over from none - rclcpp sets it twice in a row
   // and the backlog must not be paid out for both calls.
   const bool taking_over = !srv_data->on_new_request_cb;
@@ -365,9 +365,16 @@ rmw_ret_t rmw_service_set_on_new_request_callback(
   srv_data->on_new_request_user_data = user_data;
 
   if (callback && taking_over) {
-    std::lock_guard<std::mutex> qlock(srv_data->queue_mutex);
-    if (!srv_data->request_queue.empty()) {
-      callback(user_data, srv_data->request_queue.size());
+    size_t backlog = 0;
+    {
+      std::lock_guard<std::mutex> qlock(srv_data->queue_mutex);
+      backlog = srv_data->request_queue.size();
+    }
+    // Fired with queue_mutex released. A callback is user code: holding the
+    // queue lock across it means a callback that calls rmw_take on its own
+    // endpoint deadlocks against itself. drain_endpoint() notifies the same way.
+    if (backlog > 0) {
+      callback(user_data, backlog);
     }
   }
   return RMW_RET_OK;
