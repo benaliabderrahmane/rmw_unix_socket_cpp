@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <unordered_map>
 #include <unordered_set>
