@@ -238,6 +238,38 @@ TEST_F(PubSubTest, LargeMessageViaShmRing)
   EXPECT_EQ(send_msg.uint8_values, recv_msg.uint8_values);
 }
 
+// ignore_local_publications on the shm path. drain_endpoint() tests
+// is_same_context() before it resolves the descriptor, because the sender's
+// context id is already in WireHeader::gid and an ignored payload should never
+// be mapped and copied out of the ring. The small-payload ignore_local tests
+// never reach that branch, since an inline payload has no descriptor to skip.
+TEST_F(PubSubTest, IgnoreLocalPublicationsDropsLargeSameContextMessage)
+{
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  pub = rmw_create_publisher(node, seq_ts, "/large_ignore_local", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub_opts.ignore_local_publications = true;
+  sub = rmw_create_subscription(node, seq_ts, "/large_ignore_local", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  test_msgs::msg::UnboundedSequences send_msg;
+  send_msg.uint8_values.resize(300 * 1024);  // over SHM_PAYLOAD_THRESHOLD
+  EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &send_msg, nullptr));
+
+  // It really did go through the ring, so the drop below is the shm path.
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+  EXPECT_NE(nullptr, pub_data->shm_ring.base);
+
+  test_msgs::msg::UnboundedSequences recv_msg;
+  bool taken = true;
+  EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv_msg, &taken, nullptr));
+  EXPECT_FALSE(taken) <<
+    "ignore_local_publications=true must drop a same-context shm payload";
+}
+
 TEST_F(PubSubTest, StringMessages)
 {
   auto str_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
