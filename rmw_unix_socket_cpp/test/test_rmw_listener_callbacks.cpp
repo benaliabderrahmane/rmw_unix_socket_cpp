@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 #include <dirent.h>
 
@@ -760,6 +761,146 @@ TEST_F(ListenerCallbackTest, DestroyingWaitSetsWhileTheListenerDeliversIsSafe)
   // running across the churn.
   EXPECT_GT(counter.events.load(), 0u);
   EXPECT_FALSE(counter.saw_zero.load());
+
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
+
+// listener_watch read is_shutdown BEFORE taking listener_mutex, and
+// listener_stop releases that mutex before its join(). A registration landing
+// in that window finds listener_running already false and calls
+// listener_start, which move-assigns over a std::thread that is still
+// joinable - and that calls std::terminate(). rmw_context_fini reaches the
+// same stop path without setting is_shutdown at all, so moving the flag read
+// under the mutex does not close it on its own.
+//
+// This one fails by aborting the process rather than by failing an assertion,
+// which is what a std::terminate bug looks like from a test.
+TEST_F(ListenerCallbackTest, RegisteringACallbackWhileTheContextShutsDownDoesNotAbort)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+
+  for (int round = 0; round < 250; ++round) {
+    rmw_context_t ctx = rmw_get_zero_initialized_context();
+    rmw_init_options_t opts = rmw_get_zero_initialized_init_options();
+    ASSERT_EQ(RMW_RET_OK, rmw_init_options_init(&opts, rcutils_get_default_allocator()));
+    // A private domain: this context is torn down mid-test and must not
+    // disturb the fixture's registry.
+    opts.domain_id = 97;
+    ASSERT_EQ(RMW_RET_OK, rmw_init(&opts, &ctx));
+
+    auto * n = rmw_create_node(&ctx, "shutdown_race", "/test_ns");
+    ASSERT_NE(nullptr, n) << "round " << round;
+    auto sub_opts = rmw_get_default_subscription_options();
+    auto * sub = rmw_create_subscription(n, ts, "/listener_shutdown_race", &qos, &sub_opts);
+    ASSERT_NE(nullptr, sub) << "round " << round;
+
+    // Start the listener, so the shutdown below takes its stop-and-join path.
+    ASSERT_EQ(
+      RMW_RET_OK,
+      rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+
+    // Several registrars, so that when listener_stop releases listener_mutex
+    // at least one is likely to be queued on it having already passed the
+    // is_shutdown check - which is the interleaving that crashes.
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> registrars;
+    for (int r = 0; r < 4; ++r) {
+      registrars.emplace_back([&]() {
+          while (!stop.load()) {
+            // Both calls reach the listener. One landing between
+            // listener_stop's unlock and its join is the crash.
+            (void)rmw_subscription_set_on_new_message_callback(sub, nullptr, nullptr);
+            (void)rmw_subscription_set_on_new_message_callback(
+              sub, CallbackCounter::fire, &counter);
+          }
+        });
+    }
+
+    EXPECT_EQ(RMW_RET_OK, rmw_shutdown(&ctx)) << "round " << round;
+    stop.store(true);
+    for (auto & t : registrars) {
+      t.join();
+    }
+
+    auto _s [[maybe_unused]] = rmw_destroy_subscription(n, sub);
+    auto _n [[maybe_unused]] = rmw_destroy_node(n);
+    EXPECT_EQ(RMW_RET_OK, rmw_context_fini(&ctx)) << "round " << round;
+    EXPECT_EQ(RMW_RET_OK, rmw_init_options_fini(&opts)) << "round " << round;
+  }
+}
+
+// drain_endpoint() recv()s outside queue_mutex and push_back()s inside it, so
+// two concurrent drains of one socket can interleave as recv A / recv B /
+// push B / push A and land same-publisher datagrams out of order. The queue
+// mutex prevents corruption, not reordering, and ROS 2 guarantees
+// per-publisher FIFO. Both drainers are reachable through the public API
+// alone: the listener drains because a callback is registered, and rmw_take
+// drains on every call.
+TEST_F(ListenerCallbackTest, ConcurrentDrainsPreservePublisherOrder)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+
+  // Deep enough that the QoS trim never drops a sample, so an out-of-order
+  // pair below is reordering rather than overflow.
+  rmw_qos_profile_t deep = qos;
+  deep.depth = 5000;
+
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/listener_order", &deep, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/listener_order", &deep, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  // Hands the socket to the listener, which then drains it concurrently with
+  // the rmw_take loop below.
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, CallbackCounter::fire, &counter));
+
+  const int32_t total = 1500;
+  std::thread publisher([&]() {
+      for (int32_t i = 0; i < total; ++i) {
+        test_msgs::msg::BasicTypes msg;
+        msg.int32_value = i;
+        (void)rmw_publish(pub, &msg, nullptr);
+      }
+    });
+
+  int32_t prev = -1;
+  int32_t inversions = 0;
+  int32_t first_bad_prev = -1, first_bad = -1;
+  size_t collected = 0;
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (collected < static_cast<size_t>(total) &&
+    std::chrono::steady_clock::now() < deadline)
+  {
+    test_msgs::msg::BasicTypes recv;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv, &taken, nullptr));
+    if (!taken) {
+      continue;
+    }
+    if (recv.int32_value <= prev) {
+      if (inversions == 0) {
+        first_bad_prev = prev;
+        first_bad = recv.int32_value;
+      }
+      ++inversions;
+    }
+    prev = recv.int32_value;
+    ++collected;
+  }
+  publisher.join();
+
+  EXPECT_EQ(0, inversions)
+    << "first inversion: " << first_bad_prev << " then " << first_bad
+    << " (collected " << collected << " of " << total << ")";
+  // Guards against the assertion above passing vacuously.
+  EXPECT_GT(collected, static_cast<size_t>(total) / 2);
 
   auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);

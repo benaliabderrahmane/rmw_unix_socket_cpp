@@ -36,6 +36,7 @@ DrainTarget drain_target(UdsSubscription * sub)
 {
   DrainTarget t;
   t.fd = sub->socket_fd;
+  t.drain_mutex = &sub->drain_mutex;
   t.queue_mutex = &sub->queue_mutex;
   t.queue = &sub->message_queue;
   t.max_depth = sub->queue_depth;
@@ -56,6 +57,7 @@ DrainTarget drain_target(UdsService * srv)
 {
   DrainTarget t;
   t.fd = srv->socket_fd;
+  t.drain_mutex = &srv->drain_mutex;
   t.queue_mutex = &srv->queue_mutex;
   t.queue = &srv->request_queue;
   t.max_depth = SERVICE_QUEUE_DEPTH;
@@ -73,6 +75,7 @@ DrainTarget drain_target(UdsClient * cli)
 {
   DrainTarget t;
   t.fd = cli->socket_fd;
+  t.drain_mutex = &cli->drain_mutex;
   t.queue_mutex = &cli->queue_mutex;
   t.queue = &cli->response_queue;
   t.max_depth = SERVICE_QUEUE_DEPTH;
@@ -88,6 +91,14 @@ DrainTarget drain_target(UdsClient * cli)
 
 size_t drain_endpoint(const DrainTarget & t)
 {
+  // Serialises drains of this endpoint. recv_from() below runs outside
+  // queue_mutex, so without this the listener thread and an
+  // rmw_wait/rmw_take on an application thread can interleave as recv A /
+  // recv B / push B / push A and land same-publisher datagrams out of order.
+  // Taken before queue_mutex and callback_mutex, and nothing acquires
+  // listener_mutex while holding it, so the lock graph stays acyclic.
+  std::lock_guard<std::mutex> drain_lock(*t.drain_mutex);
+
   WireHeader hdr;
   std::vector<uint8_t> payload;
   size_t enqueued = 0;
