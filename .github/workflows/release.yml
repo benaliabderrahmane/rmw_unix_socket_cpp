@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        ros_distro: [jazzy, kilted, rolling]
+        ros_distro: [jazzy, kilted, rolling, lyrical]
     container:
       image: ros:${{ matrix.ros_distro }}-ros-base
     steps:
