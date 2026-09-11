@@ -120,14 +120,17 @@ jobs:
           PKG = 'rmw_unix_socket_cpp'
           pkg = parse_package(PKG)
           pkg.validate()
-          assert pkg.urls, 'package.xml has no <url> tags'
+          required_urls = {'repository', 'bugtracker', 'website'}
+          missing = required_urls - {u.type for u in pkg.urls}
+          assert not missing, f'package.xml is missing <url> types: {sorted(missing)}'
           assert pkg.maintainers[0].email, 'maintainer has no email'
 
           # bloom only reads CHANGELOG.rst sitting next to package.xml.
           changelog = get_changelog_from_path(PKG, PKG)
           assert changelog is not None, f'no CHANGELOG.rst in {PKG}/'
           versions = [v for v, _, _ in changelog.foreach_version()]
-          assert pkg.version in versions, f'package.xml {pkg.version} has no changelog entry'
+          assert pkg.version == versions[-1], \
+              f'package.xml {pkg.version} is not the newest changelog entry {versions[-1]}'
           # REP-132 forbids sub-sections under a version; catkin_pkg drops them
           # silently, so a version written that way ships an empty debian entry.
           for version, date, content in changelog.foreach_version():
