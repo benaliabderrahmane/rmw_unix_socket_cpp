@@ -905,3 +905,68 @@ TEST_F(ListenerCallbackTest, ConcurrentDrainsPreservePublisherOrder)
   auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
   auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
 }
+
+// A listener callback that takes from its own endpoint. drain_endpoint()
+// releases drain_mutex and queue_mutex before it notifies, and the backlog
+// flush in the setter does the same, so a callback runs holding only
+// callback_mutex and this is legal. Hold either data lock across the
+// notification and rmw_take deadlocks against it one frame up, so this test
+// fails by wedging the binary rather than by failing an assertion.
+struct TakingCallback
+{
+  rmw_subscription_t * sub = nullptr;
+  std::atomic<size_t> taken{0};
+
+  static void fire(const void * user_data, size_t)
+  {
+    auto * self =
+      const_cast<TakingCallback *>(static_cast<const TakingCallback *>(user_data));
+    test_msgs::msg::BasicTypes msg;
+    bool got = false;
+    if (rmw_take(self->sub, &msg, &got, nullptr) == RMW_RET_OK && got) {
+      self->taken.fetch_add(1);
+    }
+  }
+};
+
+TEST_F(ListenerCallbackTest, ACallbackMayTakeFromItsOwnEndpoint)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/listener_reentrant", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/listener_reentrant", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  TakingCallback tc;
+  tc.sub = sub;
+
+  // Queue a backlog with no callback installed, so the registration below
+  // fires the setter's flush path with entries already waiting.
+  for (int32_t i = 0; i < 3; ++i) {
+    test_msgs::msg::BasicTypes msg;
+    msg.int32_value = i;
+    ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+  }
+  wait_on_subscription(sub);
+
+  // Deadlocks here if the flush still holds queue_mutex across the callback.
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, TakingCallback::fire, &tc));
+
+  // And here if the listener's drain still holds drain_mutex across it.
+  test_msgs::msg::BasicTypes msg;
+  msg.int32_value = 99;
+  ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+  wait_on_subscription(sub);
+
+  EXPECT_GT(tc.taken.load(), 0u) << "the callback never managed a take";
+
+  auto _c [[maybe_unused]] =
+    rmw_subscription_set_on_new_message_callback(sub, nullptr, nullptr);
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
+  auto _p [[maybe_unused]] = rmw_destroy_publisher(node, pub);
+}
