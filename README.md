@@ -4,8 +4,9 @@ A lightweight, **localhost-only** RMW (ROS Middleware) implementation for ROS 2,
 built on Unix domain sockets and POSIX shared memory instead of DDS.
 
 It targets single-machine deployments with many nodes (150+ in production) and a
-small, deterministic resource footprint — no DDS, no daemon, no background
-threads. Discovery is a shared-memory registry; data moves over `AF_UNIX`
+small, deterministic resource footprint — no DDS, no daemon, and no background
+thread unless your executor asks to be called back. Discovery is a shared-memory
+registry; data moves over `AF_UNIX`
 datagram sockets; the wait set is `epoll` + `eventfd`.
 
 ## When to use it (and when not)
@@ -55,7 +56,8 @@ nodes that need to communicate must select the same RMW — there is no DDS brid
 | **Transport** | `SOCK_DGRAM` Unix domain sockets in `/tmp/ros2_uds/<domain_id>/`. Message boundaries are free; no connection management. |
 | **Discovery** | Single shared-memory file `/dev/shm/ros2_uds_<domain_id>`. No daemon, no multicast. |
 | **Locking** | Lock-free registry (per-slot seqlock + atomic state machine); process-local caches use a plain mutex. |
-| **Wait** | `epoll` over socket fds + `eventfd` guard conditions. **No background threads** — all I/O happens inside `rmw_wait`. |
+| **Wait** | `epoll` over socket fds + `eventfd` guard conditions. I/O happens inside `rmw_wait`, so a waiting executor gets **no background threads**. |
+| **Callbacks** | An endpoint that registers a listener callback is drained by one per-context listener thread, started on that first registration — what `EventsExecutor` needs, since it never calls `rmw_wait`. |
 | **Serialization** | CDR via `fastcdr` + `rosidl_typesupport_fastrtps` (the same path as the DDS RMWs). |
 | **Stale cleanup** | Dead processes are detected via `/proc/<pid>`; their registry entries and socket files are reclaimed on init and on every discovery query. |
 
@@ -140,7 +142,11 @@ for the full rationale.
 Localhost only; Linux only; no DDS interoperability. Loaned (zero-copy) messages,
 dynamic message types, network flow endpoints, and content filtering return
 `RMW_RET_UNSUPPORTED`. `deadline`, `lifespan`, and `liveliness` QoS are accepted
-but not enforced. The full list and the reasoning behind each is in
+but not enforced, and no QoS status event (`matched`, incompatible-QoS,
+incompatible-type, `message_lost`) is generated — `rmw_event_type_is_supported`
+returns `false` for every type, so `rclcpp` refuses those event handlers rather
+than holding a dead one. The listener callbacks an `EventsExecutor` needs are
+supported. The full list and the reasoning behind each is in
 [DESIGN.md → Limitations and Unsupported Features](rmw_unix_socket_cpp/DESIGN.md#limitations-and-unsupported-features).
 
 ## Documentation

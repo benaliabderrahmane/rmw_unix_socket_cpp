@@ -131,6 +131,30 @@ Tests the epoll-based wait set.
 | `WaitTimeoutWhenNoData` | Returns `RMW_RET_TIMEOUT` after specified duration, guard condition nulled out | Validates the timeout path. Without this, the executor would hang indefinitely when no messages arrive. |
 | `WaitWithSubscription` | Publish → wait on subscription → returns ready → take succeeds | End-to-end: message arrives on socket → epoll detects it → drain into queue → subscription marked ready → take succeeds. Tests the full executor wakeup path. |
 
+### test_rmw_listener_callbacks.cpp
+
+Tests the `on_new_message` / `on_new_request` / `on_new_response` listener
+callbacks, and the listener thread that fires them without a wait.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `SubscriptionCallbackFiresExactlyOnceOnDelivery` | A callback registered on a subscription is notified exactly once for one published message | Only the `rmw_take` path used to notify, so a callback was silent for every message that arrived while a thread sat in `rmw_wait`. Registering the callback also hands the socket to the listener, so either path may deliver; the count is the invariant, not which one won. |
+| `SubscriptionCallbackReportsTheBatchCount` | Three messages produce `number_of_events` summing to 3, in batches rather than one call per datagram | `rmw/event_callback_type.h` defines the count as events since the last call and allows `> 1`. Asserts the total, not the number of calls — the listener splits a burst into however many batches its `epoll` reports, so the call count is not the middleware's to promise. |
+| `BatchCountMatchesWhatCanBeTaken` | For a burst larger than `qos.depth`, the events reported equal the number of messages `rmw_take` returns | `number_of_events` is a take credit. Counting datagrams read instead of queue growth over-reports on every overflow and spends the difference on takes that find nothing. |
+| `ReRegisteringTheCallbackDoesNotReflushTheBacklog` | Setting the callback twice against the same backlog reports it once | `rclcpp` sets the rmw callback twice in a row deliberately (`subscription_base.hpp`), so a flush that pays out per call doubles every replayed TRANSIENT_LOCAL sample. |
+| `EmptyDrainDoesNotNotify` | A drain that enqueues nothing fires nothing | The contract says the count "should never be 0", so notifying on an empty drain would report an event that did not happen. |
+| `ClearingTheCallbackStopsNotifications` | Registering `nullptr` stops notification | `callback == NULL` is the documented way to clear a callback. |
+| `ServiceCallbackFiresOnRequest` / `ClientCallbackFiresOnResponse` | Request and response callbacks fire on arrival | Both were stored by their setters and flushed once against an existing backlog, then never fired again by any drain. |
+| `CallbackFiresWithNoThreadInWaitOrTake` | A published message reaches the callback with neither `rmw_wait` nor `rmw_take` ever called | The whole reason the listener thread exists. `EventsExecutor` calls neither until a callback tells it to, so without this it waits forever. Fails by timing out on the pre-listener code. |
+| `ServiceCallbackFiresWithNoThreadInWaitOrTake` / `ClientCallbackFiresWithNoThreadInWaitOrTake` | The same for a service request and a client response | Services and clients reach the listener the same way subscriptions do. |
+| `NoListenerThreadUntilACallbackIsRegistered` | `/proc/self/task` is unchanged by creating a subscription, and grows by exactly one on registration | Pins the lazy start. An executor that waits must still get the zero-background-thread behavior the design promises. |
+| `DestroySubscriptionWhileMessagesArrive` | 20 rounds of register → publish → destroy with datagrams in flight | `listener_unwatch` must not return while the listener is inside a drain, or the `delete` that follows frees the endpoint underneath it. Run under TSan/ASan to make a regression loud. |
+| `WaitAndListenerOnTheSameSubscriptionDoNotHang` | 50 rounds of publishing into a blocked `rmw_wait` on a watched subscription | If the listener empties the socket between a wait's queue scan and its `epoll_wait`, `epoll` has nothing left to report and the wait would sleep on a full queue. `delivery_fd` closes that window; this drives the race rather than interleaving it exactly. |
+| `ASecondWaitSetDoesNotStealTheDeliveryWakeup` | The same 50 rounds, with a second wait set spinning `rmw_wait` against them throughout | An eventfd read drains the whole counter, so one shared per-context `delivery_fd` was one credit: a wait set that gained no work still consumed it and discarded it. One fd per wait set removes the sharing. The window itself cannot be opened from a test — the victim has to be between its queue scan and its `epoll_wait` — so this drives the path rather than pinning the interleaving. |
+| `DestroyingWaitSetsWhileTheListenerDeliversIsSafe` | 200 wait sets created and destroyed while the listener delivers continuously | A wait set's `delivery_fd` has to leave the context's list before it is closed; the other order leaves the listener writing eight bytes into a recycled fd number. Run under TSan/ASan to make a regression loud. |
+| `RegisteringACallbackWhileTheContextShutsDownDoesNotAbort` | 250 rounds of four threads registering callbacks against a concurrent `rmw_shutdown` | `listener_watch` used to read `is_shutdown` outside `listener_mutex`, and `listener_stop` must release that mutex to join. A registration landing in that window restarted the listener — move-assigning over a joinable `std::thread` (`std::terminate`) and replacing the epoll and wake fds, so the stop's wake-up was lost and `rmw_shutdown` never returned. Fails by wedging or aborting the binary, not by an assertion. |
+| `ConcurrentDrainsPreservePublisherOrder` | 1500 samples drained concurrently by the listener and an `rmw_take` loop, checked for sequence inversions | `drain_endpoint` `recv`s outside `queue_mutex` and pushes inside it, so two drains could interleave and break the per-publisher FIFO ordering ROS 2 guarantees. Reported "531 then 530" before the per-endpoint `drain_mutex`. The deep QoS depth ensures a gap means reordering, not overflow. |
+
 ### test_rmw_graph.cpp
 
 Tests graph introspection (discovery queries).
@@ -167,7 +191,8 @@ Tests QoS policies, TRANSIENT_LOCAL (latched), and multi-endpoint scenarios.
 | Network flow endpoints | Not applicable — AF_UNIX has no IP endpoints. Returns `RMW_RET_UNSUPPORTED`. |
 | Content filtering | Not implemented. Returns `RMW_RET_UNSUPPORTED`. |
 | Cross-process tests | All tests run in a single process. Cross-process communication works via the same shared-memory registry and socket paths, but testing it requires launching separate processes (integration test territory). |
-| Deadline / lifespan QoS | Not enforced — these are timer-based policies that require background monitoring. Accepted as a known limitation for this lightweight implementation. |
+| Deadline / lifespan QoS | Not enforced — these are timer-based policies that require background monitoring. The listener thread is event-driven, not timer-driven (socket readiness, never a clock), so it does not make them enforceable. Accepted as a known limitation for this lightweight implementation. |
+| QoS status events (`matched`, incompatible-QoS, incompatible-type, `message_lost`) | Not generated. `test_rmw_event.cpp` tests the refusal instead: `rmw_event_type_is_supported` returns `false` for every type and both `*_event_init` functions reject with `RMW_RET_UNSUPPORTED`, which is what `rclcpp` handles cleanly. |
 | Stress / scale tests (200+ nodes) | Requires a launch file and process management. Can be tested with the `test200.launch.xml` launch file separately. |
 
 ---
