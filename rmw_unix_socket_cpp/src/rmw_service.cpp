@@ -361,41 +361,9 @@ rmw_ret_t rmw_service_set_on_new_request_callback(
     service, service->implementation_identifier,
     rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
-  {
-    std::lock_guard<std::mutex> lock(srv_data->callback_mutex);
-    // Only when a callback takes over from none - rclcpp sets it twice in a
-    // row and the backlog must not be paid out for both calls.
-    const bool taking_over = !srv_data->on_new_request_cb;
-    srv_data->on_new_request_cb = callback;
-    srv_data->on_new_request_user_data = user_data;
-
-    if (callback && taking_over) {
-      std::lock_guard<std::mutex> qlock(srv_data->queue_mutex);
-      if (!srv_data->request_queue.empty()) {
-        callback(user_data, srv_data->request_queue.size());
-      }
-    }
-  }
-
-  // Outside callback_mutex: the listener holds listener_mutex across a drain
-  // and takes callback_mutex inside it, so the reverse order would deadlock.
-  // The flush above covered the queue, the watch below covers the socket.
-  if (callback) {
-    const rmw_ret_t ret = rmw_uds::listener_watch(
-      srv_data->context, srv_data->socket_fd, rmw_uds::ARMED_SERVICE,
-      srv_data, srv_data->uid);
-    if (ret != RMW_RET_OK) {
-      // A failure has to mean the callback is not set, as in the subscription
-      // setter - leaving it installed behind an error fires at a caller that
-      // was told the registration failed.
-      std::lock_guard<std::mutex> lock(srv_data->callback_mutex);
-      srv_data->on_new_request_cb = nullptr;
-      srv_data->on_new_request_user_data = nullptr;
-    }
-    return ret;
-  }
-  rmw_uds::listener_unwatch(srv_data->context, srv_data->socket_fd);
-  return RMW_RET_OK;
+  return rmw_uds::listener_set_callback(
+    srv_data->context, rmw_uds::drain_target(srv_data),
+    rmw_uds::ARMED_SERVICE, srv_data, srv_data->uid, callback, user_data);
 }
 
 }  // extern "C"
