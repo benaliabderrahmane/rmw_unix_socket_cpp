@@ -114,8 +114,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-catkin-pkg
           python3 - <<'PY'
+          import re
+
           from catkin_pkg.changelog import get_changelog_from_path
           from catkin_pkg.package import parse_package
+          from docutils import nodes
+          from docutils.core import publish_doctree
 
           PKG = 'rmw_unix_socket_cpp'
           pkg = parse_package(PKG)
@@ -126,15 +130,36 @@ jobs:
           assert pkg.maintainers[0].email, 'maintainer has no email'
 
           # bloom only reads CHANGELOG.rst sitting next to package.xml.
-          changelog = get_changelog_from_path(PKG, PKG)
+          changelog = get_changelog_from_path(PKG)
           assert changelog is not None, f'no CHANGELOG.rst in {PKG}/'
           versions = [v for v, _, _ in changelog.foreach_version()]
           assert pkg.version == versions[-1], \
               f'package.xml {pkg.version} is not the newest changelog entry {versions[-1]}'
-          # REP-132 forbids sub-sections under a version; catkin_pkg drops them
-          # silently, so a version written that way ships an empty debian entry.
           for version, date, content in changelog.foreach_version():
               assert date, f'{version} has no parseable date'
-              assert content, f'{version} body is empty (sub-sections are dropped)'
+              assert content, f'{version} body is empty'
+
+          # The parsed view above is not enough: REP-132 allows only paragraphs
+          # and lists under a version heading, and catkin_pkg drops sub-sections
+          # silently. A version with an intro paragraph plus sub-sections still
+          # parses non-empty while every bullet under them is lost, so check the
+          # raw rst structure too.
+          tree = publish_doctree(
+              changelog.rst,
+              settings_overrides={'report_level': 5, 'warning_stream': False})
+          for section in tree.findall(nodes.section):
+              title = section.next_node(nodes.title).astext()
+              if not re.match(r'^\d+\.\d+\.\d+ \(', title):
+                  continue
+              nested = [s.next_node(nodes.title).astext()
+                        for s in section.findall(nodes.section) if s is not section]
+              assert not nested, f'{title} has rst sub-sections {nested}, which are dropped'
+
+          # rst has no nested inline markup, so ``code`` inside **bold** emits
+          # the backticks literally and docutils reports nothing.
+          for strong in tree.findall(nodes.strong):
+              text = strong.astext()
+              assert '``' not in text, f'literal backticks in bold: {text[:60]}'
+
           print(f'{PKG} {pkg.version}: {len(versions)} changelog entries, metadata OK')
           PY
