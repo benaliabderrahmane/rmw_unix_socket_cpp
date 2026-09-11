@@ -144,8 +144,8 @@ TEST_F(RmwUdsNodeTest, WaitWithSubscription)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
 }
 
-// drain_socket() (rmw_wait.cpp) applies the same ignore_local_publications
-// filter as drain_subscription(), so a subscription created with
+// rmw_wait drains through the same drain_endpoint() the take path uses, so the
+// ignore_local_publications filter applies there too: a subscription created with
 // ignore_local_publications=true must not wake a wait set for a message
 // published from within the same process/context.
 TEST_F(RmwUdsNodeTest, WaitDoesNotWakeForIgnoredLocalPublication)
