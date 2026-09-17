@@ -9,7 +9,7 @@ touches source on `main`.
 sudo apt install python3-bloom python3-catkin-pkg
 ```
 
-`bloom` also needs a GitHub token with `public_repo` scope.
+`bloom` also needs a GitHub token with `public_repo` and `workflow` scopes.
 
 ## Supported distros
 
@@ -24,17 +24,29 @@ Fast CDR 1.0.x, where that enum does not exist.
 
 | Prompt | Answer |
 | --- | --- |
-| Release repository url | yes — let bloom create `…/rmw_unix_socket_cpp-release` |
+| Release repository url | `https://github.com/benaliabderrahmane/rmw_unix_socket_cpp-release.git` |
 | Upstream repository uri | `https://github.com/benaliabderrahmane/rmw_unix_socket_cpp.git` |
 | Upstream devel branch | the branch for that distro (`main` until per-distro branches exist) |
 | Version | `:{auto}` |
 | Release tag | `v:{version}` |
+
+bloom does not create the release repository: the URL must point at one that
+already exists, empty is fine. Rolling (and every distro branched from it after
+that policy, so Lyrical too) only accepts a release repository hosted in the
+`ros2-gbp` organisation - request one through
+`ros2-gbp/ros2-gbp-github-org` and use its URL for those tracks instead.
 
 The release tag matters: our tags are `v0.5.0` but `catkin_prepare_release`
 writes `0.5.0`, so a bare `:{version}` makes bloom look for a tag that isn't
 there.
 
 ## First release
+
+Cut a new tag first. `:{auto}` reads the version from `package.xml`, and the
+`v0.5.0` tag that already exists predates `CHANGELOG.rst` and the `<url>` tags -
+releasing it would ship exactly the empty changelog this setup exists to avoid.
+Run the tagging half of the loop below (`catkin_generate_changelog` …
+`catkin_prepare_release --tag-prefix v`), then:
 
 ```bash
 bloom-release --new-track --rosdistro jazzy --track jazzy rmw_unix_socket_cpp
@@ -48,7 +60,7 @@ Only this first rosdistro PR gets real scrutiny.
 catkin_generate_changelog             # appends unreleased commits to rmw_unix_socket_cpp/CHANGELOG.rst
 $EDITOR rmw_unix_socket_cpp/CHANGELOG.rst
 git commit -am "Update changelog"
-catkin_prepare_release --tag-prefix v # bumps package.xml, commits, tags, pushes
+catkin_prepare_release --tag-prefix v # bumps the patch version (--bump minor|major for more), commits, tags, pushes
 bloom-release --rosdistro jazzy --track jazzy rmw_unix_socket_cpp
 ```
 
