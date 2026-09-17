@@ -14,6 +14,7 @@
 
 #include "test_base.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 
@@ -82,11 +83,15 @@ protected:
 // crashing with "failed to set the on new message callback for Event".
 //
 // Iterating the whole enum rather than naming types keeps this honest across
-// the distro matrix: rmw_event_type_t has no explicit initializers, so both
-// the ordinals and RMW_EVENT_INVALID shift as upstream adds event types.
+// the distro matrix: the ordinals shift as upstream adds event types, and
+// RMW_EVENT_INVALID is the last enumerator on Jazzy but the first (0) from
+// Kilted on - so the bound is whichever of it and the last real type is larger.
+static constexpr int LAST_EVENT_TYPE =
+  std::max<int>(RMW_EVENT_INVALID, RMW_EVENT_PUBLICATION_MATCHED);
+
 TEST_F(EventTest, SubscriptionEventInitRejectsEveryEventType)
 {
-  for (int i = 0; i <= RMW_EVENT_INVALID; ++i) {
+  for (int i = 0; i <= LAST_EVENT_TYPE; ++i) {
     const auto type = static_cast<rmw_event_type_t>(i);
     ASSERT_FALSE(rmw_event_type_is_supported(type)) << "event type " << i;
 
@@ -102,7 +107,7 @@ TEST_F(EventTest, SubscriptionEventInitRejectsEveryEventType)
 
 TEST_F(EventTest, PublisherEventInitRejectsEveryEventType)
 {
-  for (int i = 0; i <= RMW_EVENT_INVALID; ++i) {
+  for (int i = 0; i <= LAST_EVENT_TYPE; ++i) {
     const auto type = static_cast<rmw_event_type_t>(i);
     ASSERT_FALSE(rmw_event_type_is_supported(type)) << "event type " << i;
 
@@ -146,6 +151,16 @@ TEST_F(EventTest, EventInitRejectsForeignEndpoints)
   rmw_reset_error();
 }
 
+TEST_F(EventTest, SetOnNewMessageCallbackRejectsForeignSubscription)
+{
+  rmw_subscription_t foreign_sub = *sub;
+  foreign_sub.implementation_identifier = "rmw_bogus_cpp";
+  EXPECT_EQ(
+    RMW_RET_INCORRECT_RMW_IMPLEMENTATION,
+    rmw_subscription_set_on_new_message_callback(&foreign_sub, nullptr, nullptr));
+  rmw_reset_error();
+}
+
 TEST_F(EventTest, EventInitRejectsNullArguments)
 {
   rmw_event_t event = rmw_get_zero_initialized_event();
@@ -168,9 +183,7 @@ TEST_F(EventTest, EventInitRejectsNullArguments)
 }
 
 // rmw_take_event() may only write into the caller's status struct when it
-// reports taken. rcl reuses that buffer across calls, so scribbling in it on
-// the nothing-taken path would hand the application a stale status it never
-// asked for.
+// reports taken.
 TEST_F(EventTest, TakeEventTakesNothingAndLeavesEventInfoUntouched)
 {
   rmw_event_t event = our_event(RMW_EVENT_MESSAGE_LOST);
