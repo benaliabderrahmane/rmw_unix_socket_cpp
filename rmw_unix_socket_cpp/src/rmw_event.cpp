@@ -78,7 +78,7 @@ rmw_ret_t rmw_take_event(
 
   // No event type is supported, so there is never anything to take. Leave
   // `event_info` untouched: a taker may only write into the caller's status
-  // struct when it reports `taken`, and rcl reuses that buffer across calls.
+  // struct when it reports `taken`.
   (void)event_info;
   *taken = false;
   return RMW_RET_OK;
