@@ -27,8 +27,9 @@
 namespace rmw_uds
 {
 
-// Requests and responses carry no QoS depth of their own. This is the bound
-// rmw_wait has always applied to both queues; drain_target() now hands it to
+// The service/client QoS depth is accepted and reported (get_actual_qos, the
+// registry slot) but is not enforced on the request/response queues. This is
+// the bound rmw_wait has always applied to both queues; drain_target() now hands it to
 // the take path too, so a caller that only ever calls rmw_take_request()
 // cannot grow one without limit.
 //
