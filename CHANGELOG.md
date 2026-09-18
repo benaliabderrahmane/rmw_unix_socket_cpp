@@ -5,6 +5,21 @@ All notable changes to `rmw_unix_socket_cpp` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **QoS status events are refused honestly.** `rmw_publisher_event_init` /
+  `rmw_subscription_event_init` return `RMW_RET_UNSUPPORTED` for every event
+  type (#61) - the refusal `rclcpp` swallows - where reporting success made
+  `EventsExecutor` crash. `rmw_event_set_callback` returned
+  a failure with no error message behind it — the `": error not set"` half of
+  the original `EventsExecutor` crash report. `rmw_take_event`,
+  `rmw_event_set_callback`, both `*_event_init` functions and
+  `rmw_subscription_set_on_new_message_callback` were also missing the
+  `RMW_CHECK_TYPE_IDENTIFIERS_MATCH` (the service and client callback setters
+  already had it).
+
 ## [0.5.0] - 2026-08-27
 
 The wait/wakeup release. The 200 ms `rmw_wait` poll is gone, replaced by an
