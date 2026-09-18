@@ -17,6 +17,7 @@
 #include <chrono>
 
 #include "identifier.hpp"
+#include "listener.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
 #include "transport.hpp"
@@ -286,6 +287,10 @@ rmw_ret_t rmw_shutdown(rmw_context_t * context)
   auto * ctx = reinterpret_cast<rmw_uds::UdsContext *>(context->impl);
   if (ctx) {
     ctx->is_shutdown.store(true);
+    // Join the listener here rather than in rmw_context_fini: after shutdown
+    // this context does no work, and an endpoint destroyed between the two
+    // calls must not be drained by a thread that is still running.
+    rmw_uds::listener_stop(ctx);
   }
   return RMW_RET_OK;
 }
@@ -299,6 +304,9 @@ rmw_ret_t rmw_context_fini(rmw_context_t * context)
 
   auto * ctx = reinterpret_cast<rmw_uds::UdsContext *>(context->impl);
   if (ctx) {
+    // Idempotent: rmw_shutdown normally joined it already, but a context
+    // finalized without one must not delete ctx under a live thread.
+    rmw_uds::listener_stop(ctx);
     // Doorbell teardown before the registry unmaps: registry_remove's slot
     // teardown also unlinks the socket file. When the doorbell was never
     // lazily registered there is no slot, so unlink the socket file here.

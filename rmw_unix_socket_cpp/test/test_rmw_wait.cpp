@@ -144,8 +144,8 @@ TEST_F(RmwUdsNodeTest, WaitWithSubscription)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
 }
 
-// drain_socket() (rmw_wait.cpp) applies the same ignore_local_publications
-// filter as drain_subscription(), so a subscription created with
+// rmw_wait drains through the same drain_endpoint() the take path uses, so the
+// ignore_local_publications filter applies there too: a subscription created with
 // ignore_local_publications=true must not wake a wait set for a message
 // published from within the same process/context.
 TEST_F(RmwUdsNodeTest, WaitDoesNotWakeForIgnoredLocalPublication)
@@ -786,4 +786,59 @@ TEST_F(RmwUdsNodeTest, BoundedWaitUnderRegistryChurnTimesOutOnSchedule)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws_reg));
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub));
+}
+
+// Before the drains were unified only the rmw_take path fired on_new_message,
+// so a callback heard nothing about a message drained by rmw_wait - which is
+// every message, for an executor that waits before it takes.
+TEST_F(RmwUdsNodeTest, WaitDrainFiresOnNewMessageCallback)
+{
+  auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::BasicTypes>();
+  rmw_qos_profile_t qos = rmw_qos_profile_default;
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * pub = rmw_create_publisher(node, ts, "/wait_fires_callback", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(node, ts, "/wait_fires_callback", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+
+  // Summed, not counted: whether three messages arrive as three calls or as
+  // one call reporting three is not what this pins.
+  std::atomic<size_t> events{0};
+  auto on_new_message = [](const void * user_data, size_t number_of_events) {
+      auto * total =
+        const_cast<std::atomic<size_t> *>(static_cast<const std::atomic<size_t> *>(user_data));
+      total->fetch_add(number_of_events);
+    };
+  ASSERT_EQ(
+    RMW_RET_OK, rmw_subscription_set_on_new_message_callback(sub, on_new_message, &events));
+
+  test_msgs::msg::BasicTypes msg;
+  for (int i = 0; i < 3; ++i) {
+    msg.int32_value = i;
+    ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &msg, nullptr));
+  }
+
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  rmw_subscriptions_t subs;
+  void * arr[1] = {sub->data};
+  subs.subscribers = arr;
+  subs.subscriber_count = 1;
+  const rmw_time_t timeout = {1, 0};
+  EXPECT_EQ(RMW_RET_OK, rmw_wait(&subs, nullptr, nullptr, nullptr, nullptr, ws, &timeout));
+
+  // No take has run, so the wait drain is the only thing that can have fired it.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (events.load() < 3 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_EQ(3u, events.load());
+
+  EXPECT_EQ(
+    RMW_RET_OK, rmw_subscription_set_on_new_message_callback(sub, nullptr, nullptr));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
 }
