@@ -207,6 +207,15 @@ struct UdsNode
   int32_t registry_index = -1;
 };
 
+// A matched subscriber cached on the publisher. `label` is a pre-formatted
+// human-readable identity (node + topic, see make_peer_label) used only in
+// diagnostic logs; built once per graph change so publish never formats it.
+struct CachedSubscriber
+{
+  std::string socket_path;
+  std::string label;
+};
+
 // Publisher data
 struct UdsPublisher
 {
@@ -221,14 +230,15 @@ struct UdsPublisher
   UdsContext * context = nullptr;
   UdsNode * node = nullptr;
 
-  // PERFORMANCE: cache the matching subscriber socket paths to avoid locking
-  // the registry on every publish. We re-query only when the registry's
-  // generation counter changes (graph topology actually changed).
+  // PERFORMANCE: cache the matching subscribers to avoid locking the registry
+  // on every publish. We re-query only when the registry's generation counter
+  // changes (graph topology actually changed).
   std::mutex sub_cache_mutex;
   uint64_t cached_generation = 0;
   // Copy-on-write: swapped wholesale on graph-generation change so the publish/
-  // wait hot path copies one refcount instead of N strings. Null until first refresh.
-  std::shared_ptr<const std::vector<std::string>> cached_subscriber_paths;
+  // wait hot path copies one refcount instead of N entries. Each entry carries
+  // its diagnostic label, built here (off the hot path). Null until first refresh.
+  std::shared_ptr<const std::vector<CachedSubscriber>> cached_subscribers;
 
   // TRANSIENT_LOCAL latched cache, pulled by late joiners themselves at
   // rmw_create_subscription (see shm_transport.hpp). cache_mutex serializes
