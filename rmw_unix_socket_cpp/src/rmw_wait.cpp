@@ -12,19 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "drain.hpp"
 #include "identifier.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
-#include "transport.hpp"
 #include "types.hpp"
 
 #include <algorithm>
-#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <limits>
-#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -42,81 +40,6 @@ static int64_t steady_now_ns()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::steady_clock::now().time_since_epoch()).count();
-}
-
-static int64_t wall_now_ns()
-{
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-    std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-// Drain a socket into a message queue (subscription, service, or client).
-// `shm_cache`/`domain_id` resolve large-payload descriptors: topic, request,
-// and response messages can all carry SHM_PAYLOAD_FLAG, so every caller passes
-// its own reader cache. If `ignore_local` is true, `context_id` is compared
-// against the sender context id embedded in WireHeader::gid and matching
-// same-context publications are dropped (subscriptions only; services/clients
-// leave ignore_local=false to disable the check).
-static void drain_socket(
-  int fd,
-  std::mutex & queue_mutex,
-  std::deque<rmw_uds::ReceivedMessage> & queue,
-  size_t max_depth,
-  uint8_t expected_msg_type,
-  rmw_uds::ShmReaderCache & shm_cache,
-  size_t domain_id,
-  bool ignore_local = false,
-  uint64_t context_id = 0,
-  std::map<std::array<uint8_t, 16>, int64_t> * replay_watermarks = nullptr)
-{
-  rmw_uds::WireHeader hdr;
-  std::vector<uint8_t> payload;
-
-  while (rmw_uds::recv_from(fd, hdr, payload)) {
-    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != expected_msg_type) {
-      payload.clear();
-      continue;
-    }
-    if (replay_watermarks) {
-      // TRANSIENT_LOCAL dedup (subscriptions only): drop a datagram whose
-      // sample the creation-time pull already delivered. Checked before the
-      // descriptor resolve so a duplicate never maps a segment.
-      std::array<uint8_t, 16> key;
-      std::memcpy(key.data(), hdr.gid, key.size());
-      bool dup = false;
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        auto it = replay_watermarks->find(key);
-        dup = it != replay_watermarks->end() &&
-          hdr.sequence_number <= it->second;
-      }
-      if (dup) {
-        payload.clear();
-        continue;
-      }
-    }
-    if (!rmw_uds::shm_resolve_incoming(shm_cache, domain_id, hdr, payload)) {
-      payload.clear();
-      continue;  // shm descriptor unresolvable (sender gone / ring lapped)
-    }
-    if (ignore_local && rmw_uds::is_same_context(hdr, context_id)) {
-      payload.clear();
-      continue;  // ignore_local_publications: drop same-context publications
-    }
-
-    rmw_uds::ReceivedMessage msg;
-    msg.header = hdr;
-    msg.payload = std::move(payload);
-    msg.received_timestamp_ns = wall_now_ns();
-
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex);
-      queue.push_back(std::move(msg));
-      while (queue.size() > max_depth) {
-        queue.pop_front();
-      }
-    }
-  }
 }
 
 extern "C"
@@ -387,22 +310,17 @@ rmw_ret_t rmw_wait(
     switch (ue.kind) {
       case rmw_uds::ARMED_SUBSCRIPTION: {
           auto * sub = static_cast<rmw_uds::UdsSubscription *>(ue.entity);
-          drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-            sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id,
-            sub->ignore_local_publications, sub->context->context_id,
-            &sub->replayed_watermarks);
+          rmw_uds::drain_endpoint(rmw_uds::drain_target(sub));
           break;
         }
       case rmw_uds::ARMED_SERVICE: {
           auto * srv = static_cast<rmw_uds::UdsService *>(ue.entity);
-          drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1,
-            srv->shm_cache, srv->context->domain_id);
+          rmw_uds::drain_endpoint(rmw_uds::drain_target(srv));
           break;
         }
       case rmw_uds::ARMED_CLIENT: {
           auto * cli = static_cast<rmw_uds::UdsClient *>(ue.entity);
-          drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2,
-            cli->shm_cache, cli->context->domain_id);
+          rmw_uds::drain_endpoint(rmw_uds::drain_target(cli));
           break;
         }
       default:
@@ -410,7 +328,7 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  // 3. Check if anything is already ready, without blocking. drain_socket()
+  // 3. Check if anything is already ready, without blocking. drain_endpoint()
   // reads until EAGAIN, so an earlier wait can leave more messages queued than
   // rmw_take has consumed since. Those are invisible to epoll (their socket is
   // already empty), so the internal queues must be checked directly. This is a
@@ -540,7 +458,7 @@ rmw_ret_t rmw_wait(
       }
       // Only actual progress ends the wait: an entity the caller waits on now
       // holds data, or a guard condition fired. A wake alone is not enough. A
-      // doorbell ring carries no caller work, and a datagram that drain_socket
+      // doorbell ring carries no caller work, and a datagram that drain_endpoint
       // filters out (an ignored local publication, a replayed-duplicate
       // TRANSIENT_LOCAL sample, a foreign message type, an unresolvable shm
       // descriptor) leaves the queue empty. Ending the wait on those would
@@ -570,10 +488,7 @@ rmw_ret_t rmw_wait(
         switch (entry.kind) {
           case rmw_uds::ARMED_SUBSCRIPTION: {
               auto * sub = static_cast<rmw_uds::UdsSubscription *>(entry.entity);
-              drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-                sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id,
-                sub->ignore_local_publications, sub->context->context_id,
-                &sub->replayed_watermarks);
+              rmw_uds::drain_endpoint(rmw_uds::drain_target(sub));
               std::lock_guard<std::mutex> lock(sub->queue_mutex);
               if (!sub->message_queue.empty()) {
                 progressed = true;
@@ -582,8 +497,7 @@ rmw_ret_t rmw_wait(
             }
           case rmw_uds::ARMED_SERVICE: {
               auto * srv = static_cast<rmw_uds::UdsService *>(entry.entity);
-              drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1,
-                srv->shm_cache, srv->context->domain_id);
+              rmw_uds::drain_endpoint(rmw_uds::drain_target(srv));
               std::lock_guard<std::mutex> lock(srv->queue_mutex);
               if (!srv->request_queue.empty()) {
                 progressed = true;
@@ -592,8 +506,7 @@ rmw_ret_t rmw_wait(
             }
           case rmw_uds::ARMED_CLIENT: {
               auto * cli = static_cast<rmw_uds::UdsClient *>(entry.entity);
-              drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2,
-                cli->shm_cache, cli->context->domain_id);
+              rmw_uds::drain_endpoint(rmw_uds::drain_target(cli));
               std::lock_guard<std::mutex> lock(cli->queue_mutex);
               if (!cli->response_queue.empty()) {
                 progressed = true;
