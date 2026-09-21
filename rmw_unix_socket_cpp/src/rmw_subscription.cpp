@@ -29,6 +29,7 @@
 #include "rmw/check_type_identifiers_match.h"
 #include "rmw/error_handling.h"
 #include "rmw/rmw.h"
+#include "tracetools/tracetools.h"
 
 static rmw_qos_profile_t resolve_qos(const rmw_qos_profile_t * qos)
 {
@@ -338,6 +339,7 @@ rmw_subscription_t * rmw_create_subscription(
     }
     rmw_uds::shm_reader_close(pull_cache);
   }
+  TRACETOOLS_TRACEPOINT(rmw_subscription_init, sub, sub_data->gid.data);
   return sub;
 }
 
@@ -420,6 +422,8 @@ rmw_ret_t rmw_take(
   }
 
   *taken = true;
+  TRACETOOLS_TRACEPOINT(
+    rmw_take, subscription, ros_message, msg.header.source_timestamp_ns, *taken);
   return RMW_RET_OK;
 }
 
@@ -485,6 +489,8 @@ rmw_ret_t rmw_take_with_info(
   message_info->from_intra_process = false;
 
   *taken = true;
+  TRACETOOLS_TRACEPOINT(
+    rmw_take, subscription, ros_message, msg.header.source_timestamp_ns, *taken);
   return RMW_RET_OK;
 }
 
@@ -547,6 +553,9 @@ rmw_ret_t rmw_take_sequence(
     info.publisher_gid.implementation_identifier = rmw_uds::identifier;
     info.from_intra_process = false;
 
+    TRACETOOLS_TRACEPOINT(
+      rmw_take, subscription, message_sequence->data[*taken],
+      msg.header.source_timestamp_ns, true);
     (*taken)++;
   }
 
@@ -587,6 +596,8 @@ rmw_ret_t rmw_take_serialized_message(
   serialized_message->buffer_length = msg.payload.size();
 
   *taken = true;
+  TRACETOOLS_TRACEPOINT(
+    rmw_take, subscription, serialized_message, msg.header.source_timestamp_ns, *taken);
   return RMW_RET_OK;
 }
 
@@ -634,6 +645,8 @@ rmw_ret_t rmw_take_serialized_message_with_info(
   message_info->from_intra_process = false;
 
   *taken = true;
+  TRACETOOLS_TRACEPOINT(
+    rmw_take, subscription, serialized_message, msg.header.source_timestamp_ns, *taken);
   return RMW_RET_OK;
 }
 
