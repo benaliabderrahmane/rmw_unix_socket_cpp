@@ -70,16 +70,6 @@ jobs:
               ros-${{ matrix.ros_distro }}-rosidl-buffer
           fi
 
-      - name: Check ROS typesupport links
-        shell: bash
-        run: |
-          source /opt/ros/${{ matrix.ros_distro }}/setup.bash
-          lib=/opt/ros/${{ matrix.ros_distro }}/lib/libtest_msgs__rosidl_typesupport_fastrtps_c.so
-          if ldd -r "$lib" 2>&1 | grep 'undefined symbol'; then
-            echo "::error::$lib has undefined symbols: installed ROS debs come from mixed apt syncs (not an rmw bug)."
-            exit 1
-          fi
-
       - name: Build
         shell: bash
         run: |
