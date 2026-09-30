@@ -36,6 +36,11 @@ jobs:
       - name: Resolve package dependencies
         shell: bash
         run: |
+          # The base image lags the ROS apt sync. Upgrade it first so every
+          # ROS package comes from the same sync; otherwise a fresh test_msgs
+          # lands on stale builtin_interfaces & co. and fails to link.
+          apt-get update
+          apt-get -y upgrade
           rosdep update --rosdistro=${{ matrix.ros_distro }}
           # rosdep's --from-paths defaults exclude test deps, so list types
           # explicitly. Without this, test_msgs/rosidl_typesupport_cpp/etc.
@@ -51,18 +56,10 @@ jobs:
           # Belt & suspenders: on Rolling, rosdep -r silently skips
           # test_msgs when its key drifts between syncs. Install the
           # test-only deps explicitly so find_package(test_msgs REQUIRED)
-          # in the BUILD_TESTING block always has what it needs. Also pull
-          # rosidl-runtime-cpp by name so apt upgrades it: the base image
-          # is months behind the rolling sync, and a stale rosidl-runtime-cpp
-          # is missing buffer__traits.hpp which the latest test_msgs headers
-          # reference.
-          # Likewise, test_msgs can require typesupport symbols newer than the
-          # builtin_interfaces library in the base image.
+          # in the BUILD_TESTING block always has what it needs.
           apt-get install -y --no-install-recommends \
             ros-${{ matrix.ros_distro }}-test-msgs \
-            ros-${{ matrix.ros_distro }}-builtin-interfaces \
-            ros-${{ matrix.ros_distro }}-rosidl-typesupport-cpp \
-            ros-${{ matrix.ros_distro }}-rosidl-runtime-cpp
+            ros-${{ matrix.ros_distro }}-rosidl-typesupport-cpp
           # rosidl_buffer was introduced after Jazzy/Kilted were branched and
           # test_msgs' exported imported targets reference it; Lyrical branched
           # from Rolling after it landed, so both ship it. CMake side:
