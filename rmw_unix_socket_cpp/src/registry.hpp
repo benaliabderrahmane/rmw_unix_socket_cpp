@@ -104,11 +104,12 @@ static_assert(offsetof(RegistryEntry, qos_depth) == 1160, "RegistryEntry layout 
 //   4. s2 = seq.load(acquire); if (s1 != s2) retry (bounded retries, then skip)
 //
 // Protocol (remove):
-//   1. CAS state <current> -> EMPTY      (claims removal; loses race => abort)
+//   1. CAS state <current> -> RESERVED   (claims removal; loses race => abort)
 //   2. seq.fetch_add(1)                  -> begin payload teardown
 //   3. unlink(socket_path); memset payload
 //   4. seq.fetch_add(1)                  -> end teardown
-//   5. generation.fetch_add(1)
+//   5. state.store(EMPTY, release)       -> only now can an adder claim the slot
+//   6. generation.fetch_add(1)
 //
 // All atomics are lock-free + address-free (std::atomic<u8/u32>::is_always_lock_free
 // is true on every Linux target we support), so they work across process

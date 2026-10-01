@@ -38,6 +38,7 @@
 #include <vector>
 
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../src/registry.hpp"
@@ -339,4 +340,78 @@ TEST_F(RegistryConcurrentTest, GenerationCounterMonotonicUnderChaos)
 
   EXPECT_EQ(0, regressions.load())
     << "generation counter regressed " << regressions.load() << " times";
+}
+
+// A stale-PID reap must never tear down an entry that a live process wrote into
+// the same slot after the reaper claimed it. Before the fix the reaper freed the
+// slot (state -> EMPTY) before zeroing it, so a concurrent add could take the
+// slot and have its payload wiped: the live entry vanished and a nameless
+// "ghost" stayed behind (seen as an empty service name in a 10-robot fleet).
+TEST_F(RegistryConcurrentTest, StaleReapNeverClobbersConcurrentAdd)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+
+  pid_t dead = fork();
+  ASSERT_GE(dead, 0);
+  if (dead == 0) {_exit(0);}
+  ASSERT_EQ(dead, waitpid(dead, nullptr, 0));  // reaped: /proc/<dead> is gone
+
+  std::atomic<bool> stop{false};
+  std::atomic<int> lost{0}, ghosts{0};
+
+  // Mimics a launch spawner that exits uncleanly: its entry keeps landing in
+  // the lowest free slot and a sweep keeps reaping it.
+  std::thread reaper([&]() {
+      while (!stop.load()) {
+        rmw_uds::RegistryEntry e;
+        std::memset(&e, 0, sizeof(e));
+        e.type = rmw_uds::ENTRY_SERVICE;
+        e.pid = dead;
+        std::snprintf(e.topic_name, sizeof(e.topic_name), "/dead_srv");
+        std::snprintf(e.type_name, sizeof(e.type_name), "T");
+        rmw_uds::registry_add(header, e);
+        rmw_uds::registry_cleanup_stale(header);
+      }
+    });
+
+  std::thread detector([&]() {
+      while (!stop.load()) {
+        for (auto & r : rmw_uds::registry_query(
+            header, rmw_uds::ENTRY_SERVICE, nullptr, nullptr, nullptr))
+        {
+          if (r.topic_name.empty()) {ghosts.fetch_add(1);}
+        }
+      }
+    });
+
+  std::vector<std::thread> writers;
+  for (int t = 0; t < 4; ++t) {
+    writers.emplace_back([&, t]() {
+        for (int k = 0; k < 5000; ++k) {
+          rmw_uds::RegistryEntry e;
+          std::memset(&e, 0, sizeof(e));
+          e.type = rmw_uds::ENTRY_SERVICE;
+          e.pid = getpid();
+          std::snprintf(e.topic_name, sizeof(e.topic_name), "/live_%d_%d", t, k);
+          std::snprintf(e.type_name, sizeof(e.type_name), "T");
+          int32_t idx = rmw_uds::registry_add(header, e);
+          ASSERT_GE(idx, 0);
+          // Give an in-flight reap of this slot time to finish its teardown.
+          std::this_thread::sleep_for(std::chrono::microseconds(50));
+          if (rmw_uds::registry_query(
+              header, rmw_uds::ENTRY_SERVICE, e.topic_name, nullptr, nullptr).size() != 1)
+          {
+            lost.fetch_add(1);
+          }
+          rmw_uds::registry_remove(header, idx);
+        }
+      });
+  }
+  for (auto & w : writers) {w.join();}
+  stop.store(true);
+  reaper.join();
+  detector.join();
+
+  EXPECT_EQ(0, lost.load()) << "live entries wiped by a concurrent stale reap";
+  EXPECT_EQ(0, ghosts.load()) << "nameless entries observed after a reap clobbered an add";
 }
