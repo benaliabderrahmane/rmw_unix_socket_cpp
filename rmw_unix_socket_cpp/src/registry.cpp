@@ -305,10 +305,11 @@ int32_t registry_add(RegistryHeader * header, const RegistryEntry & entry)
   return try_add_once(header, entry);
 }
 
-// Best-effort tear-down of a slot we already claimed (state already EMPTY).
-// Unlink the socket file and zero out the payload so the next reuse starts
-// from a clean state. Wrapped in a seqlock so any reader still in the middle
-// of a snapshot retries.
+// Best-effort tear-down of a slot we already claimed (state RESERVED). Unlink the
+// socket file and zero out the payload so the next reuse starts from a clean
+// state. Wrapped in a seqlock so any reader still in the middle of a snapshot
+// retries. The caller stores EMPTY only afterwards: freeing the slot first would
+// let a concurrent add claim it and have its fresh entry (and socket) wiped here.
 static void teardown_slot(RegistryEntrySlot * slot)
 {
   slot->seq.fetch_add(1, std::memory_order_acq_rel);
@@ -352,17 +353,19 @@ void registry_remove(RegistryHeader * header, int32_t index)
   auto * slot = &registry_slots(header)[index];
 
   uint8_t st = slot->state.load(std::memory_order_acquire);
-  if (st == ENTRY_EMPTY) {
-    return;
+  if (st == ENTRY_EMPTY || st == ENTRY_RESERVED) {
+    return;  // already free, or another thread is mid-add/mid-teardown
   }
-  // CAS state -> EMPTY. Winner owns the teardown.
+  // CAS state -> RESERVED. Winner owns the teardown; the slot stays unclaimable
+  // until the payload is zeroed.
   if (!slot->state.compare_exchange_strong(
-      st, static_cast<uint8_t>(ENTRY_EMPTY),
+      st, static_cast<uint8_t>(ENTRY_RESERVED),
       std::memory_order_acq_rel, std::memory_order_relaxed))
   {
     return;  // someone else removed it
   }
   teardown_slot(slot);
+  slot->state.store(static_cast<uint8_t>(ENTRY_EMPTY), std::memory_order_release);
   header->generation.fetch_add(1, std::memory_order_acq_rel);
   if (st != ENTRY_DOORBELL) {  // doorbell slots have no wake consumers
     ring_doorbells(header);    // strictly after the bump — see ring_doorbells
@@ -518,10 +521,11 @@ void registry_cleanup_stale(RegistryHeader * header)
       continue;  // slot was rewritten since snapshot — not the entry we vetted
     }
     // Try to claim the slot for removal. The CAS-expected value is the state
-    // we observed in the snapshot.
+    // we observed in the snapshot. RESERVED (not EMPTY) keeps adders out until
+    // teardown_slot has zeroed it; see teardown_slot.
     uint8_t expected = snap.state.load(std::memory_order_relaxed);
     if (!slots[i].state.compare_exchange_strong(
-        expected, static_cast<uint8_t>(ENTRY_EMPTY),
+        expected, static_cast<uint8_t>(ENTRY_RESERVED),
         std::memory_order_acq_rel, std::memory_order_relaxed))
     {
       continue;  // raced with another remover / writer
@@ -539,6 +543,7 @@ void registry_cleanup_stale(RegistryHeader * header)
       snap.topic_name[0] ? snap.topic_name : "(none)");
 
     teardown_slot(&slots[i]);
+    slots[i].state.store(static_cast<uint8_t>(ENTRY_EMPTY), std::memory_order_release);
     header->generation.fetch_add(1, std::memory_order_acq_rel);
     if (expected != static_cast<uint8_t>(ENTRY_DOORBELL)) {
       reclaimed = true;  // doorbell-only reclaims ring nobody
