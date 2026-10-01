@@ -176,26 +176,31 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rmw_node test/test_rmw_node.cpp)
   target_link_libraries(test_rmw_node ${_rmw_test_libs})
   target_include_directories(test_rmw_node PRIVATE src)
+  target_compile_definitions(test_rmw_node PRIVATE RMW_TEST_DOMAIN_ID=100)
 
   # RMW API: guard conditions
   ament_add_gtest(test_rmw_guard_condition test/test_rmw_guard_condition.cpp)
   target_link_libraries(test_rmw_guard_condition ${_rmw_test_libs})
   target_include_directories(test_rmw_guard_condition PRIVATE src)
+  target_compile_definitions(test_rmw_guard_condition PRIVATE RMW_TEST_DOMAIN_ID=101)
 
   # RMW API: publish/subscribe round-trip
   ament_add_gtest(test_rmw_pub_sub test/test_rmw_pub_sub.cpp)
   target_link_libraries(test_rmw_pub_sub ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_pub_sub PRIVATE src)
+  target_compile_definitions(test_rmw_pub_sub PRIVATE RMW_TEST_DOMAIN_ID=102)
 
   # RMW API: service/client round-trip
   ament_add_gtest(test_rmw_service_client test/test_rmw_service_client.cpp)
   target_link_libraries(test_rmw_service_client ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_service_client PRIVATE src)
+  target_compile_definitions(test_rmw_service_client PRIVATE RMW_TEST_DOMAIN_ID=103)
 
   # RMW API: wait set
   ament_add_gtest(test_rmw_wait test/test_rmw_wait.cpp)
   target_link_libraries(test_rmw_wait ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_wait PRIVATE src)
+  target_compile_definitions(test_rmw_wait PRIVATE RMW_TEST_DOMAIN_ID=104)
 
   # RMW API: graph introspection. registry.cpp is compiled in as well so the
   # test can seed the shared registry directly; the rmw library does not export
@@ -205,11 +210,13 @@ if(BUILD_TESTING)
   ament_add_gtest(test_rmw_graph test/test_rmw_graph.cpp src/registry.cpp)
   target_link_libraries(test_rmw_graph ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_graph PRIVATE src)
+  target_compile_definitions(test_rmw_graph PRIVATE RMW_TEST_DOMAIN_ID=105)
 
   # RMW API: QoS, TRANSIENT_LOCAL, multi-subscriber/client
   ament_add_gtest(test_rmw_qos test/test_rmw_qos.cpp)
   target_link_libraries(test_rmw_qos ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_qos PRIVATE src)
+  target_compile_definitions(test_rmw_qos PRIVATE RMW_TEST_DOMAIN_ID=106)
 
   # Integration: fork()-based two-process tests pushing >4 MB payloads across
   # a real PID boundary through the shared-memory path.
