@@ -11,7 +11,7 @@ Tests are organized in two tiers:
 1. **Unit tests** — test internal components (registry, serialization, transport) in isolation by compiling source files directly into the test binary. These bypass the shared library's hidden visibility.
 2. **RMW API tests** — test the public `rmw_*` C functions through the shared library, validating the full stack from API call to socket I/O.
 
-All tests use Google Test (gtest) via `ament_add_gtest`. Each test uses domain ID 98/99 to avoid collisions with a running ROS system.
+All tests use Google Test (gtest) via `ament_add_gtest`. RMW API test binaries use separate domain IDs to avoid interfering with parallel tests; unit tests that use shared resources also have private domain IDs.
 
 ---
 

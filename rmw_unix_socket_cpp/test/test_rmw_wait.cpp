@@ -309,7 +309,7 @@ TEST_F(RmwUdsNodeTest, LatchedTopicSurvivesAnUnresponsiveParticipant)
   rmw_init_options_t opts2 = rmw_get_zero_initialized_init_options();
   rcutils_allocator_t allocator = rcutils_get_default_allocator();
   ASSERT_EQ(RMW_RET_OK, rmw_init_options_init(&opts2, allocator));
-  opts2.domain_id = 99;  // same domain as the fixture
+  opts2.domain_id = domain_id;
   rmw_context_t ctx2 = rmw_get_zero_initialized_context();
   ASSERT_EQ(RMW_RET_OK, rmw_init(&opts2, &ctx2));  // never waits, never drains
 
