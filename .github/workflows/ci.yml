@@ -56,8 +56,11 @@ jobs:
           # is months behind the rolling sync, and a stale rosidl-runtime-cpp
           # is missing buffer__traits.hpp which the latest test_msgs headers
           # reference.
+          # Likewise, test_msgs can require typesupport symbols newer than the
+          # builtin_interfaces library in the base image.
           apt-get install -y --no-install-recommends \
             ros-${{ matrix.ros_distro }}-test-msgs \
+            ros-${{ matrix.ros_distro }}-builtin-interfaces \
             ros-${{ matrix.ros_distro }}-rosidl-typesupport-cpp \
             ros-${{ matrix.ros_distro }}-rosidl-runtime-cpp
           # rosidl_buffer was introduced after Jazzy/Kilted were branched and
