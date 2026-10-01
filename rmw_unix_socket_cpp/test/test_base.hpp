@@ -21,6 +21,10 @@
 #include "rmw/init.h"
 #include "rmw/init_options.h"
 
+#ifndef RMW_TEST_DOMAIN_ID
+#define RMW_TEST_DOMAIN_ID 99
+#endif
+
 // Use the identifier from the shared library, not our own copy.
 // Pointer comparison requires the same address.
 inline const char * uds_id() { return rmw_get_implementation_identifier(); }
@@ -33,7 +37,7 @@ protected:
   rmw_init_options_t options = rmw_get_zero_initialized_init_options();
   // Unique domain to avoid collisions with running ROS systems. A subclass
   // constructor may override it for tests that need a private registry.
-  size_t domain_id = 99;
+  size_t domain_id = RMW_TEST_DOMAIN_ID;
 
   void SetUp() override
   {
