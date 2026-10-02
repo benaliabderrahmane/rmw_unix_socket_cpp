@@ -266,14 +266,14 @@ struct UdsSubscription
   UdsContext * context = nullptr;
   UdsNode * node = nullptr;
   // rmw_subscription_options_t::ignore_local_publications, copied at creation
-  // time (used by drain_subscription()/drain_socket()).
+  // time (used by drain_endpoint()).
   bool ignore_local_publications = false;
   // TRANSIENT_LOCAL dedup: highest sequence number pulled from each latched
   // publisher's cache at creation, keyed by the FULL 16-byte GID (the trailing
   // context_id bytes are what distinguish a respawned publisher under a
   // recycled pid — anything less would blackhole its fresh samples). Frozen at
-  // pull time; the drains drop an inbound datagram whose (gid, seq) is at or
-  // below its watermark. Guarded by queue_mutex. One small entry per latched
+  // pull time; drain_endpoint() drops an inbound datagram whose (gid, seq) is
+  // at or below its watermark. Guarded by queue_mutex. One small entry per latched
   // publisher ever pulled — subscription-lifetime state, never pruned.
   std::map<std::array<uint8_t, 16>, int64_t> replayed_watermarks;
   // Callback support

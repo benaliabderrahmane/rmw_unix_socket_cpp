@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "drain.hpp"
 #include "identifier.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
@@ -56,84 +57,6 @@ static int64_t system_now_ns()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-// TRANSIENT_LOCAL dedup: true when this datagram's sample was already
-// delivered by the creation-time pull — the sender's GID has a watermark and
-// the sequence number is at or below it. Sequence numbers are assigned inside
-// the publisher's latch critical section and the pull never extends the
-// watermark across a scan-overlap gap, so anything <= the watermark was
-// either pulled or already lapped out of the publisher's ring at pull time —
-// history DDS would not owe a late joiner either.
-static bool is_replayed_duplicate(
-  rmw_uds::UdsSubscription * sub, const rmw_uds::WireHeader & hdr)
-{
-  std::array<uint8_t, 16> key;
-  std::memcpy(key.data(), hdr.gid, key.size());
-  std::lock_guard<std::mutex> lock(sub->queue_mutex);
-  auto it = sub->replayed_watermarks.find(key);
-  return it != sub->replayed_watermarks.end() &&
-         hdr.sequence_number <= it->second;
-}
-
-// Drain socket into message queue
-static void drain_subscription(rmw_uds::UdsSubscription * sub)
-{
-  rmw_uds::WireHeader hdr;
-  std::vector<uint8_t> payload;
-
-  while (rmw_uds::recv_from(sub->socket_fd, hdr, payload)) {
-    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 0) {continue;}  // Not a topic message
-
-    if (is_replayed_duplicate(sub, hdr)) {
-      continue;  // already delivered by the creation-time pull
-    }
-
-    if (!rmw_uds::shm_resolve_incoming(
-        sub->shm_cache, sub->context->domain_id, hdr, payload))
-    {
-      continue;  // shm descriptor unresolvable (publisher gone / ring lapped)
-    }
-
-    if (sub->ignore_local_publications &&
-      rmw_uds::is_same_context(hdr, sub->context->context_id))
-    {
-      continue;  // ignore_local_publications: drop same-context publications
-    }
-
-    rmw_uds::ReceivedMessage msg;
-    msg.header = hdr;
-    msg.payload = std::move(payload);
-    msg.received_timestamp_ns = system_now_ns();
-
-    bool overflow = false;
-    {
-      std::lock_guard<std::mutex> lock(sub->queue_mutex);
-      sub->message_queue.push_back(std::move(msg));
-      // Enforce queue depth — any pops here mean we're dropping messages
-      // the kernel already delivered to us because the take() side isn't
-      // keeping up. This is the rcl-layer equivalent of "slow subscriber".
-      while (sub->message_queue.size() > sub->queue_depth) {
-        sub->message_queue.pop_front();
-        overflow = true;
-      }
-    }
-    if (overflow) {
-      RMW_UDS_LOG_WARN_THROTTLE(
-        1000,
-        "subscription queue overflow on topic '%s' (depth=%zu) — "
-        "dropping oldest. Application is not calling take() fast enough.",
-        sub->topic_name.c_str(), sub->queue_depth);
-    }
-
-    // Trigger callback if set
-    {
-      std::lock_guard<std::mutex> lock(sub->callback_mutex);
-      if (sub->on_new_message_cb) {
-        sub->on_new_message_cb(sub->on_new_message_user_data, 1);
-      }
-    }
-  }
 }
 
 extern "C"
@@ -388,7 +311,7 @@ rmw_ret_t rmw_take(
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
 
   // Drain any pending messages
-  drain_subscription(sub_data);
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(sub_data));
 
   std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
   if (sub_data->message_queue.empty()) {
@@ -442,7 +365,7 @@ rmw_ret_t rmw_take_with_info(
   *taken = false;
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
 
-  drain_subscription(sub_data);
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(sub_data));
 
   std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
   if (sub_data->message_queue.empty()) {
@@ -508,7 +431,7 @@ rmw_ret_t rmw_take_sequence(
   *taken = 0;
 
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
-  drain_subscription(sub_data);
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(sub_data));
 
   std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
 
@@ -571,7 +494,7 @@ rmw_ret_t rmw_take_serialized_message(
 
   *taken = false;
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
-  drain_subscription(sub_data);
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(sub_data));
 
   std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
   if (sub_data->message_queue.empty()) {
@@ -608,7 +531,7 @@ rmw_ret_t rmw_take_serialized_message_with_info(
 
   *taken = false;
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
-  drain_subscription(sub_data);
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(sub_data));
 
   std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
   if (sub_data->message_queue.empty()) {
