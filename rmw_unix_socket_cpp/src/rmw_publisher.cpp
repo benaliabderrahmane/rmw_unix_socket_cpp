@@ -28,6 +28,7 @@
 #include "rmw/check_type_identifiers_match.h"
 #include "rmw/error_handling.h"
 #include "rmw/rmw.h"
+#include "tracetools/tracetools.h"
 
 static rmw_qos_profile_t resolve_qos(const rmw_qos_profile_t * qos)
 {
@@ -168,6 +169,7 @@ rmw_publisher_t * rmw_create_publisher(
   pub->options = publisher_options ? *publisher_options : rmw_get_default_publisher_options();
   pub->can_loan_messages = false;
 
+  TRACETOOLS_TRACEPOINT(rmw_publisher_init, pub, pub_data->gid.data);
   return pub;
 }
 
@@ -354,6 +356,7 @@ rmw_ret_t rmw_publish(
   std::memcpy(hdr.gid, pub_data->gid.data, sizeof(hdr.gid));
   hdr.source_timestamp_ns = system_now_ns();
   hdr.msg_type = 0;  // topic message
+  TRACETOOLS_TRACEPOINT(rmw_publish, publisher, ros_message, hdr.source_timestamp_ns);
 
   // TRANSIENT_LOCAL: latch into the pull cache, then fan out (ordering
   // documented at transient_local_publish). Serializes to a heap payload —
@@ -444,6 +447,7 @@ rmw_ret_t rmw_publish_serialized_message(
   hdr.source_timestamp_ns = system_now_ns();
   hdr.payload_size = static_cast<uint32_t>(serialized_message->buffer_length);
   hdr.msg_type = 0;
+  TRACETOOLS_TRACEPOINT(rmw_publish, publisher, serialized_message, hdr.source_timestamp_ns);
 
   // TRANSIENT_LOCAL: latch + fan out through the same pull-cache path as
   // rmw_publish, so a serialized latched payload (including one above the

@@ -15,6 +15,7 @@
   <depend>rcutils</depend>
   <depend>rcpputils</depend>
   <depend>rmw</depend>
+  <depend>tracetools</depend>
   <depend>rosidl_runtime_c</depend>
   <depend>fastcdr</depend>
   <depend>rosidl_typesupport_fastrtps_c</depend>
