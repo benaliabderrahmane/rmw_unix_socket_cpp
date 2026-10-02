@@ -130,6 +130,8 @@ Tests the epoll-based wait set.
 | `WaitWithGuardCondition` | Pre-triggered guard condition causes immediate return with `RMW_RET_OK` | Validates the "already ready" fast path — avoids unnecessary epoll_wait when data is already available. |
 | `WaitTimeoutWhenNoData` | Returns `RMW_RET_TIMEOUT` after specified duration, guard condition nulled out | Validates the timeout path. Without this, the executor would hang indefinitely when no messages arrive. |
 | `WaitWithSubscription` | Publish → wait on subscription → returns ready → take succeeds | End-to-end: message arrives on socket → epoll detects it → drain into queue → subscription marked ready → take succeeds. Tests the full executor wakeup path. |
+| `WaitKeepsSubMillisecondTimeoutResolution` | 0.3 ms and 1.7 ms waits return `RMW_RET_TIMEOUT` no earlier than the timeout and less than 0.5 ms after it | rcl passes the time to the next timer in nanoseconds. Rounding it to whole milliseconds made a 1.7 ms wait end after 1 ms (a false timeout) and a 0.3 ms wait take 1 ms. |
+| `OneKilohertzWaitLoopStaysOnSchedule` | A 1 kHz loop of deadline-based `rmw_wait` calls wakes within 0.5 ms of each period in at least 95 % of 500 periods | This is what an executor does for a 1 kHz timer. With millisecond rounding the loop slid behind schedule and rclcpp skipped periods. |
 
 ### test_rmw_graph.cpp
 

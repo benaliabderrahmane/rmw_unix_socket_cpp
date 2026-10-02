@@ -20,9 +20,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <limits>
 #include <map>
 #include <unordered_map>
@@ -48,6 +50,36 @@ static int64_t wall_now_ns()
 {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
     std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+// Block in epoll for up to `timeout_ns` nanoseconds; -1 blocks forever.
+// epoll_pwait2 (Linux 5.11, glibc 2.35) takes the timeout with nanosecond
+// resolution. epoll_wait only takes milliseconds, so it is the fallback where
+// epoll_pwait2 is missing: an older glibc at build time, or an older kernel
+// (ENOSYS) or a container seccomp profile that blocks it (EPERM) at run time.
+static int epoll_wait_ns(
+  int epfd, struct epoll_event * events, int max_events, int64_t timeout_ns)
+{
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 35))
+  static std::atomic<bool> pwait2_unavailable{false};
+  if (!pwait2_unavailable.load(std::memory_order_relaxed)) {
+    struct timespec ts;
+    ts.tv_sec = static_cast<time_t>(timeout_ns / 1000000000);
+    ts.tv_nsec = static_cast<decltype(ts.tv_nsec)>(timeout_ns % 1000000000);
+    int n = epoll_pwait2(epfd, events, max_events, timeout_ns < 0 ? nullptr : &ts, nullptr);
+    if (n >= 0 || (errno != ENOSYS && errno != EPERM)) {
+      return n;
+    }
+    pwait2_unavailable.store(true, std::memory_order_relaxed);
+  }
+#endif
+  // Round up so the fallback never returns before the caller's deadline.
+  int timeout_ms = -1;
+  if (timeout_ns >= 0) {
+    timeout_ms = static_cast<int>(std::min<int64_t>(
+      (timeout_ns + 999999) / 1000000, std::numeric_limits<int>::max()));
+  }
+  return epoll_wait(epfd, events, max_events, timeout_ms);
 }
 
 // Drain a socket into a message queue (subscription, service, or client).
@@ -470,19 +502,17 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  // Compute timeout. -1 means block forever (epoll_wait sentinel).
-  int timeout_ms = -1;
+  // Compute timeout in nanoseconds. -1 means block forever.
+  int64_t timeout_ns = -1;
   if (wait_timeout) {
     // Accumulate in int64_t; RMW_DURATION_INFINITE (~9.2e12 ms) overflows int.
     int64_t ms = static_cast<int64_t>(wait_timeout->sec) * 1000 +
       static_cast<int64_t>(wait_timeout->nsec) / 1000000;
     if (ms > std::numeric_limits<int>::max()) {
-      timeout_ms = -1;  // Infinite (or beyond epoll's range) -> block forever
+      timeout_ns = -1;  // Infinite (or beyond epoll's range) -> block forever
     } else {
-      timeout_ms = static_cast<int>(ms);
-      if (timeout_ms == 0 && wait_timeout->nsec > 0) {
-        timeout_ms = 1;  // At least 1ms
-      }
+      timeout_ns = static_cast<int64_t>(wait_timeout->sec) * 1000000000 +
+        static_cast<int64_t>(wait_timeout->nsec);
     }
   }
 
@@ -495,9 +525,9 @@ rmw_ret_t rmw_wait(
   // re-blocks. RMW_RET_TIMEOUT surfaces only at the caller's own deadline; an
   // infinite wait never surfaces a synthetic timeout. EINTR re-enters the
   // loop, so a signal neither returns TIMEOUT early nor busy-loops.
-  const bool infinite = (timeout_ms < 0);
+  const bool infinite = (timeout_ns < 0);
   const int64_t caller_deadline_ns =
-    infinite ? 0 : steady_now_ns() + static_cast<int64_t>(timeout_ms) * 1000000;
+    infinite ? 0 : steady_now_ns() + timeout_ns;
   // 4. Block on epoll, then drain only the fds it reported ready. This is what
   // keeps the wait O(ready) instead of O(entities in the wait set). When step 3
   // already found queued work we still make one non-blocking pass, so an entity
@@ -508,26 +538,24 @@ rmw_ret_t rmw_wait(
   {
     struct epoll_event ready_events[64];
     while (true) {
-      int block_ms = 0;
+      int64_t block_ns = 0;
       if (!poll_only) {
-        block_ms = -1;
+        block_ns = -1;
         if (!infinite) {
           const int64_t rem_ns = caller_deadline_ns - steady_now_ns();
-          const int64_t rem_ms = (rem_ns > 0) ? (rem_ns + 999999) / 1000000 : 0;  // ceil
-          block_ms = static_cast<int>(
-            std::min<int64_t>(rem_ms, std::numeric_limits<int>::max()));
+          block_ns = (rem_ns > 0) ? rem_ns : 0;
         }
         if ((graph_gc_unwired || !unarmed.empty()) &&
-          (block_ms < 0 || block_ms > 200))
+          (block_ns < 0 || block_ns > 200000000))
         {
           // No doorbell wiring (registry full), or an entity epoll cannot
           // watch: never block unbounded, or its event is silently lost
           // forever. The early return is a spurious wake (OK, nothing ready)
           // that lets the next rmw_wait retry registration / re-drain.
-          block_ms = 200;
+          block_ns = 200000000;  // 200 ms
         }
       }
-      int n = epoll_wait(ws_data->epoll_fd, ready_events, 64, block_ms);
+      int n = epoll_wait_ns(ws_data->epoll_fd, ready_events, 64, block_ns);
       if (n < 0) {
         if (errno == EINTR) {
           continue;
