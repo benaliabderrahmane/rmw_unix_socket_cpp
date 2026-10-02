@@ -511,8 +511,6 @@ rmw_ret_t rmw_wait(
     if (ms > std::numeric_limits<int>::max()) {
       timeout_ns = -1;  // Infinite (or beyond epoll's range) -> block forever
     } else {
-      // Keep the sub-millisecond part: rounding to whole milliseconds made a
-      // 1.7 ms wait return after 1 ms and a 0.3 ms wait take 1 ms.
       timeout_ns = static_cast<int64_t>(wait_timeout->sec) * 1000000000 +
         static_cast<int64_t>(wait_timeout->nsec);
     }
