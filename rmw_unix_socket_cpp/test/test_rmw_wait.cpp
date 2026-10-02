@@ -14,9 +14,11 @@
 
 #include "test_base.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -294,6 +296,87 @@ TEST_F(RmwUdsNodeTest, WaitBlocksForFullCallerTimeout)
   EXPECT_GE(elapsed_ms, 550) <<
     "rmw_wait returned TIMEOUT before the caller's 600 ms deadline";
   EXPECT_LE(elapsed_ms, 1500) << "rmw_wait overshot the deadline";
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_wait_set(ws);
+  auto _r2 [[maybe_unused]] = rmw_destroy_guard_condition(gc);
+}
+
+TEST_F(RmwUdsNodeTest, WaitKeepsSubMillisecondTimeoutResolution)
+{
+  // Scenario: rcl hands rmw_wait the time left until the next timer with
+  // nanosecond resolution. Rounding it to whole milliseconds makes a short
+  // wait return early (1.7 ms -> 1 ms, a false timeout) or late (0.3 ms ->
+  // 1 ms, a late timer). The wait must last at least the caller's timeout and
+  // must not be stretched to the next millisecond.
+  auto * gc = rmw_create_guard_condition(&context);
+  ASSERT_NE(nullptr, gc);
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+
+  for (const int64_t timeout_ns : {300000, 1700000}) {  // 0.3 ms and 1.7 ms
+    int64_t shortest_ns = std::numeric_limits<int64_t>::max();
+    for (int i = 0; i < 20; ++i) {
+      void * gc_array[1] = {gc->data};
+      rmw_guard_conditions_t gcs;
+      gcs.guard_conditions = gc_array;
+      gcs.guard_condition_count = 1;
+
+      rmw_time_t timeout{0, static_cast<uint64_t>(timeout_ns)};  // never triggered
+      auto t0 = std::chrono::steady_clock::now();
+      rmw_ret_t ret = rmw_wait(nullptr, &gcs, nullptr, nullptr, nullptr, ws, &timeout);
+      int64_t elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now() - t0).count();
+
+      EXPECT_EQ(RMW_RET_TIMEOUT, ret);
+      EXPECT_GE(elapsed_ns, timeout_ns) <<
+        "rmw_wait returned TIMEOUT before the caller's " << timeout_ns << " ns deadline";
+      shortest_ns = std::min(shortest_ns, elapsed_ns);
+    }
+    // The shortest of 20 waits is immune to an occasional preemption.
+    EXPECT_LT(shortest_ns, timeout_ns + 500000) <<
+      "a " << timeout_ns << " ns wait took at least " << shortest_ns << " ns";
+  }
+
+  auto _r1 [[maybe_unused]] = rmw_destroy_wait_set(ws);
+  auto _r2 [[maybe_unused]] = rmw_destroy_guard_condition(gc);
+}
+
+TEST_F(RmwUdsNodeTest, OneKilohertzWaitLoopStaysOnSchedule)
+{
+  // Scenario: an executor running a 1 kHz timer calls rmw_wait with whatever
+  // is left of the current 1 ms period. If that remainder is rounded up to a
+  // whole millisecond, each wake is late by the part of the period already
+  // spent, so the loop slides behind schedule and rclcpp skips periods.
+  auto * gc = rmw_create_guard_condition(&context);
+  ASSERT_NE(nullptr, gc);
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+
+  constexpr int kPeriods = 500;
+  constexpr int64_t kPeriodNs = 1000000;  // 1 kHz
+  auto now_ns = [] {
+      return std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    };
+
+  int late = 0;
+  int64_t next_ns = now_ns();
+  for (int i = 0; i < kPeriods; ++i) {
+    next_ns += kPeriodNs;
+    void * gc_array[1] = {gc->data};
+    rmw_guard_conditions_t gcs;
+    gcs.guard_conditions = gc_array;
+    gcs.guard_condition_count = 1;
+
+    const int64_t left_ns = std::max<int64_t>(0, next_ns - now_ns());
+    rmw_time_t timeout{0, static_cast<uint64_t>(left_ns)};  // never triggered
+    auto _r [[maybe_unused]] = rmw_wait(nullptr, &gcs, nullptr, nullptr, nullptr, ws, &timeout);
+    if (now_ns() - next_ns > kPeriodNs / 2) {
+      ++late;
+    }
+  }
+  EXPECT_LT(late, kPeriods / 20) <<
+    late << " of " << kPeriods << " periods woke more than 0.5 ms late";
 
   auto _r1 [[maybe_unused]] = rmw_destroy_wait_set(ws);
   auto _r2 [[maybe_unused]] = rmw_destroy_guard_condition(gc);
