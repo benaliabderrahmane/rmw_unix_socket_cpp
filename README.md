@@ -58,6 +58,7 @@ nodes that need to communicate must select the same RMW — there is no DDS brid
 | **Wait** | `epoll` over socket fds + `eventfd` guard conditions. **No background threads** — all I/O happens inside `rmw_wait`. |
 | **Serialization** | CDR via `fastcdr` + `rosidl_typesupport_fastrtps` (the same path as the DDS RMWs). |
 | **Stale cleanup** | Dead processes are detected via `/proc/<pid>`; their registry entries and socket files are reclaimed on init and on every discovery query. |
+| **Tracing** | Emits the standard `tracetools` rmw tracepoints (`rmw_publish`, `rmw_take`, `rmw_publisher_init`, `rmw_subscription_init`), so `ros2 trace`, Trace Compass and CARET follow a message across processes on this RMW exactly as they do on the DDS RMWs. |
 
 Every choice — including the ones that were tried and abandoned — is written up
 with rationale in **[DESIGN.md](rmw_unix_socket_cpp/DESIGN.md)**.

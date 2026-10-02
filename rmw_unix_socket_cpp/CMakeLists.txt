@@ -18,6 +18,7 @@ find_package(rosidl_runtime_c REQUIRED)
 find_package(fastcdr CONFIG REQUIRED)
 find_package(rosidl_typesupport_fastrtps_c REQUIRED)
 find_package(rosidl_typesupport_fastrtps_cpp REQUIRED)
+find_package(tracetools REQUIRED)
 
 # rmw_init_options_t::localhost_only was removed in Kilted (rmw >= 7.8).
 # Probe so we can keep setting it on older distros without breaking newer ones.
@@ -86,6 +87,7 @@ target_link_libraries(rmw_unix_socket_cpp PRIVATE
   fastcdr
   rosidl_typesupport_fastrtps_c::rosidl_typesupport_fastrtps_c
   rosidl_typesupport_fastrtps_cpp::rosidl_typesupport_fastrtps_cpp
+  tracetools::tracetools
   pthread
   rt
 )
