@@ -50,6 +50,12 @@ jobs:
       - name: Resolve package dependencies
         shell: bash
         run: |
+          # The base image lags the ROS apt sync. Upgrade it first so every
+          # ROS package comes from the same sync, as the CI workflow does
+          # since #80; otherwise a fresh test_msgs lands on stale
+          # builtin_interfaces & co. and fails to link.
+          apt-get update
+          apt-get -y upgrade
           rosdep update --rosdistro=jazzy
           # Mirrors the CI workflow: rosdep's --from-paths defaults exclude
           # test deps, and BUILD_TESTING=ON (colcon build default) fails to
@@ -63,8 +69,7 @@ jobs:
             --dependency-types=test
           apt-get install -y --no-install-recommends \
             ros-jazzy-test-msgs \
-            ros-jazzy-rosidl-typesupport-cpp \
-            ros-jazzy-rosidl-runtime-cpp
+            ros-jazzy-rosidl-typesupport-cpp
 
       - name: Report ASLR entropy for the sanitizer runtimes
         shell: bash
