@@ -277,7 +277,10 @@ struct UdsSubscription
   // publisher ever pulled — subscription-lifetime state, never pruned.
   std::map<std::array<uint8_t, 16>, int64_t> replayed_watermarks;
   // Callback support
-  std::mutex callback_mutex;
+  // Recursive: a callback that takes from its own endpoint re-enters
+  // drain_endpoint() on the thread already holding this, and a nested drain
+  // that gains a datagram notifies again.
+  std::recursive_mutex callback_mutex;
   rmw_event_callback_t on_new_message_cb = nullptr;
   const void * on_new_message_user_data = nullptr;
 
@@ -324,7 +327,7 @@ struct UdsService
   ShmReaderCache shm_cache;
 
   // Callback support
-  std::mutex callback_mutex;
+  std::recursive_mutex callback_mutex;
   rmw_event_callback_t on_new_request_cb = nullptr;
   const void * on_new_request_user_data = nullptr;
 };
@@ -362,7 +365,7 @@ struct UdsClient
   ShmReaderCache shm_cache;
 
   // Callback support
-  std::mutex callback_mutex;
+  std::recursive_mutex callback_mutex;
   rmw_event_callback_t on_new_response_cb = nullptr;
   const void * on_new_response_user_data = nullptr;
 };
