@@ -847,12 +847,14 @@ TEST_F(ListenerCallbackTest, DestroyingWaitSetsWhileTheListenerDeliversIsSafe)
     ASSERT_EQ(RMW_RET_OK, rmw_destroy_wait_set(churn)) << "round " << round;
   }
 
+  // The listener was the only thing draining, so this also confirms it kept
+  // running across the churn. Awaited with the publisher still running: under
+  // TSan the churn can end before the publisher thread has sent anything.
+  EXPECT_TRUE(await_events(counter));
+
   stop.store(true);
   publisher.join();
 
-  // The listener was the only thing draining, so this also confirms it kept
-  // running across the churn.
-  EXPECT_GT(counter.events.load(), 0u);
   EXPECT_FALSE(counter.saw_zero.load());
 
   auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);
