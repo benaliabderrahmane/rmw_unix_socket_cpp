@@ -184,6 +184,9 @@ rmw_ret_t listener_set_callback(
   UdsContext * ctx, const DrainTarget & t, uint8_t kind, void * entity,
   uint64_t uid, rmw_event_callback_t callback, const void * user_data)
 {
+  // rmw.h requires these setters to be thread-safe; see
+  // listener_registration_mutex for the race this closes.
+  std::lock_guard<std::recursive_mutex> registration(ctx->listener_registration_mutex);
   {
     std::lock_guard<std::recursive_mutex> lock(*t.callback_mutex);
     // Flush the backlog only when a callback is taking over from none. rclcpp

@@ -66,7 +66,8 @@ void listener_unwatch(UdsContext * ctx, int fd);
 // One implementation for all three endpoint kinds. The protocol is fiddly in
 // the same three ways every time (flush only on takeover, watch outside
 // callback_mutex, roll the callback back if the watch fails), and it was three
-// copies that had already drifted once.
+// copies that had already drifted once. Calls are serialized per context, so
+// concurrent set/clear on one endpoint leave its callback and watch agreeing.
 rmw_ret_t listener_set_callback(
   UdsContext * ctx, const DrainTarget & t, uint8_t kind, void * entity,
   uint64_t uid, rmw_event_callback_t callback, const void * user_data);
