@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "drain.hpp"
+#include "events.hpp"
 #include "identifier.hpp"
 #include "listener.hpp"
 #include "logging.hpp"
@@ -283,6 +284,9 @@ rmw_ret_t rmw_destroy_subscription(
     // listener_unwatch blocks until an in-flight drain of this subscription
     // has returned, so the delete below cannot race it.
     rmw_uds::listener_unwatch(sub_data->context, sub_data->socket_fd);
+    // Likewise for a listener recompute of its matched event; normally a
+    // no-op, since rmw_event_fini comes first.
+    rmw_uds::forget_graph_events(sub_data->context, sub_data);
     if (sub_data->context && sub_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(sub_data->context->registry_ptr);
       rmw_uds::registry_remove(header, sub_data->registry_index);

@@ -161,6 +161,29 @@ callbacks, and the listener thread that fires them without a wait.
 | `ConcurrentDrainsPreservePublisherOrder` | 1500 samples drained concurrently by the listener and an `rmw_take` loop, checked for sequence inversions | `drain_endpoint` `recv`s outside `queue_mutex` and pushes inside it, so two drains could interleave and break the per-publisher FIFO ordering ROS 2 guarantees. Reported "531 then 530" before the per-endpoint `drain_mutex`. The deep QoS depth ensures a gap means reordering, not overflow. |
 | `ACallbackMayTakeFromItsOwnEndpoint` | A callback that calls `rmw_take` on its own subscription completes, both from the setter's backlog flush and from a listener drain | `drain_endpoint` and the flush release `drain_mutex` and `queue_mutex` before they notify, which is what makes this legal. Holding either across the callback deadlocks the take one frame up, so this fails by wedging the binary rather than by an assertion. |
 
+### test_rmw_event.cpp
+
+Tests the QoS status events: which types are accepted or refused, the entry points' argument checks, and the behaviour of `message_lost` and both `matched` events.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `OnlyClockFreeEventTypesAreSupported` | `rmw_event_type_is_supported` is true for `message_lost` and both `matched` events, false for every other type | Iterates the whole enum, whose ordinals differ across distros. |
+| `SubscriptionEventInitAcceptsOnlyItsTypes` / `PublisherEventInitAcceptsOnlyPublicationMatched` | Supported types init and fini cleanly; every other type returns `RMW_RET_UNSUPPORTED` with an error message | `RMW_RET_UNSUPPORTED` is the one init failure `rclcpp` swallows; anything else crashes later, when the executor registers its callback. |
+| `RejectedEventInitLeavesTheHandleZeroInitialized` | A refused init leaves the handle untouched | A failed `EventHandler` construction must not leave rcl holding a handle that looks like ours. |
+| `EventInitRejectsForeignEndpoints` / `SetOnNewMessageCallbackRejectsForeignSubscription` / `EventInitRejectsNullArguments` / `TakeEventRejectsBadArguments` | Identifier and null-argument checks on every event entry point | Mixing RMWs, or a null handle, must fail with the documented code rather than dereference. |
+| `TakeEventWithNothingNewReportsZeroChanges` | A take with nothing new still succeeds and reports zero changes | Like the DDS RMWs: rcl turns `taken == false` into `RCL_RET_EVENT_TAKE_FAILED`, which rclcpp logs as an error, and a MultiThreadedExecutor can race two takes of one ready event. |
+| `EventFiniOfAnUninitializedHandleIsANoOp` | `rmw_event_fini` on a zero-initialized handle returns OK | rcl never makes this call, but fini must stay harmless for a handle no init filled in. |
+| `EventSetCallbackReportsUnsupportedWithAMessage` | A callback for a refused type fails with an error message | The original `EventsExecutor` crash read "error not set": a failure with no message behind it. |
+| `MatchedReportsThePeerAnEndpointIsCreatedInto` | Both matched events report the existing peer as a change once; the next take reports the same match with zero changes | DDS reports the matches an endpoint is created into; a second take must not repeat them as new. |
+| `PublicationMatchedTracksSubscriptionsJoiningAndLeaving` | A joining subscription moves `current_count` +1 and `total_count` +1; leaving moves `current_count` −1 and leaves `total_count`; other topics are ignored | `total_count` is cumulative and `current_count` is not; both must follow the registry. |
+| `MatchedEventWakesABlockedWait` | A wait holding only a publisher's matched event wakes when a subscriber appears | image_pipeline's lazy nodes block exactly like this until someone subscribes; the wait needs the doorbell. |
+| `MatchedCallbackFiresWithNoThreadInWait` | A matched callback fires for a new subscriber with no thread in `rmw_wait` | An `EventsExecutor` never waits: the listener thread must hear the registry change itself. |
+| `ReRegisteringAMatchedCallbackDoesNotRepayIt` | Setting the callback twice pays the unread change out once | `rclcpp` sets event callbacks twice in a row on purpose. |
+| `MessageLostCountsSequenceGaps` | The first message from a publisher sets the baseline; skipped sequence numbers count as lost, cumulatively | A gap in a publisher's numbering is what a dropped datagram leaves. |
+| `MessageLostIsReportedByTheWaitThatFoundIt` | A wait holding the subscription and its message_lost event reports the event from the drain that found the gap | rosbag2's recorder runs a waiting executor; before this, `ros2 bag record` exited at startup on jazzy. |
+| `MessageLostCallbackFiresFromTheListenerDrain` | With a message callback set, the listener's drain fires the message_lost callback | The `EventsExecutor` path: no thread waits or takes. |
+| `EventCallbackFiresOncePerUntakenBatch` | Two losses before a take fire one callback, the take collects both, and a loss after it fires again | The executor takes once per callback; a callback per change would leave takes with nothing new. |
+
 ### test_rmw_graph.cpp
 
 Tests graph introspection (discovery queries).
@@ -198,7 +221,8 @@ Tests QoS policies, TRANSIENT_LOCAL (latched), and multi-endpoint scenarios.
 | Content filtering | Not implemented. Returns `RMW_RET_UNSUPPORTED`. |
 | Cross-process tests | All tests run in a single process. Cross-process communication works via the same shared-memory registry and socket paths, but testing it requires launching separate processes (integration test territory). |
 | Deadline / lifespan QoS | Not enforced — these are timer-based policies that require background monitoring. The listener thread is event-driven, not timer-driven (socket readiness, never a clock), so it does not make them enforceable. Accepted as a known limitation for this lightweight implementation. |
-| QoS status events (`matched`, incompatible-QoS, incompatible-type, `message_lost`) | Not generated. `test_rmw_event.cpp` tests the refusal instead: `rmw_event_type_is_supported` returns `false` for every type and both `*_event_init` functions reject with `RMW_RET_UNSUPPORTED`, which `rclcpp` catches for the handlers it installs by default. |
+| Deadline, liveliness, incompatible-QoS and incompatible-type events | Not generated. `test_rmw_event.cpp` tests the refusal instead: `rmw_event_type_is_supported` returns `false` for them and both `*_event_init` functions reject with `RMW_RET_UNSUPPORTED`, which `rclcpp` catches for the handlers it installs by default. |
+| `message_lost` from a real kernel drop | `test_rmw_event.cpp` injects the sequence gap a drop leaves instead of making the kernel drop datagrams, which a test cannot do on demand. |
 | Stress / scale tests (200+ nodes) | Requires a launch file and process management. Can be tested with the `test200.launch.xml` launch file separately. |
 
 ---

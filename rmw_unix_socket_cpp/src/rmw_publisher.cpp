@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "events.hpp"
 #include "identifier.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
@@ -183,6 +184,9 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
 
   auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(publisher->data);
   if (pub_data) {
+    // Normally already gone (rmw_event_fini comes first); waits out a
+    // listener recompute of this publisher's matched event before the delete.
+    rmw_uds::forget_graph_events(pub_data->context, pub_data);
     if (pub_data->context && pub_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
       rmw_uds::registry_remove(header, pub_data->registry_index);

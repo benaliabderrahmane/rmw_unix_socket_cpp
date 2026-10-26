@@ -25,12 +25,14 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
+#include "rmw/event.h"
 #include "rmw/event_callback_type.h"
 #include "rmw/types.h"
 #include "rosidl_typesupport_fastrtps_cpp/message_type_support.h"
@@ -176,6 +178,39 @@ struct ArmedEntry
   uint64_t uid = 0;                   // 0 for the doorbell, which has no entity
 };
 
+// QoS status events (rmw_event.cpp; DESIGN.md, "QoS status events"). Each
+// state is guarded by its endpoint's event_mutex. *_change is what accumulated
+// since the last rmw_take_event, and `unread` counts the status changes
+// recorded since then: it makes a waited-on event ready, and an event callback
+// fires when it goes from 0 to 1 - one take credit per untaken batch.
+struct UdsEventCallback
+{
+  rmw_event_callback_t callback = nullptr;
+  const void * user_data = nullptr;
+};
+
+// matched: the GIDs on the other side of the topic at the last recompute,
+// which re-reads the registry only when its generation has moved.
+struct UdsMatchedState
+{
+  std::set<std::array<uint8_t, 16>> peers;
+  bool computed = false;
+  uint64_t generation = 0;
+  size_t total_count = 0;
+  size_t total_count_change = 0;
+  int32_t current_count_change = 0;
+  size_t unread = 0;
+  UdsEventCallback cb;
+};
+
+struct UdsMessageLostState
+{
+  size_t total_count = 0;
+  size_t total_count_change = 0;
+  size_t unread = 0;
+  UdsEventCallback cb;
+};
+
 // Per-context implementation data
 struct UdsContext
 {
@@ -271,6 +306,12 @@ struct UdsContext
   std::recursive_mutex listener_registration_mutex;
   std::unordered_map<int, ArmedEntry> listener_targets;
   std::vector<int> delivery_fds;
+  // Matched events with a callback registered, as (endpoint data, event type).
+  // The listener watches the doorbell while any exist and recomputes these on
+  // every ring, so an executor that never waits still hears graph changes.
+  // Guarded by listener_mutex; rmw_event_fini and the endpoint destroys remove
+  // their entries before the endpoint is freed.
+  std::vector<std::pair<void *, rmw_event_type_t>> graph_events;
 };
 
 // Node data
@@ -320,6 +361,10 @@ struct UdsPublisher
   // several threads publish on the same publisher.
   std::mutex shm_mutex;
   ShmRingWriter shm_ring;
+
+  // QoS status events. Recursive: an event callback may take its own event.
+  std::recursive_mutex event_mutex;
+  UdsMatchedState matched;
 };
 
 // Subscription data
@@ -370,6 +415,15 @@ struct UdsSubscription
   // Large payloads: mapped publisher rings this subscription reads from
   // (internally locked; see ShmReaderCache).
   ShmReaderCache shm_cache;
+
+  // QoS status events. Recursive: an event callback may take its own event.
+  std::recursive_mutex event_mutex;
+  UdsMatchedState matched;
+  UdsMessageLostState message_lost;
+  // message_lost: highest sequence number seen from each publisher GID.
+  // Guarded by drain_mutex - only drain_endpoint() touches it - and never
+  // pruned, like replayed_watermarks: one small entry per publisher ever heard.
+  std::map<std::array<uint8_t, 16>, int64_t> last_sequence;
 };
 
 // Cached client routing entry for service responses (path + GID)
