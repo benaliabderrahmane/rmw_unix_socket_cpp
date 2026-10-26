@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+The EventsExecutor release. `rclcpp`'s `EventsExecutor` — the default in
+`performance_test` and `ros2-benchmark-container` — crashed on every pub/sub
+topology, and fixing the crash only turned it into a silent hang: that executor
+never calls `rmw_wait`, and delivery happened exclusively inside `rmw_wait`, so
+nothing ever drained its sockets. Callback-driven delivery now works, and the
+four copies of the receive loop that hid the gap are one.
+
+### Added
+
+- **Listener thread for callback-driven delivery.** An endpoint that registers
+  a listener callback is watched by one per-context thread that drains its
+  socket and fires the callback with no application thread involved. It is
+  started **lazily**, by the first callback registration in the context, so an
+  executor that waits registers nothing and the process still starts no
+  background thread: `SingleThreadedExecutor` and `MultiThreadedExecutor`
+  still start none. Joined in `rmw_shutdown`.
+- **`delivery_fd`, so a watched endpoint can still sit in a wait set.** The
+  listener signals this eventfd strictly *after* enqueueing and `rmw_wait`
+  drains it strictly *before* scanning its queues, which is what stops a wait
+  from sleeping on a socket the listener already emptied. Same ordering pair as
+  the registry doorbell. **One per wait set**, created in
+  `rmw_create_wait_set`: reading an eventfd drains its whole counter, so a
+  single shared fd is a single credit that whichever wait set wakes first
+  consumes — including one that gained no work and discards it. Creating it
+  with the wait set also means a callback registered while a wait is already
+  blocked still has an armed fd to signal. Its cost when no callback is ever
+  registered: one eventfd per wait set, read once per `rmw_wait`.
+- **The listener holds up against the calls that race it.** A registration
+  that lands while `rmw_shutdown` runs cannot restart the thread (a
+  `listener_stopping` flag checked under `listener_mutex`); a failed watch
+  leaves no callback installed; thread exhaustion at start is returned as an
+  error instead of thrown through the C API; a per-endpoint `drain_mutex`,
+  held for the receive loop, keeps a publisher's messages in order when the
+  listener and an `rmw_wait`/`rmw_take` drain the same socket; and
+  `listener_registration_mutex` serialises concurrent set and clear calls on
+  one endpoint so its callback and its socket watch always agree.
+
+### Changed
+
+- **One socket drain instead of four.** `drain_endpoint` replaces
+  `drain_subscription`, `drain_socket`, and the inline copies in
+  `rmw_take_request` and `rmw_take_response`. Each copy had been deciding its
+  own policy, which is where the delivery gaps lived. `DrainTarget` now carries
+  that policy per endpoint.
+- **Listener callbacks report a batch count.** One notification per drain
+  carrying the number of entries the queue *gained*, rather than one call of
+  `1` per datagram. `rmw/event_callback_type.h` defines `number_of_events` as
+  the count since the callback was last called and allows `> 1`. The count is
+  growth rather than datagrams read, because it is a take credit: an overflow
+  that pushes 100 and pops 90 reports 10, not 100.
+- Request and response queues are capped at `SERVICE_QUEUE_DEPTH` (100)
+  wherever they are filled. `rmw_wait` always applied that bound; the take-path
+  drains had none.
+- `DESIGN.md` documents the listener thread and the `delivery_fd` ordering, and
+  narrows the no-background-threads claim to what it now guarantees.
+
 ### Fixed
 
 - **QoS status events are refused honestly.** `rmw_publisher_event_init` /
@@ -19,6 +75,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `rmw_subscription_set_on_new_message_callback` were also missing the
   `RMW_CHECK_TYPE_IDENTIFIERS_MATCH` (the service and client callback setters
   already had it).
+- **Services and clients were callback-dead after registration** (#61
+  follow-up). `on_new_request_cb` and `on_new_response_cb` were stored and
+  flushed once against an existing backlog, then never fired again by any drain.
+- **The `rmw_wait` drain notified nobody.** Only the `rmw_take` path fired a
+  subscription's `on_new_message` callback, so a callback registered by an
+  executor was silent for every message that arrived while a thread sat in
+  `rmw_wait`. It also trimmed to the QoS depth without reporting the overflow.
+- **A backlog was flushed twice per registration.** `rclcpp` calls the rmw
+  setter twice in a row on purpose — a stack temporary, then its permanent
+  storage — so the flush in the three `set_on_new_*_callback` functions paid the
+  same queued messages out for both calls, and a TRANSIENT_LOCAL subscription
+  with ten replayed samples handed the executor twenty events. It now flushes
+  only when a callback takes over from none.
 
 ## [0.5.0] - 2026-08-27
 
