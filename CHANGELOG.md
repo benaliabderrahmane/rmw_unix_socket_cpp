@@ -21,9 +21,8 @@ four copies of the receive loop that hid the gap are one.
   socket and fires the callback with no application thread involved. It is
   started **lazily**, by the first callback registration in the context, so an
   executor that waits registers nothing and the process still starts no
-  background thread — the zero-thread property holds for
-  `SingleThreadedExecutor` and `MultiThreadedExecutor` exactly as before.
-  Joined in `rmw_shutdown`.
+  background thread: `SingleThreadedExecutor` and `MultiThreadedExecutor`
+  still start none. Joined in `rmw_shutdown`.
 - **`delivery_fd`, so a watched endpoint can still sit in a wait set.** The
   listener signals this eventfd strictly *after* enqueueing and `rmw_wait`
   drains it strictly *before* scanning its queues, which is what stops a wait
@@ -33,7 +32,17 @@ four copies of the receive loop that hid the gap are one.
   single shared fd is a single credit that whichever wait set wakes first
   consumes — including one that gained no work and discards it. Creating it
   with the wait set also means a callback registered while a wait is already
-  blocked still has an armed fd to signal.
+  blocked still has an armed fd to signal. Its cost when no callback is ever
+  registered: one eventfd per wait set, read once per `rmw_wait`.
+- **The listener holds up against the calls that race it.** A registration
+  that lands while `rmw_shutdown` runs cannot restart the thread (a
+  `listener_stopping` flag checked under `listener_mutex`); a failed watch
+  leaves no callback installed; thread exhaustion at start is returned as an
+  error instead of thrown through the C API; a per-endpoint `drain_mutex`,
+  held for the receive loop, keeps a publisher's messages in order when the
+  listener and an `rmw_wait`/`rmw_take` drain the same socket; and
+  `listener_registration_mutex` serialises concurrent set and clear calls on
+  one endpoint so its callback and its socket watch always agree.
 
 ### Changed
 
@@ -66,20 +75,6 @@ four copies of the receive loop that hid the gap are one.
   `rmw_subscription_set_on_new_message_callback` were also missing the
   `RMW_CHECK_TYPE_IDENTIFIERS_MATCH` (the service and client callback setters
   already had it).
-- **Registering a callback while the context shut down could abort or hang.**
-  `listener_watch` read `is_shutdown` before taking `listener_mutex`, which
-  `listener_stop` must release in order to join. A registration landing in that
-  window restarted the listener: it move-assigned over a still-joinable
-  `std::thread` (`std::terminate`) and replaced the epoll and wake descriptors,
-  so the stop's wake-up went to an fd nobody polled and `rmw_shutdown` never
-  returned. Both are closed by a `listener_stopping` flag checked under the
-  mutex — `is_shutdown` alone does not cover it, because `rmw_context_fini`
-  reaches `listener_stop` without setting it.
-- **Concurrent drains of one endpoint could reorder a publisher's messages.**
-  `drain_endpoint` `recv`s outside `queue_mutex` and pushes inside it, so the
-  listener thread and an `rmw_wait`/`rmw_take` could interleave and break the
-  per-publisher FIFO ordering ROS 2 guarantees. A per-endpoint `drain_mutex`
-  held for the whole drain serialises them.
 - **Services and clients were callback-dead after registration** (#61
   follow-up). `on_new_request_cb` and `on_new_response_cb` were stored and
   flushed once against an existing backlog, then never fired again by any drain.
@@ -93,12 +88,6 @@ four copies of the receive loop that hid the gap are one.
   same queued messages out for both calls, and a TRANSIENT_LOCAL subscription
   with ten replayed samples handed the executor twenty events. It now flushes
   only when a callback takes over from none.
-- **The three callback setters left the callback installed after
-  `listener_watch` failed**, contradicting the error they returned. A failure
-  now means the callback is not set.
-- **`listener_start` could throw out of an `extern "C"` entry point.**
-  `std::thread` construction reports thread exhaustion as `std::system_error`;
-  it is now caught, and the running flag it had already set is cleared.
 
 ## [0.5.0] - 2026-08-27
 

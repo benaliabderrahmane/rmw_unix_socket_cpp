@@ -144,10 +144,12 @@ Localhost only; Linux only; no DDS interoperability. Loaned (zero-copy) messages
 dynamic message types, network flow endpoints, and content filtering return
 `RMW_RET_UNSUPPORTED`. `deadline`, `lifespan`, and `liveliness` QoS are accepted
 but not enforced, and no QoS status event (`matched`, incompatible-QoS,
-incompatible-type, `message_lost`) is generated — `rmw_event_type_is_supported`
-returns `false` for every type, so `rclcpp` refuses those event handlers rather
-than holding a dead one. The listener callbacks an `EventsExecutor` needs are
-supported. The full list and the reasoning behind each is in
+incompatible-type, `message_lost`) is generated: both `*_event_init` functions
+return `RMW_RET_UNSUPPORTED` for every type. `rclcpp` catches that for the
+handlers it installs by default (with a warning per handler on kilted and
+later), but on jazzy a handler the application registers itself throws — so
+`ros2 bag record`, which always asks for `message_lost`, exits at startup. The
+listener callbacks an `EventsExecutor` needs are supported. The full list and the reasoning behind each is in
 [DESIGN.md → Limitations and Unsupported Features](rmw_unix_socket_cpp/DESIGN.md#limitations-and-unsupported-features).
 
 ## Documentation
