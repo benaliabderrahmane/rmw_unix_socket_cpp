@@ -14,6 +14,7 @@
 
 #include "drain.hpp"
 
+#include "events.hpp"
 #include "logging.hpp"
 #include "shm_transport.hpp"
 #include "transport.hpp"
@@ -46,6 +47,8 @@ DrainTarget drain_target(UdsSubscription * sub)
   t.ignore_local = sub->ignore_local_publications;
   t.context_id = sub->context->context_id;
   t.replay_watermarks = &sub->replayed_watermarks;
+  t.last_sequence = &sub->last_sequence;
+  t.lost_sub = sub;
   t.callback_mutex = &sub->callback_mutex;
   t.callback = &sub->on_new_message_cb;
   t.callback_user_data = &sub->on_new_message_user_data;
@@ -93,6 +96,7 @@ size_t drain_endpoint(const DrainTarget & t)
 {
   size_t enqueued = 0;
   size_t dropped = 0;
+  size_t lost = 0;
 
   // Scoped to the receive loop only. It serialises drains of this endpoint:
   // recv_from() runs outside queue_mutex, so without it the listener thread
@@ -106,10 +110,37 @@ size_t drain_endpoint(const DrainTarget & t)
 
     WireHeader hdr;
     std::vector<uint8_t> payload;
+    std::array<uint8_t, 16> seen_key{};  // message_lost: last publisher looked up
+    int64_t * seen = nullptr;
 
     while (recv_from(t.fd, hdr, payload)) {
       if ((hdr.msg_type & ~SHM_PAYLOAD_FLAG) != t.msg_type) {
         continue;
+      }
+      if (t.last_sequence) {
+        // message_lost. A publisher numbers each publish once, for every
+        // subscriber, so a jump in its sequence is datagrams that never
+        // arrived here (the kernel dropped them, or the sender did on a full
+        // socket). Checked before the filters below, which drop on purpose.
+        // The first datagram from a publisher only sets the baseline.
+        std::array<uint8_t, 16> key;
+        std::memcpy(key.data(), hdr.gid, key.size());
+        const int64_t seq = hdr.sequence_number;  // packed: no reference to it
+        // A drain usually carries one publisher's datagrams back to back, so
+        // the map is searched once per publisher per drain, not per datagram.
+        // std::map entries never move, so the pointer stays valid.
+        if (!seen || key != seen_key) {
+          auto it = t.last_sequence->find(key);
+          if (it == t.last_sequence->end()) {
+            it = t.last_sequence->emplace(key, seq - 1).first;  // baseline: no gap
+          }
+          seen_key = key;
+          seen = &it->second;
+        }
+        if (seq > *seen) {
+          lost += static_cast<size_t>(seq - *seen - 1);
+          *seen = seq;
+        }
       }
       if (t.replay_watermarks) {
         // TRANSIENT_LOCAL dedup: drop this datagram when its sample was already
@@ -141,7 +172,10 @@ size_t drain_endpoint(const DrainTarget & t)
         continue;  // ignore_local_publications: drop same-context publications
       }
       if (!shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload)) {
-        continue;  // shm descriptor unresolvable (sender gone / ring lapped)
+        // shm descriptor unresolvable (sender gone / ring lapped): the
+        // datagram arrived but the message is gone, so it counts as lost.
+        lost += t.last_sequence ? 1 : 0;
+        continue;
       }
 
       ReceivedMessage msg;
@@ -172,6 +206,11 @@ size_t drain_endpoint(const DrainTarget & t)
       }
       ++enqueued;
     }
+  }
+
+  // With drain_mutex released, like the notification below.
+  if (lost > 0 && t.lost_sub) {
+    record_message_lost(t.lost_sub, lost);
   }
 
   // One notification for the whole batch. rmw_event_callback_t takes the

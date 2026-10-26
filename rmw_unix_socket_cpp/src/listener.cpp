@@ -15,6 +15,7 @@
 #include "listener.hpp"
 
 #include "drain.hpp"
+#include "events.hpp"
 #include "logging.hpp"
 
 #include "rmw/error_handling.h"
@@ -26,6 +27,7 @@
 #include <system_error>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace rmw_uds
@@ -99,6 +101,19 @@ static void listener_loop(UdsContext * ctx)
           enqueued = drain_endpoint(
             drain_target(static_cast<UdsClient *>(entry.entity)));
           break;
+        case ARMED_DOORBELL: {
+            // Watched while matched callbacks exist: a registry mutation
+            // somewhere. Drain the ring, then recompute those events. The
+            // rmw_waits share this socket, so the delivery_fds below are
+            // signalled even when nothing here changed: a wait whose ring this
+            // consumed re-reads the generation on that wake.
+            uint8_t buf[16];
+            while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
+            }
+            notify_graph_events(ctx);
+            enqueued = 1;
+            break;
+          }
         default:
           break;
       }
