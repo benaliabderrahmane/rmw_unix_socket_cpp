@@ -49,10 +49,13 @@ enum RegistryEntryType : uint8_t
   // the registry. Additive: no slot layout change, and type-filtered queries
   // never match it, so it is invisible to graph introspection.
   ENTRY_DOORBELL,
-  // Transient claim state: a writer won the slot but has not yet committed its
-  // payload. Readers treat it like ENTRY_EMPTY so they never observe a slot
-  // before its payload is published. Never stored in a RegistryEntry; lives
-  // only in the slot's atomic state field, so it costs no struct layout.
+  // Transient claim state: someone owns the slot but its payload is not in a
+  // publishable state — either an adder has not yet committed its payload, or
+  // a remover has not yet finished erasing it. Readers treat it like
+  // ENTRY_EMPTY, and try_add_once only ever claims from ENTRY_EMPTY, so a slot
+  // parked here is neither observable nor reusable. Never stored in a
+  // RegistryEntry; lives only in the slot's atomic state field, so it costs no
+  // struct layout.
   ENTRY_RESERVED = 0xFF,
 };
 
@@ -92,7 +95,8 @@ static_assert(offsetof(RegistryEntry, qos_depth) == 1160, "RegistryEntry layout 
 // Protocol (writer):
 //   1. CAS state EMPTY -> RESERVED       (claims the slot; readers treat as EMPTY)
 //   2. seq.fetch_add(1, acq_rel)         -> seq becomes odd (write in progress)
-//   3. memcpy payload fields
+//      atomic_thread_fence(release)      -> payload stores stay after the odd seq
+//   3. relaxed atomic stores of the payload fields (shm_store_relaxed)
 //   4. seq.fetch_add(1, acq_rel)         -> seq becomes even (snapshot stable)
 //   5. state.store(target_type, release) -> publishes the committed payload
 //   6. generation.fetch_add(1, acq_rel)  -> wakes cached readers
@@ -100,16 +104,28 @@ static_assert(offsetof(RegistryEntry, qos_depth) == 1160, "RegistryEntry layout 
 // Protocol (reader):
 //   1. s1 = seq.load(acquire); if (s1 & 1) skip slot (writer in progress)
 //   2. st = state.load(acquire); if (st == EMPTY) skip
-//   3. memcpy payload into local snapshot
+//   3. relaxed atomic loads of the payload into a local snapshot (shm_load_relaxed)
+//      atomic_thread_fence(acquire)      -> pairs with the writer's release fence
 //   4. s2 = seq.load(acquire); if (s1 != s2) retry (bounded retries, then skip)
+//
+// The payload accesses in steps 3 must be atomic: a plain memcpy racing a
+// writer is a data race, undefined behaviour even though step 4 discards the
+// torn copy. Relaxed is enough; the fences and seq give the ordering.
 //
 // Protocol (remove):
 //   1. CAS state <current> -> RESERVED   (claims removal; loses race => abort)
 //   2. seq.fetch_add(1)                  -> begin payload teardown
-//   3. unlink(socket_path); memset payload
+//   3. copy out socket_path; zero the payload with relaxed atomic stores
 //   4. seq.fetch_add(1)                  -> end teardown
-//   5. state.store(EMPTY, release)       -> only now can an adder claim the slot
+//   5. state.store(EMPTY, release)       -> only now is the slot reusable
 //   6. generation.fetch_add(1)
+//   7. unlink(socket_path)               -> syscall, deliberately after step 5
+//
+// Step 5 must follow the teardown, not replace step 1: a slot published as
+// EMPTY while its payload is still being erased can be claimed by a concurrent
+// add, whose fresh payload the teardown then zeroes and whose live socket it
+// unlinks — leaving a slot with a valid type but an empty node_name that
+// cleanup_stale can never reclaim (it skips pid == 0).
 //
 // All atomics are lock-free + address-free (std::atomic<u8/u32>::is_always_lock_free
 // is true on every Linux target we support), so they work across process
