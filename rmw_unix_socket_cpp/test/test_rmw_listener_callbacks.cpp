@@ -891,10 +891,17 @@ TEST_F(ListenerCallbackTest, DestroyingWaitSetsWhileTheListenerDeliversIsSafe)
 {
   auto * ts = rosidl_typesupport_cpp::get_message_type_support_handle<
     test_msgs::msg::BasicTypes>();
+
+  // Nothing takes here, and a callback reports queue growth: at qos.depth (10)
+  // the queue stops growing and the callback stops firing. Deep enough that
+  // events keep arriving for the whole churn.
+  rmw_qos_profile_t deep = qos;
+  deep.depth = 5000;
+
   auto pub_opts = rmw_get_default_publisher_options();
-  auto * pub = rmw_create_publisher(node, ts, "/listener_wschurn", &qos, &pub_opts);
+  auto * pub = rmw_create_publisher(node, ts, "/listener_wschurn", &deep, &pub_opts);
   auto sub_opts = rmw_get_default_subscription_options();
-  auto * sub = rmw_create_subscription(node, ts, "/listener_wschurn", &qos, &sub_opts);
+  auto * sub = rmw_create_subscription(node, ts, "/listener_wschurn", &deep, &sub_opts);
   ASSERT_NE(nullptr, pub);
   ASSERT_NE(nullptr, sub);
 
@@ -913,18 +920,46 @@ TEST_F(ListenerCallbackTest, DestroyingWaitSetsWhileTheListenerDeliversIsSafe)
       }
     });
 
-  for (int round = 0; round < 200; ++round) {
+  // An ASSERT below returns early; a joinable std::thread destroyed on that
+  // path calls std::terminate, so stop and join it on every exit.
+  struct StopAndJoin
+  {
+    std::atomic<bool> & stop;
+    std::thread & thread;
+    ~StopAndJoin()
+    {
+      stop.store(true);
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  } stop_and_join{stop, publisher};
+
+  // Churn only once the listener is delivering. Under TSan 200 rounds can end
+  // before the publisher thread sends anything, and then deregistration never
+  // races the listener's writes to the delivery-fd list.
+  ASSERT_TRUE(await_events(counter)) << "no delivery before the churn";
+
+  // Keep churning until the listener has delivered during the churn itself.
+  // It is the only thing draining, so this also shows it kept running.
+  const size_t before = counter.events.load();
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  int round = 0;
+  while (round < 200 ||
+    (counter.events.load() < before + 5 && std::chrono::steady_clock::now() < deadline))
+  {
     rmw_wait_set_t * churn = rmw_create_wait_set(&context, 1);
     ASSERT_NE(nullptr, churn) << "round " << round;
     ASSERT_EQ(RMW_RET_OK, rmw_destroy_wait_set(churn)) << "round " << round;
+    ++round;
   }
+  EXPECT_GE(counter.events.load(), before + 5)
+    << "delivery stalled during the churn (" << round << " rounds)";
 
+  // Before the destroys below: the publisher thread uses pub.
   stop.store(true);
   publisher.join();
 
-  // The listener was the only thing draining, so this also confirms it kept
-  // running across the churn.
-  EXPECT_GT(counter.events.load(), 0u);
   EXPECT_FALSE(counter.saw_zero.load());
 
   auto _s [[maybe_unused]] = rmw_destroy_subscription(node, sub);

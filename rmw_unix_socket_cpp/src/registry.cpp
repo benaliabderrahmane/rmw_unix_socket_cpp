@@ -52,6 +52,110 @@ static_assert(
 // spin readers forever.
 static constexpr int MAX_READ_RETRIES = 16;
 
+// A seqlock reader copies a slot's payload while a writer may be storing it.
+// With plain memcpy on both sides that overlap is a data race - undefined
+// behaviour, even though the seq re-check discards a torn copy - so every
+// access to a published slot's payload goes through these relaxed atomic
+// copies, word by word where aligned. The seq counter and the fences around
+// these calls give the ordering (Boehm, "Can seqlocks get along with
+// programming language memory models?", MSPC 2012). C++17 has no atomic_ref,
+// hence the builtins; may_alias lets them read the char arrays as words.
+using ShmWord = uint64_t __attribute__((may_alias));
+static_assert(__atomic_always_lock_free(sizeof(ShmWord), 0), "registry needs lock-free words");
+
+static void shm_load_relaxed(void * dst, const void * shared, size_t n)
+{
+  auto * d = static_cast<unsigned char *>(dst);
+  auto * s = static_cast<const unsigned char *>(shared);
+  for (; n > 0 && reinterpret_cast<uintptr_t>(s) % sizeof(ShmWord) != 0; --n) {
+    *d++ = __atomic_load_n(s++, __ATOMIC_RELAXED);
+  }
+  for (; n >= sizeof(ShmWord); n -= sizeof(ShmWord), s += sizeof(ShmWord), d += sizeof(ShmWord)) {
+    const ShmWord w = __atomic_load_n(reinterpret_cast<const ShmWord *>(s), __ATOMIC_RELAXED);
+    std::memcpy(d, &w, sizeof(w));
+  }
+  for (; n > 0; --n) {
+    *d++ = __atomic_load_n(s++, __ATOMIC_RELAXED);
+  }
+}
+
+// Copy a NUL-padded string field and stop after the word that holds its
+// terminator. Registry names are a few dozen bytes in 108- to 256-byte fields,
+// so a snapshot reads a few words per name instead of all of them. dst past the
+// terminator is left as it was: every reader of a snapshot uses these fields as
+// C strings. A torn copy can miss the terminator: n bounds it, and the seq
+// re-check rejects it like any other torn copy.
+static void shm_load_cstr_relaxed(char * dst, const char * shared, size_t n)
+{
+  size_t i = 0;
+  bool done = false;
+  for (; !done && i < n && reinterpret_cast<uintptr_t>(shared + i) % sizeof(ShmWord) != 0; ++i) {
+    dst[i] = __atomic_load_n(shared + i, __ATOMIC_RELAXED);
+    done = dst[i] == '\0';
+  }
+  for (; !done && i + sizeof(ShmWord) <= n; i += sizeof(ShmWord)) {
+    const ShmWord w =
+      __atomic_load_n(reinterpret_cast<const ShmWord *>(shared + i), __ATOMIC_RELAXED);
+    std::memcpy(dst + i, &w, sizeof(w));
+    done = ((w - 0x0101010101010101ull) & ~w & 0x8080808080808080ull) != 0;  // has a zero byte
+  }
+  for (; !done && i < n; ++i) {
+    dst[i] = __atomic_load_n(shared + i, __ATOMIC_RELAXED);
+    done = dst[i] == '\0';
+  }
+}
+
+// The payload (pid .. qos_depth) is one contiguous span, laid out identically
+// in a slot and in a RegistryEntry, so it is copied in a single call: aligned
+// words end to end, with no per-field head and tail.
+static constexpr size_t PAYLOAD_SIZE =
+  sizeof(RegistryEntrySlot) - offsetof(RegistryEntrySlot, pid);
+static_assert(
+  PAYLOAD_SIZE == sizeof(RegistryEntry) - offsetof(RegistryEntry, pid),
+  "slot and entry payload sizes differ");
+static_assert(
+  offsetof(RegistryEntrySlot, pid) % sizeof(ShmWord) == 0 &&
+  sizeof(RegistryEntrySlot) % sizeof(ShmWord) == 0,
+  "slot payloads must start on a word boundary in the slot array");
+#define RMW_UDS_SAME_PAYLOAD_OFFSET(f) \
+  static_assert( \
+    offsetof(RegistryEntrySlot, f) - offsetof(RegistryEntrySlot, pid) == \
+    offsetof(RegistryEntry, f) - offsetof(RegistryEntry, pid), \
+    "slot and entry payloads diverge at " #f)
+RMW_UDS_SAME_PAYLOAD_OFFSET(gid);
+RMW_UDS_SAME_PAYLOAD_OFFSET(node_name);
+RMW_UDS_SAME_PAYLOAD_OFFSET(node_namespace);
+RMW_UDS_SAME_PAYLOAD_OFFSET(topic_name);
+RMW_UDS_SAME_PAYLOAD_OFFSET(type_name);
+RMW_UDS_SAME_PAYLOAD_OFFSET(socket_path);
+RMW_UDS_SAME_PAYLOAD_OFFSET(qos_reliability);
+RMW_UDS_SAME_PAYLOAD_OFFSET(qos_durability);
+RMW_UDS_SAME_PAYLOAD_OFFSET(qos_history);
+RMW_UDS_SAME_PAYLOAD_OFFSET(qos_depth);
+#undef RMW_UDS_SAME_PAYLOAD_OFFSET
+
+// src == nullptr stores zeros.
+static void shm_store_relaxed(void * shared, const void * src, size_t n)
+{
+  auto * d = static_cast<unsigned char *>(shared);
+  auto * s = static_cast<const unsigned char *>(src);
+  auto next_byte = [&s]() -> unsigned char {return s ? *s++ : 0;};
+  for (; n > 0 && reinterpret_cast<uintptr_t>(d) % sizeof(ShmWord) != 0; --n) {
+    __atomic_store_n(d++, next_byte(), __ATOMIC_RELAXED);
+  }
+  for (; n >= sizeof(ShmWord); n -= sizeof(ShmWord), d += sizeof(ShmWord)) {
+    ShmWord w = 0;
+    if (s) {
+      std::memcpy(&w, s, sizeof(w));
+      s += sizeof(w);
+    }
+    __atomic_store_n(reinterpret_cast<ShmWord *>(d), w, __ATOMIC_RELAXED);
+  }
+  for (; n > 0; --n) {
+    __atomic_store_n(d++, next_byte(), __ATOMIC_RELAXED);
+  }
+}
+
 static size_t compute_registry_size()
 {
   return sizeof(RegistryHeader) + REGISTRY_MAX_ENTRIES * sizeof(RegistryEntrySlot);
@@ -198,21 +302,24 @@ static bool snapshot_slot(RegistryEntrySlot * slot, RegistryEntrySlot * out, uin
       return false;
     }
 
-    // Read payload into the output buffer. The non-atomic fields can race
-    // with a concurrent writer; the seq re-read below detects torn snapshots.
+    // Read payload into the output buffer. A concurrent writer can tear the
+    // copy; the seq re-read below detects that. The copies are atomic so the
+    // overlap is not a data race (see shm_load_relaxed).
     out->state.store(st, std::memory_order_relaxed);
-    out->pid = slot->pid;
-    std::memcpy(out->gid, slot->gid, sizeof(out->gid));
-    std::memcpy(out->node_name, slot->node_name, sizeof(out->node_name));
-    std::memcpy(out->node_namespace, slot->node_namespace, sizeof(out->node_namespace));
-    std::memcpy(out->topic_name, slot->topic_name, sizeof(out->topic_name));
-    std::memcpy(out->type_name, slot->type_name, sizeof(out->type_name));
-    std::memcpy(out->socket_path, slot->socket_path, sizeof(out->socket_path));
-    out->qos_reliability = slot->qos_reliability;
-    out->qos_durability = slot->qos_durability;
-    out->qos_history = slot->qos_history;
-    out->qos_depth = slot->qos_depth;
+    shm_load_relaxed(
+      &out->pid, &slot->pid, offsetof(RegistryEntrySlot, node_name) - offsetof(RegistryEntrySlot, pid));
+    shm_load_cstr_relaxed(out->node_name, slot->node_name, sizeof(out->node_name));
+    shm_load_cstr_relaxed(out->node_namespace, slot->node_namespace, sizeof(out->node_namespace));
+    shm_load_cstr_relaxed(out->topic_name, slot->topic_name, sizeof(out->topic_name));
+    shm_load_cstr_relaxed(out->type_name, slot->type_name, sizeof(out->type_name));
+    shm_load_cstr_relaxed(out->socket_path, slot->socket_path, sizeof(out->socket_path));
+    shm_load_relaxed(
+      &out->qos_reliability, &slot->qos_reliability,
+      sizeof(RegistryEntrySlot) - offsetof(RegistryEntrySlot, qos_reliability));
 
+    // Pairs with the writer's release fence: if any load above saw a byte the
+    // writer stored, the re-read below sees its odd seq and the copy retries.
+    std::atomic_thread_fence(std::memory_order_acquire);
     uint32_t s2 = slot->seq.load(std::memory_order_acquire);
     if (s1 == s2) {
       if (out_seq) {
@@ -229,20 +336,12 @@ static bool snapshot_slot(RegistryEntrySlot * slot, RegistryEntrySlot * out, uin
 // (via successful CAS on state).
 static void write_slot_payload(RegistryEntrySlot * slot, const RegistryEntry & entry)
 {
-  // Begin write: seq -> odd.
+  // Begin write: seq -> odd. The release fence keeps the payload stores
+  // below from becoming visible to a reader before the odd seq does.
   slot->seq.fetch_add(1, std::memory_order_acq_rel);
+  std::atomic_thread_fence(std::memory_order_release);
 
-  slot->pid = entry.pid;
-  std::memcpy(slot->gid, entry.gid, sizeof(slot->gid));
-  std::memcpy(slot->node_name, entry.node_name, sizeof(slot->node_name));
-  std::memcpy(slot->node_namespace, entry.node_namespace, sizeof(slot->node_namespace));
-  std::memcpy(slot->topic_name, entry.topic_name, sizeof(slot->topic_name));
-  std::memcpy(slot->type_name, entry.type_name, sizeof(slot->type_name));
-  std::memcpy(slot->socket_path, entry.socket_path, sizeof(slot->socket_path));
-  slot->qos_reliability = entry.qos_reliability;
-  slot->qos_durability = entry.qos_durability;
-  slot->qos_history = entry.qos_history;
-  slot->qos_depth = entry.qos_depth;
+  shm_store_relaxed(&slot->pid, &entry.pid, PAYLOAD_SIZE);
 
   // End write: seq -> even.
   slot->seq.fetch_add(1, std::memory_order_acq_rel);
@@ -305,32 +404,29 @@ int32_t registry_add(RegistryHeader * header, const RegistryEntry & entry)
   return try_add_once(header, entry);
 }
 
-// Best-effort tear-down of a slot we already claimed (state RESERVED). Unlink the
-// socket file and zero out the payload so the next reuse starts from a clean
-// state. Wrapped in a seqlock so any reader still in the middle of a snapshot
-// retries. The caller stores EMPTY only afterwards: freeing the slot first would
-// let a concurrent add claim it and have its fresh entry (and socket) wiped here.
-static void teardown_slot(RegistryEntrySlot * slot)
+// Best-effort tear-down of a slot we already claimed (state RESERVED). Zero out
+// the payload so the next reuse starts from a clean state, handing the path back
+// for the caller to unlink once the slot is released. Wrapped in a seqlock so any
+// reader still in the middle of a snapshot retries. The caller stores EMPTY only
+// afterwards: freeing the slot first would let a concurrent add claim it and have
+// its fresh entry wiped here.
+static void teardown_slot(
+  RegistryEntrySlot * slot,
+  char (& path_copy)[sizeof(RegistryEntrySlot::socket_path)])
 {
   slot->seq.fetch_add(1, std::memory_order_acq_rel);
+  std::atomic_thread_fence(std::memory_order_release);  // as in write_slot_payload
 
-  char path_copy[sizeof(slot->socket_path)];
+  // Plain read: this thread owns the slot (RESERVED), so no writer can race it.
   std::memcpy(path_copy, slot->socket_path, sizeof(path_copy));
 
-  slot->pid = 0;
-  std::memset(slot->gid, 0, sizeof(slot->gid));
-  std::memset(slot->node_name, 0, sizeof(slot->node_name));
-  std::memset(slot->node_namespace, 0, sizeof(slot->node_namespace));
-  std::memset(slot->topic_name, 0, sizeof(slot->topic_name));
-  std::memset(slot->type_name, 0, sizeof(slot->type_name));
-  std::memset(slot->socket_path, 0, sizeof(slot->socket_path));
-  slot->qos_reliability = 0;
-  slot->qos_durability = 0;
-  slot->qos_history = 0;
-  slot->qos_depth = 0;
+  shm_store_relaxed(&slot->pid, nullptr, PAYLOAD_SIZE);
 
   slot->seq.fetch_add(1, std::memory_order_acq_rel);
+}
 
+static void unlink_torn_down_path(const char * path_copy)
+{
   // Unlink outside the seqlock — filesystem op, doesn't need to be observable
   // by other readers atomically. A TRANSIENT_LOCAL publisher slot names its
   // latched-cache shm segment here (not a socket file), so a stale-PID reap
@@ -364,9 +460,11 @@ void registry_remove(RegistryHeader * header, int32_t index)
   {
     return;  // someone else removed it
   }
-  teardown_slot(slot);
+  char path[sizeof(RegistryEntrySlot::socket_path)];
+  teardown_slot(slot, path);
   slot->state.store(static_cast<uint8_t>(ENTRY_EMPTY), std::memory_order_release);
   header->generation.fetch_add(1, std::memory_order_acq_rel);
+  unlink_torn_down_path(path);
   if (st != ENTRY_DOORBELL) {  // doorbell slots have no wake consumers
     ring_doorbells(header);    // strictly after the bump — see ring_doorbells
   }
@@ -453,7 +551,8 @@ static void ring_doorbells(RegistryHeader * header)
     {
       continue;
     }
-    std::memcpy(path, slots[i].socket_path, sizeof(path));
+    shm_load_cstr_relaxed(path, slots[i].socket_path, sizeof(path));
+    std::atomic_thread_fence(std::memory_order_acquire);  // as in snapshot_slot
     if (slots[i].seq.load(std::memory_order_acquire) != s1 || path[0] == '\0') {
       continue;
     }
@@ -531,8 +630,16 @@ void registry_cleanup_stale(RegistryHeader * header)
       continue;  // raced with another remover / writer
     }
 
+    char path[sizeof(RegistryEntrySlot::socket_path)];
+    teardown_slot(&slots[i], path);
+    slots[i].state.store(static_cast<uint8_t>(ENTRY_EMPTY), std::memory_order_release);
+    header->generation.fetch_add(1, std::memory_order_acq_rel);
+    unlink_torn_down_path(path);
+
     // Surface the reclaim so a crashed-node incident leaves a breadcrumb
     // in the ROS log. WARN level — this is an ungraceful exit, not routine.
+    // Logged from the local snapshot after the slot is released, so
+    // formatting it never holds the slot unclaimable.
     RMW_UDS_LOG_WARN(
       "reclaimed stale registry slot %u: %s pid=%d node=%s%s topic=%s — "
       "owning process is gone (ungraceful exit)",
@@ -541,10 +648,6 @@ void registry_cleanup_stale(RegistryHeader * header)
       snap.node_namespace[0] ? snap.node_namespace : "",
       snap.node_name,
       snap.topic_name[0] ? snap.topic_name : "(none)");
-
-    teardown_slot(&slots[i]);
-    slots[i].state.store(static_cast<uint8_t>(ENTRY_EMPTY), std::memory_order_release);
-    header->generation.fetch_add(1, std::memory_order_acq_rel);
     if (expected != static_cast<uint8_t>(ENTRY_DOORBELL)) {
       reclaimed = true;  // doorbell-only reclaims ring nobody
     }
