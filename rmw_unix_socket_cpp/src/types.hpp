@@ -261,6 +261,14 @@ struct UdsContext
   std::atomic<bool> listener_running{false};
   bool listener_stopping = false;
   std::mutex listener_mutex;
+  // Held across a whole listener_set_callback, so an endpoint's callback slot,
+  // its socket watch and a failed watch's rollback change as one step: a
+  // clear that had updated the slot but not yet unwatched could otherwise
+  // unwatch AFTER a register that followed it, leaving that callback on a
+  // socket nobody drains. Taken before callback_mutex and listener_mutex and
+  // never by the listener thread, so it adds no lock-order cycle. Recursive
+  // because the backlog flush runs a user callback under it.
+  std::recursive_mutex listener_registration_mutex;
   std::unordered_map<int, ArmedEntry> listener_targets;
   std::vector<int> delivery_fds;
 };
