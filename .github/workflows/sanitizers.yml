@@ -33,7 +33,9 @@ jobs:
       # Default Docker /dev/shm is 64MB; one domain registry mmap is ~37MB
       # and rmw_shutdown doesn't shm_unlink, so tests that init multiple
       # domains across processes exhaust tmpfs and crash with SIGBUS.
-      options: --shm-size=1g
+      # seccomp=unconfined lets the Test step call setarch -R (the personality
+      # syscall it needs is blocked by Docker's default profile).
+      options: --shm-size=1g --security-opt seccomp=unconfined
 
     steps:
       - name: Install build prerequisites
@@ -79,13 +81,10 @@ jobs:
           # memory mapping" at startup). The job container is unprivileged,
           # so /proc/sys is read-only and the value is whatever the runner
           # host uses - `sysctl -w` here warns, prints the requested value
-          # and exits 0 without changing anything. So read the real value,
-          # and say so up front if it is the kind that breaks the runtimes.
-          bits=$(cat /proc/sys/vm/mmap_rnd_bits)
-          echo "vm.mmap_rnd_bits=$bits"
-          if [ "$bits" -gt 28 ]; then
-            echo "::warning::vm.mmap_rnd_bits=$bits > 28: the sanitizer runtimes may die with 'unexpected memory mapping', and this container cannot lower it"
-          fi
+          # and exits 0 without changing anything. The Test step therefore
+          # runs under setarch -R, which turns ASLR off for the test processes
+          # whatever the host value is; this step only records it.
+          echo "vm.mmap_rnd_bits=$(cat /proc/sys/vm/mmap_rnd_bits)"
 
       - name: Build
         shell: bash
@@ -128,7 +127,8 @@ jobs:
           # races - two threads inside write_slot_payload/teardown_slot on one
           # slot - fully reported.
           export TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1:suppressions=$GITHUB_WORKSPACE/.github/tsan.supp
-          colcon test \
+          # ASLR off (see the entropy step), so the runtimes start on any host.
+          setarch "$(uname -m)" -R colcon test \
             --paths rmw_unix_socket_cpp \
             --event-handlers console_direct+ \
             --return-code-on-test-failure
