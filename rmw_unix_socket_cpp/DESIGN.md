@@ -298,7 +298,7 @@ Every entity in the system claims exactly one slot in the shared-memory registry
 
 A slot is the `RegistryEntrySlot` struct mapped into shared memory (`registry.hpp`). It is plain data with no pointers, because pointers would be meaningless across processes that map the region at different addresses. Two fields at the front coordinate concurrent access, and the rest describe the endpoint:
 
-- `seq` (32-bit atomic) — the seqlock counter. Even means the payload is stable; odd means a writer is mid-update.
+- `seq` (32-bit atomic) — the seqlock counter. Even means the payload is stable; odd means a writer is mid-update. Every read and write of the payload below goes through relaxed atomic copies (`shm_load_relaxed` / `shm_store_relaxed` in `registry.cpp`), with a release fence after the writer's first bump and an acquire fence before the reader's re-check: a plain `memcpy` racing a writer would be a data race, undefined behaviour in C++ even though the counter discards the torn copy.
 - `state` (8-bit atomic) — the entity kind and lifecycle marker: `ENTRY_EMPTY`, `ENTRY_NODE`, `ENTRY_PUBLISHER`, `ENTRY_SUBSCRIPTION`, `ENTRY_SERVICE`, `ENTRY_CLIENT`, `ENTRY_DOORBELL` (one per context, holding the socket path of that process's wakeup doorbell — see The doorbell under Wait set; type-filtered queries never match it, so it is invisible to graph introspection), plus the internal `ENTRY_RESERVED` value that marks a slot as claimed but not publishable — set by a writer before its payload is filled in, and by a remover before the payload is erased.
 - `pid` — the owning process ID. This is the liveness handle. Stale-entry cleanup reclaims a slot when `/proc/<pid>` no longer exists.
 - `gid[16]` — the RMW GID, the 16-byte unique identity of this endpoint.

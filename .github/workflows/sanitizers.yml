@@ -119,14 +119,9 @@ jobs:
           # lock sites rather than one. Deadlock detection itself is on by
           # default in libtsan.
           #
-          # The registry is a seqlock: readers deliberately read payload fields
-          # without synchronisation and validate with a sequence counter
-          # (snapshot_slot in registry.cpp). TSan has no model for that, so it
-          # reports every reader/writer pair as a race. The suppression file
-          # silences the READER side only, which leaves genuine writer-vs-writer
-          # races - two threads inside write_slot_payload/teardown_slot on one
-          # slot - fully reported.
-          export TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1:suppressions=$GITHUB_WORKSPACE/.github/tsan.supp
+          # No suppressions file: the registry seqlock copies its payload with
+          # relaxed atomics (registry.cpp), so TSan has nothing to excuse there.
+          export TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1
           # ASLR off (see the entropy step), so the runtimes start on any host.
           setarch "$(uname -m)" -R colcon test \
             --paths rmw_unix_socket_cpp \

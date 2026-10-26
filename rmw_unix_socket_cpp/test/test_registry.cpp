@@ -16,6 +16,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <string>
+#include <vector>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
@@ -106,6 +108,48 @@ TEST_F(RegistryTest, GenerationIncrementsOnChange)
   rmw_uds::registry_remove(header, idx);
   uint64_t gen2 = rmw_uds::registry_generation(header);
   EXPECT_GT(gen2, gen1);
+}
+
+// A snapshot copies each name only up to the word that holds its terminator
+// (shm_load_cstr_relaxed). Every length must still round-trip, wherever the
+// terminator lands: in a field's unaligned head, on a word boundary, in its
+// tail, or in the last byte the field holds.
+TEST_F(RegistryTest, QueryReturnsNamesOfEveryLength)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  const size_t path_cap = sizeof(rmw_uds::RegistryEntry::socket_path) - 1;
+  std::vector<int32_t> added;
+  for (size_t len = 0; len < sizeof(rmw_uds::RegistryEntry::node_name); ++len) {
+    rmw_uds::RegistryEntry e;
+    std::memset(&e, 0, sizeof(e));
+    e.type = rmw_uds::ENTRY_PUBLISHER;
+    e.pid = getpid();
+    e.gid[0] = static_cast<uint8_t>(len);
+    std::memset(e.node_name, 'n', len);
+    std::memset(e.node_namespace, 's', len);
+    std::memset(e.topic_name, 't', len);
+    std::memset(e.type_name, 'y', len);
+    std::memset(e.socket_path, 'p', std::min(len, path_cap));
+    const int32_t idx = rmw_uds::registry_add(header, e);
+    ASSERT_GE(idx, 0) << "len " << len;
+    added.push_back(idx);
+  }
+
+  auto results = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_PUBLISHER, nullptr, nullptr, nullptr);
+  ASSERT_EQ(added.size(), results.size());
+  for (const auto & r : results) {
+    const size_t len = r.gid[0];
+    EXPECT_EQ(std::string(len, 'n'), r.node_name) << "len " << len;
+    EXPECT_EQ(std::string(len, 's'), r.node_namespace) << "len " << len;
+    EXPECT_EQ(std::string(len, 't'), r.topic_name) << "len " << len;
+    EXPECT_EQ(std::string(len, 'y'), r.type_name) << "len " << len;
+    EXPECT_EQ(std::string(std::min(len, path_cap), 'p'), r.socket_path) << "len " << len;
+  }
+
+  for (const int32_t idx : added) {
+    rmw_uds::registry_remove(header, idx);
+  }
 }
 
 TEST_F(RegistryTest, QueryFiltersByType)

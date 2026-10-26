@@ -95,7 +95,8 @@ static_assert(offsetof(RegistryEntry, qos_depth) == 1160, "RegistryEntry layout 
 // Protocol (writer):
 //   1. CAS state EMPTY -> RESERVED       (claims the slot; readers treat as EMPTY)
 //   2. seq.fetch_add(1, acq_rel)         -> seq becomes odd (write in progress)
-//   3. memcpy payload fields
+//      atomic_thread_fence(release)      -> payload stores stay after the odd seq
+//   3. relaxed atomic stores of the payload fields (shm_store_relaxed)
 //   4. seq.fetch_add(1, acq_rel)         -> seq becomes even (snapshot stable)
 //   5. state.store(target_type, release) -> publishes the committed payload
 //   6. generation.fetch_add(1, acq_rel)  -> wakes cached readers
@@ -103,13 +104,18 @@ static_assert(offsetof(RegistryEntry, qos_depth) == 1160, "RegistryEntry layout 
 // Protocol (reader):
 //   1. s1 = seq.load(acquire); if (s1 & 1) skip slot (writer in progress)
 //   2. st = state.load(acquire); if (st == EMPTY) skip
-//   3. memcpy payload into local snapshot
+//   3. relaxed atomic loads of the payload into a local snapshot (shm_load_relaxed)
+//      atomic_thread_fence(acquire)      -> pairs with the writer's release fence
 //   4. s2 = seq.load(acquire); if (s1 != s2) retry (bounded retries, then skip)
+//
+// The payload accesses in steps 3 must be atomic: a plain memcpy racing a
+// writer is a data race, undefined behaviour even though step 4 discards the
+// torn copy. Relaxed is enough; the fences and seq give the ordering.
 //
 // Protocol (remove):
 //   1. CAS state <current> -> RESERVED   (claims removal; loses race => abort)
 //   2. seq.fetch_add(1)                  -> begin payload teardown
-//   3. copy out socket_path; memset payload
+//   3. copy out socket_path; zero the payload with relaxed atomic stores
 //   4. seq.fetch_add(1)                  -> end teardown
 //   5. state.store(EMPTY, release)       -> only now is the slot reusable
 //   6. generation.fetch_add(1)
