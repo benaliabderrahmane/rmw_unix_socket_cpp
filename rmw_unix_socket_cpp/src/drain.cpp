@@ -117,12 +117,21 @@ size_t drain_endpoint(const DrainTarget & t)
       if ((hdr.msg_type & ~SHM_PAYLOAD_FLAG) != t.msg_type) {
         continue;
       }
+      // Checked before the descriptor resolve, for the same reason the dedup
+      // below is: is_same_context() reads only WireHeader::gid, so an ignored
+      // large payload need never be mapped and copied out of the sender's ring.
+      // And before the gap check: what this subscription drops on purpose
+      // cannot be lost to it.
+      if (t.ignore_local && is_same_context(hdr, t.context_id)) {
+        continue;  // ignore_local_publications: drop same-context publications
+      }
       if (t.last_sequence) {
         // message_lost. A publisher numbers each publish once, for every
-        // subscriber, so a jump in its sequence is datagrams that never
-        // arrived here (the kernel dropped them, or the sender did on a full
-        // socket). Checked before the filters below, which drop on purpose.
-        // The first datagram from a publisher only sets the baseline.
+        // subscriber, in send order (UdsPublisher::send_mutex), so a jump in
+        // its sequence is datagrams that never arrived here (the kernel
+        // dropped them, or the sender did on a full socket). Checked before
+        // the dedup below, which drops on purpose. The first datagram from a
+        // publisher only sets the baseline.
         std::array<uint8_t, 16> key;
         std::memcpy(key.data(), hdr.gid, key.size());
         const int64_t seq = hdr.sequence_number;  // packed: no reference to it
@@ -164,12 +173,6 @@ size_t drain_endpoint(const DrainTarget & t)
         if (dup) {
           continue;
         }
-      }
-      // Checked before the descriptor resolve, for the same reason the dedup
-      // above is: is_same_context() reads only WireHeader::gid, so an ignored
-      // large payload need never be mapped and copied out of the sender's ring.
-      if (t.ignore_local && is_same_context(hdr, t.context_id)) {
-        continue;  // ignore_local_publications: drop same-context publications
       }
       if (!shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload)) {
         // shm descriptor unresolvable (sender gone / ring lapped): the

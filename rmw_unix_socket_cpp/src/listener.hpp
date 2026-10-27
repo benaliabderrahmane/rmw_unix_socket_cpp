@@ -79,6 +79,12 @@ rmw_ret_t listener_set_callback(
 void listener_add_delivery_fd(UdsContext * ctx, int fd);
 void listener_remove_delivery_fd(UdsContext * ctx, int fd);
 
+// A graph change was observed (see observe_generation). If the context has
+// matched events, signal every wait set's delivery_fd and wake the listener,
+// so whichever of them holds one recomputes it. Takes listener_mutex; a no-op
+// while the context has no matched event.
+void listener_graph_changed(UdsContext * ctx);
+
 // Stop and join the thread and release its fds. Idempotent, and a no-op when
 // the thread was never started.
 void listener_stop(UdsContext * ctx);

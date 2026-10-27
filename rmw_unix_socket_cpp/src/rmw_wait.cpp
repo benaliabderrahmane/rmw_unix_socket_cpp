@@ -118,6 +118,37 @@ bool ensure_doorbell_registered(UdsContext * ctx)
   return true;
 }
 
+bool observe_generation(UdsContext * ctx)
+{
+  if (!ctx || !ctx->registry_ptr) {
+    return false;
+  }
+  const uint64_t gen = registry_generation(registry_header(ctx->registry_ptr));
+  uint64_t seen = ctx->last_registry_generation.load(std::memory_order_relaxed);
+  // Only ever forward: an observer holding an older generation must not move
+  // it back and fan the same change out twice - or worse, skip a newer one.
+  while (gen > seen) {
+    if (ctx->last_registry_generation.compare_exchange_weak(
+        seen, gen, std::memory_order_relaxed, std::memory_order_relaxed))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+void trigger_graph_gcs(UdsContext * ctx)
+{
+  // Wake graph listeners: trigger every node's graph guard condition (rclcpp's
+  // GraphListener waits on these). rmw_destroy_node removes a node's GC from
+  // this list under the same mutex before destroying it, so a freed guard
+  // condition is never triggered.
+  std::lock_guard<std::mutex> gc_lock(ctx->graph_gcs_mutex);
+  for (auto * gc : ctx->graph_gcs) {
+    auto _r [[maybe_unused]] = rmw_trigger_guard_condition(gc);
+  }
+}
+
 }  // namespace rmw_uds
 
 extern "C"
@@ -260,31 +291,6 @@ rmw_ret_t rmw_wait(
   // registration from any thread at any time. A process that never registers
   // one just holds an eventfd nobody writes.
   const int delivery_fd = ws_data->delivery_fd;
-  // The generation half on its own also runs after this wait drains its
-  // delivery_fd. While matched callbacks exist, the listener thread drains the
-  // doorbell too, and it signals every delivery_fd strictly AFTER that drain -
-  // so a wait whose ring the listener consumed still sees the new generation.
-  auto check_generation = [&]() {
-      if (!(ctx && ctx->registry_ptr)) {
-        return;
-      }
-      auto * header = rmw_uds::registry_header(ctx->registry_ptr);
-      uint64_t gen = rmw_uds::registry_generation(header);
-      if (gen != ctx->last_registry_generation.load(std::memory_order_relaxed)) {
-        ctx->last_registry_generation.store(gen, std::memory_order_relaxed);
-
-        // Wake graph listeners: trigger every node's graph guard condition
-        // (rclcpp's GraphListener waits on these). rmw_destroy_node removes a
-        // node's GC from this list under the same mutex before destroying it,
-        // so a freed guard condition is never triggered.
-        {
-          std::lock_guard<std::mutex> gc_lock(ctx->graph_gcs_mutex);
-          for (auto * gc : ctx->graph_gcs) {
-            auto _r [[maybe_unused]] = rmw_trigger_guard_condition(gc);
-          }
-        }
-      }
-    };
   auto run_generation_check = [&]() {
       // Drain the doorbell strictly BEFORE reading the generation: paired with
       // ring_doorbells running strictly AFTER the bump, a mutation either lands
@@ -295,7 +301,13 @@ rmw_ret_t rmw_wait(
         while (recv(doorbell_fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
         }
       }
-      check_generation();
+      // The ring may have been the one another wait or the listener was
+      // blocked on, so whoever sees the change tells them all (see
+      // observe_generation).
+      if (rmw_uds::observe_generation(ctx)) {
+        rmw_uds::trigger_graph_gcs(ctx);
+        rmw_uds::listener_graph_changed(ctx);
+      }
     };
   run_generation_check();
 
@@ -435,10 +447,6 @@ rmw_ret_t rmw_wait(
     while (read(delivery_fd, &val, sizeof(val)) == static_cast<ssize_t>(sizeof(val))) {
     }
   }
-  // After the delivery drain, for the listener's doorbell drains (see
-  // check_generation). One atomic load when the graph did not change; any guard
-  // condition it triggers is read by the scan below.
-  check_generation();
 
   // Events the caller waits on with untaken status changes. A message_lost
   // gains them in the drains, a matched one when the registry moves.
@@ -668,10 +676,6 @@ rmw_ret_t rmw_wait(
       }
       if (rang) {
         run_generation_check();  // Drains the doorbell, triggers graph GCs.
-      } else if (delivered) {
-        // Possibly a doorbell ring the listener consumed (see check_generation);
-        // a guard condition triggered here is reported by the next pass.
-        check_generation();
       }
       if (delivered && !progressed) {
         // The listener drains endpoints across the whole context, so the wake
@@ -680,7 +684,9 @@ rmw_ret_t rmw_wait(
         progressed = caller_queue_has_work();
       }
       if (!progressed) {
-        // A drain above can find messages lost, and a ring can move a match.
+        // A drain above can find messages lost, and a graph change - seen here,
+        // or fanned out to this wait's delivery_fd by whoever saw it - can
+        // move a match.
         progressed = caller_event_ready();
       }
       if (poll_only) {
