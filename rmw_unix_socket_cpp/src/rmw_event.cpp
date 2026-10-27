@@ -220,13 +220,25 @@ void forget_graph_events(UdsContext * ctx, void * endpoint, rmw_event_type_t mat
   if (!ctx) {
     return;
   }
+  // Serialised with the callback setters, like their clear path: a set on
+  // another endpoint between the check and the unwatch below would otherwise
+  // lose the doorbell watch it just made.
+  std::lock_guard<std::recursive_mutex> registration(ctx->listener_registration_mutex);
+  bool none_left = false;
   {
     std::lock_guard<std::mutex> lock(ctx->listener_mutex);
     auto & ev = ctx->graph_events;
+    const auto before = ev.size();
     ev.erase(
       std::remove_if(
         ev.begin(), ev.end(), [endpoint](const auto & e) {return e.first == endpoint;}),
       ev.end());
+    none_left = ev.size() < before && ev.empty();
+  }
+  if (none_left) {
+    // Destroyed with its matched callback still set (rclcpp clears it first):
+    // stop waking the listener on each registry mutation, as a clear does.
+    listener_unwatch(ctx, ctx->doorbell_fd);
   }
   const MatchedRef ref = matched_of(endpoint, matched_type);
   std::lock_guard<std::recursive_mutex> lock(*ref.mutex);

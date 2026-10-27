@@ -54,6 +54,9 @@ static void drain_eventfd(int fd)
 
 void signal_delivery_fds(UdsContext * ctx)
 {
+  if (!ctx) {
+    return;
+  }
   std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
   uint64_t val = 1;
   for (const int delivery_fd : ctx->delivery_fds) {

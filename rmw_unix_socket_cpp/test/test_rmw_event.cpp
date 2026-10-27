@@ -1209,3 +1209,25 @@ TEST_F(EventTest, AnEventOnlyWaitWakesTheWaitWhoseSocketItDrained)
   }
   EXPECT_EQ(0u, late) << "the reader slept through messages another wait queued";
 }
+
+// An rcl user may destroy an endpoint with its matched callback still set;
+// rclcpp clears it first. The destroy must then stop the listener watching
+// the doorbell, as clearing the last matched callback does.
+TEST_F(EventTest, DestroyingTheLastMatchedCallbacksEndpointUnwatchesTheDoorbell)
+{
+  auto * ctx = reinterpret_cast<rmw_uds::UdsContext *>(context.impl);
+  auto doorbell_watched = [ctx]() {
+      std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+      return ctx->listener_targets.count(ctx->doorbell_fd) == 1;
+    };
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * other = rmw_create_publisher(node, ts, "/event_test_topic", &qos, &pub_opts);
+  ASSERT_NE(nullptr, other);
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, other, RMW_EVENT_PUBLICATION_MATCHED));
+  EventCounter counter;
+  ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &counter));
+  EXPECT_TRUE(doorbell_watched());
+  ASSERT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, other));  // callback still set
+  EXPECT_FALSE(doorbell_watched());
+}
