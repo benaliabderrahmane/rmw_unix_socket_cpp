@@ -133,13 +133,16 @@ bool event_init(
   rmw_event->event_type = event_type;
   if (is_matched_type(event_type)) {
     const MatchedRef ref = matched_of(endpoint, event_type);
-    if (ref.ctx) {
+    std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
+    if (ref.ctx && !ref.state->counted) {
+      ref.state->counted = true;
       ref.ctx->matched_events.fetch_add(1, std::memory_order_release);
     }
     // Recompute now, so matches that already exist are reported as soon as
-    // the event is waited on, taken or given a callback.
-    std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
-    recompute(ref, false);
+    // the event is waited on, taken or given a callback. With notify: the
+    // state is per endpoint, so another handle's callback may be registered,
+    // and the listener will not announce a generation this read first.
+    recompute(ref, true);
   }
   return true;
 }
@@ -177,14 +180,23 @@ bool event_is_graph_driven(const rmw_event_t * event)
 
 void record_message_lost(UdsSubscription * sub, size_t lost)
 {
-  std::lock_guard<std::recursive_mutex> lock(sub->event_mutex);
-  auto & st = sub->message_lost;
-  st.total_count += lost;
-  st.total_count_change += lost;
-  // One take credit per batch: a callback fires only when the event goes from
-  // nothing untaken to untaken, so every take it causes finds the batch.
-  if (st.unread++ == 0 && st.cb.callback) {
-    st.cb.callback(st.cb.user_data, 1);
+  {
+    std::lock_guard<std::recursive_mutex> lock(sub->event_mutex);
+    auto & st = sub->message_lost;
+    st.total_count += lost;
+    st.total_count_change += lost;
+    // One take credit per batch: a callback fires only when the event goes
+    // from nothing untaken to untaken, so every take it causes finds the batch.
+    if (st.unread++ == 0 && st.cb.callback) {
+      st.cb.callback(st.cb.user_data, 1);
+    }
+  }
+  // Strictly after the record, from whichever thread drained: the drain may
+  // have emptied a socket another wait set is blocked on, and its epoll then
+  // never sees that socket readable. The wait re-checks its events on a
+  // delivery wake (see rmw_wait).
+  if (sub->context) {
+    signal_delivery_fds(sub->context);
   }
 }
 
@@ -203,17 +215,25 @@ bool message_lost_callback_set(UdsSubscription * sub)
   return sub->message_lost.cb.callback != nullptr;
 }
 
-void forget_graph_events(UdsContext * ctx, void * endpoint)
+void forget_graph_events(UdsContext * ctx, void * endpoint, rmw_event_type_t matched_type)
 {
   if (!ctx) {
     return;
   }
-  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
-  auto & ev = ctx->graph_events;
-  ev.erase(
-    std::remove_if(
-      ev.begin(), ev.end(), [endpoint](const auto & e) {return e.first == endpoint;}),
-    ev.end());
+  {
+    std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+    auto & ev = ctx->graph_events;
+    ev.erase(
+      std::remove_if(
+        ev.begin(), ev.end(), [endpoint](const auto & e) {return e.first == endpoint;}),
+      ev.end());
+  }
+  const MatchedRef ref = matched_of(endpoint, matched_type);
+  std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
+  if (ref.state->counted) {
+    ref.state->counted = false;
+    ctx->matched_events.fetch_sub(1, std::memory_order_release);
+  }
 }
 
 }  // namespace rmw_uds
@@ -306,26 +326,16 @@ rmw_ret_t rmw_take_event(
 
 rmw_ret_t rmw_event_fini(rmw_event_t * event)
 {
-  RMW_CHECK_ARGUMENT_FOR_NULL(event, RMW_RET_INVALID_ARGUMENT);
-  // A handle no init ever filled in has nothing to release. rcl never gets
-  // here with one - rcl_event_fini skips the call when rcl_*_event_init freed
-  // its impl after RMW_RET_UNSUPPORTED - but fini stays harmless for it.
-  if (!event->implementation_identifier || !event->data ||
-    !rmw_event_type_is_supported(event->event_type))
-  {
-    return RMW_RET_OK;
-  }
-  // Clears the callback and, for matched, the listener's graph entry. The
-  // endpoint is still alive: rcl finalizes an event before its publisher or
-  // subscription.
-  const rmw_ret_t ret = rmw_event_set_callback(event, nullptr, nullptr);
-  if (ret == RMW_RET_OK && rmw_uds::is_matched_type(event->event_type)) {
-    auto * ctx = rmw_uds::matched_of(event->data, event->event_type).ctx;
-    if (ctx) {
-      ctx->matched_events.fetch_sub(1, std::memory_order_release);
-    }
-  }
-  return ret;
+  // Nothing to release, and nothing may depend on this running: rcl's
+  // rcl_event_fini calls librmw's own rmw_event_fini, which rmw_implementation
+  // does not forward to an RMW. Event state belongs to the endpoint, and
+  // rmw_event_t::data aliases the endpoint's impl, so its destroy releases it
+  // (forget_graph_events, listener_unwatch); rclcpp clears a callback before
+  // it finalizes the event. And rclcpp can finalize an event after its
+  // endpoint - EventHandler drops its parent handle before the base destructor
+  // finalizes the event - so touching event->data here could read freed memory.
+  (void)event;
+  return RMW_RET_OK;
 }
 
 bool rmw_event_type_is_supported(rmw_event_type_t event_type)
@@ -443,10 +453,14 @@ rmw_ret_t rmw_event_set_callback(
     // the listener for this context. The callback still fires for what this
     // registration finds and for what a wait in this process sees, so the
     // event is degraded rather than failed.
+    // shortcut: no retry - a callback registration made while the registry is
+    // full stays deaf to other processes until a later matched callback
+    // registration finds a free slot; add a retry if full registries happen.
     RMW_UDS_LOG_WARN_THROTTLE(
       5000,
-      "no graph doorbell (registry full?): matched callbacks miss graph changes "
-      "until one is registered");
+      "no graph doorbell (registry full?): matched callbacks hear no other "
+      "process's graph changes until a matched callback is registered with a "
+      "free slot");
   }
   {
     std::lock_guard<std::mutex> lock(ctx->listener_mutex);
