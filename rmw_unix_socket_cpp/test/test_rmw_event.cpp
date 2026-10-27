@@ -15,12 +15,19 @@
 #include "test_base.hpp"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <mutex>
+#include <string>
 #include <thread>
+
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 #include "test_msgs/msg/basic_types.hpp"
 
@@ -30,6 +37,7 @@
 #include "rmw/qos_profiles.h"
 #include "rosidl_typesupport_cpp/message_type_support.hpp"
 
+#include "shm_transport.hpp"
 #include "types.hpp"
 
 class EventTest : public RmwUdsNodeTest
@@ -157,6 +165,32 @@ static bool await_calls(const EventCounter & c, size_t target, int budget_ms = 2
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   }
   return c.calls.load() >= target;
+}
+
+// Puts one forged datagram on an endpoint's socket, laid out as send_to()
+// does (header, then payload), for states a real publisher cannot be made to
+// produce on cue. send_to() itself is not exported.
+static bool send_raw(
+  const std::string & path, const rmw_uds::WireHeader & hdr, const void * payload, size_t size)
+{
+  const int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    return false;
+  }
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+  iovec iov[2] = {
+    {const_cast<rmw_uds::WireHeader *>(&hdr), sizeof(hdr)},
+    {const_cast<void *>(payload), size}};
+  msghdr msg{};
+  msg.msg_name = &addr;
+  msg.msg_namelen = sizeof(addr);
+  msg.msg_iov = iov;
+  msg.msg_iovlen = 2;
+  const bool sent = sendmsg(fd, &msg, MSG_NOSIGNAL) == static_cast<ssize_t>(sizeof(hdr) + size);
+  close(fd);
+  return sent;
 }
 
 // Iterating the whole enum rather than naming types keeps this honest across
@@ -519,6 +553,31 @@ static void skip_publications(rmw_publisher_t * pub, int64_t n)
   static_cast<rmw_uds::UdsPublisher *>(pub->data)->sequence_number.fetch_add(n);
 }
 
+// rclcpp registers an event callback twice. A registration that keeps the
+// callback must still announce a change it is first to read: the listener,
+// finding that registry generation already read, will not.
+TEST_F(EventTest, AChangeReadByAReRegistrationIsStillAnnounced)
+{
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, pub, RMW_EVENT_PUBLICATION_MATCHED));
+  EventCounter counter;
+  ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &counter));
+  OnExit clear{[&]() {(void)rmw_event_set_callback(&ev, nullptr, nullptr);}};
+  rmw_matched_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));  // the existing match
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * second = rmw_create_subscription(node, ts, "/event_test_topic", &qos, &sub_opts);
+  ASSERT_NE(nullptr, second);
+  OnExit destroy{[&]() {(void)rmw_destroy_subscription(node, second);}};
+  ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &counter));
+  EXPECT_TRUE(await_calls(counter, 2)) << "the re-registration absorbed the new match";
+
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
+  EXPECT_EQ(1, st.current_count_change);
+}
+
 TEST_F(EventTest, MessageLostCountsSequenceGaps)
 {
   rmw_event_t ev = rmw_get_zero_initialized_event();
@@ -616,20 +675,30 @@ TEST_F(EventTest, MessageLostCallbackFiresFromTheListenerDrain)
 
 // One callback per untaken batch: the executor takes once per callback, and a
 // take collects every change since the last one, so a callback per change
-// would leave takes with nothing new to report.
+// would leave takes with nothing new to report. A lost callback has the
+// listener drain the socket, and a drain records a loss before it reports the
+// message, so an arrival count says when each gap has been seen.
 TEST_F(EventTest, EventCallbackFiresOncePerUntakenBatch)
 {
   rmw_event_t ev = rmw_get_zero_initialized_event();
   ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_MESSAGE_LOST));
   EventCounter lost;
   ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &lost));
+  EventCounter arrived;
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(sub, EventCounter::fire, &arrived));
+  OnExit clear{[&]() {
+      (void)rmw_subscription_set_on_new_message_callback(sub, nullptr, nullptr);
+      (void)rmw_event_set_callback(&ev, nullptr, nullptr);
+    }};
   publish(1);
-  wait_on_sub(sub);  // baseline
+  ASSERT_TRUE(await_calls(arrived, 1));  // baseline
 
-  for (int32_t i = 2; i <= 3; ++i) {  // two gaps, two drains, no take between
+  for (int32_t i = 2; i <= 3; ++i) {  // two gaps, no take between
     skip_publications(pub, 1);
     publish(i);
-    wait_on_sub(sub);
+    ASSERT_TRUE(await_calls(arrived, static_cast<size_t>(i)));
   }
   EXPECT_EQ(1u, lost.calls.load());
 
@@ -640,9 +709,8 @@ TEST_F(EventTest, EventCallbackFiresOncePerUntakenBatch)
 
   skip_publications(pub, 1);
   publish(4);
-  wait_on_sub(sub);
+  ASSERT_TRUE(await_calls(arrived, 4));
   EXPECT_EQ(2u, lost.calls.load()) << "a change after a take starts a new batch";
-  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
 }
 
 // --- review regressions -------------------------------------------------------
@@ -781,5 +849,148 @@ TEST_F(EventTest, GapsFromAnIgnoredLocalPublisherAreNotLost)
   bool taken = false;
   ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
   EXPECT_EQ(0u, st.total_count);
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+
+// An executor driven by callbacks may set only the message_lost callback. A
+// loss is found by draining, so the listener must then drain the socket
+// itself, with nothing waiting or taking.
+TEST_F(EventTest, AMessageLostCallbackAloneWatchesTheSocket)
+{
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_MESSAGE_LOST));
+  EventCounter lost;
+  ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &lost));
+  OnExit clear{[&]() {(void)rmw_event_set_callback(&ev, nullptr, nullptr);}};
+
+  publish(1);
+  skip_publications(pub, 3);
+  publish(2);
+  EXPECT_TRUE(await_calls(lost, 1)) << "nothing drained the socket for the lost callback";
+
+  rmw_message_lost_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
+  EXPECT_EQ(3u, st.total_count);
+}
+
+// rclcpp waits on a subscription and its events together, but the rmw
+// contract does not require it: a wait holding only a message_lost event has
+// to drain the subscription itself to find a gap - without reporting the
+// subscription, which it was not asked about.
+TEST_F(EventTest, AWaitHoldingOnlyAMessageLostEventFindsTheGap)
+{
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_MESSAGE_LOST));
+  rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  OnExit destroy{[&]() {(void)rmw_destroy_wait_set(ws);}};
+  auto wait_on_event = [&](rmw_time_t timeout, bool & ready) {
+      void * arr[1] = {&ev};
+      rmw_events_t events{1, arr};
+      const rmw_ret_t ret = rmw_wait(nullptr, nullptr, nullptr, nullptr, &events, ws, &timeout);
+      ready = arr[0] != nullptr;
+      return ret;
+    };
+
+  bool ready = true;
+  publish(1);
+  (void)wait_on_event({0, 200000000}, ready);  // drains the baseline
+  EXPECT_FALSE(ready) << "a queued message is not this wait's business";
+
+  skip_publications(pub, 4);
+  publish(2);
+  EXPECT_EQ(RMW_RET_OK, wait_on_event({2, 0}, ready));
+  EXPECT_TRUE(ready) << "the event-only wait never drained the subscription";
+
+  rmw_message_lost_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
+  EXPECT_EQ(4u, st.total_count);
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+
+// A datagram whose shm descriptor no longer resolves - the sender is gone,
+// or lapped its ring - arrived but its message is gone: a loss. Here it is all
+// the socket holds, so the listener's drain finds a loss and nothing else.
+TEST_F(EventTest, AnUnresolvableShmDescriptorCountsAsLost)
+{
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_MESSAGE_LOST));
+  EventCounter lost;
+  ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &lost));
+  OnExit clear{[&]() {(void)rmw_event_set_callback(&ev, nullptr, nullptr);}};
+
+  rmw_uds::WireHeader hdr{};
+  hdr.gid[0] = 0xAB;  // a publisher this subscription has never heard from
+  hdr.sequence_number = 1;
+  hdr.msg_type = rmw_uds::SHM_PAYLOAD_FLAG;  // a topic message staged in shm
+  const rmw_uds::ShmPayloadDescriptor desc{};  // names no ring
+  hdr.payload_size = sizeof(desc);
+  auto * data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+  ASSERT_TRUE(send_raw(data->socket_path, hdr, &desc, sizeof(desc)));
+  EXPECT_TRUE(await_calls(lost, 1));
+
+  rmw_message_lost_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
+  EXPECT_EQ(1u, st.total_count);
+  std::lock_guard<std::mutex> lock(data->queue_mutex);
+  EXPECT_TRUE(data->message_queue.empty());
+}
+
+// A TRANSIENT_LOCAL late joiner gets the history through the creation-time
+// pull, and its socket may still carry some of it: the datagrams sent between
+// its registration and the pull, deduplicated against the pull's watermark.
+// The loss baseline must start at that watermark, or a sequence the pull
+// delivered but the socket never held counts as lost.
+TEST_F(EventTest, HistoryDeliveredByTheLateJoinerPullIsNotLost)
+{
+  rmw_qos_profile_t tl = qos;
+  tl.durability = RMW_QOS_POLICY_DURABILITY_TRANSIENT_LOCAL;
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * tl_pub = rmw_create_publisher(node, ts, "/event_test_tl", &tl, &pub_opts);
+  ASSERT_NE(nullptr, tl_pub);
+  OnExit destroy_pub{[&]() {(void)rmw_destroy_publisher(node, tl_pub);}};
+  test_msgs::msg::BasicTypes msg;
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(RMW_RET_OK, rmw_publish(tl_pub, &msg, nullptr));
+  }
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * tl_sub = rmw_create_subscription(node, ts, "/event_test_tl", &tl, &sub_opts);
+  ASSERT_NE(nullptr, tl_sub);
+  OnExit destroy_sub{[&]() {(void)rmw_destroy_subscription(node, tl_sub);}};
+  auto * data = static_cast<rmw_uds::UdsSubscription *>(tl_sub->data);
+
+  rmw_gid_t gid;
+  ASSERT_EQ(RMW_RET_OK, rmw_get_gid_for_publisher(tl_pub, &gid));
+  std::array<uint8_t, 16> key;
+  std::memcpy(key.data(), gid.data, key.size());
+  int64_t watermark = 0;
+  {
+    std::lock_guard<std::mutex> lock(data->queue_mutex);
+    ASSERT_EQ(1u, data->replayed_watermarks.count(key)) << "no creation-time pull";
+    watermark = data->replayed_watermarks.at(key);
+  }
+  ASSERT_EQ(3, watermark);
+
+  // A send that raced the pull: sequence 2 reached the socket, 3 did not.
+  rmw_uds::WireHeader hdr{};
+  std::memcpy(hdr.gid, gid.data, sizeof(hdr.gid));
+  hdr.sequence_number = watermark - 1;
+  const uint8_t payload[4] = {};
+  hdr.payload_size = sizeof(payload);
+  ASSERT_TRUE(send_raw(data->socket_path, hdr, payload, sizeof(payload)));
+  ASSERT_EQ(RMW_RET_OK, rmw_publish(tl_pub, &msg, nullptr));  // live: sequence 4
+  wait_on_sub(tl_sub);  // a first arming drains the socket
+
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, tl_sub, RMW_EVENT_MESSAGE_LOST));
+  rmw_message_lost_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
+  EXPECT_EQ(0u, st.total_count) << "sequence 3 came through the pull";
   EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
 }

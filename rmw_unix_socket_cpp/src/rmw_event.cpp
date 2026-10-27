@@ -197,6 +197,12 @@ void notify_graph_events(UdsContext * ctx)
   }
 }
 
+bool message_lost_callback_set(UdsSubscription * sub)
+{
+  std::lock_guard<std::recursive_mutex> lock(sub->event_mutex);
+  return sub->message_lost.cb.callback != nullptr;
+}
+
 void forget_graph_events(UdsContext * ctx, void * endpoint)
 {
   if (!ctx) {
@@ -351,12 +357,41 @@ rmw_ret_t rmw_event_set_callback(
   // the executor a take with nothing new.
   if (event->event_type == RMW_EVENT_MESSAGE_LOST) {
     auto * sub = static_cast<rmw_uds::UdsSubscription *>(event->data);
-    std::lock_guard<std::recursive_mutex> lock(sub->event_mutex);
-    auto & st = sub->message_lost;
-    const bool taking_over = !st.cb.callback;
-    st.cb = {callback, user_data};
-    if (callback && taking_over && st.unread > 0) {
-      callback(user_data, 1);
+    rmw_uds::UdsContext * ctx = sub->context;
+    if (!ctx) {
+      RMW_SET_ERROR_MSG("event endpoint has no context");
+      return RMW_RET_ERROR;
+    }
+    // Serialised with listener_set_callback, which shares this socket watch.
+    std::lock_guard<std::recursive_mutex> registration(ctx->listener_registration_mutex);
+    if (callback) {
+      // A loss is found by draining. With only this callback set, nothing
+      // else may drain the socket - an executor driven by callbacks never
+      // waits or takes - so the listener watches it.
+      const rmw_ret_t ret = rmw_uds::listener_watch(
+        ctx, sub->socket_fd, rmw_uds::ARMED_SUBSCRIPTION, sub, sub->uid);
+      if (ret != RMW_RET_OK) {
+        return ret;  // nothing is set yet
+      }
+    }
+    {
+      std::lock_guard<std::recursive_mutex> lock(sub->event_mutex);
+      auto & st = sub->message_lost;
+      const bool taking_over = !st.cb.callback;
+      st.cb = {callback, user_data};
+      if (callback && taking_over && st.unread > 0) {
+        callback(user_data, 1);
+      }
+    }
+    if (!callback) {
+      bool message_callback = false;
+      {
+        std::lock_guard<std::recursive_mutex> lock(sub->callback_mutex);
+        message_callback = sub->on_new_message_cb != nullptr;
+      }
+      if (!message_callback) {
+        rmw_uds::listener_unwatch(ctx, sub->socket_fd);
+      }
     }
     return RMW_RET_OK;
   }
@@ -425,7 +460,9 @@ rmw_ret_t rmw_event_set_callback(
     std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
     const bool taking_over = !ref.state->cb.callback;
     ref.state->cb = {callback, user_data};
-    rmw_uds::recompute(ref, false);
+    // A takeover pays any untaken batch out once below; a re-registration
+    // notifies a new batch like any other recompute.
+    rmw_uds::recompute(ref, !taking_over);
     if (taking_over && ref.state->unread > 0) {
       callback(user_data, 1);
     }
