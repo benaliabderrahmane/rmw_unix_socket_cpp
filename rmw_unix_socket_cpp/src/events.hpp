@@ -53,7 +53,8 @@ bool message_lost_callback_set(UdsSubscription * sub);
 // Drop the endpoint's entries from ctx->graph_events and its count in
 // ctx->matched_events. `matched_type` is the endpoint's matched event type.
 // Called by the endpoint destroys before they free anything; takes
-// listener_mutex, so it also waits out a notify_graph_events() in flight.
+// listener_mutex, so it also waits out a notify_graph_events() in flight. If
+// that removed the last listed event, the listener stops watching the doorbell.
 void forget_graph_events(UdsContext * ctx, void * endpoint, rmw_event_type_t matched_type);
 
 // Register the context's doorbell slot if it is not registered yet, so
