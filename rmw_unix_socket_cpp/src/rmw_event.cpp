@@ -147,12 +147,17 @@ bool event_init(
   return true;
 }
 
-void remove_graph_event(UdsContext * ctx, void * endpoint, rmw_event_type_t type)
+// Unlist (endpoint, type) from ctx->graph_events. True when that emptied the
+// list: the caller, holding listener_registration_mutex, then unwatches the
+// doorbell no matched callback needs any more.
+bool unlist_graph_event(UdsContext * ctx, void * endpoint, rmw_event_type_t type)
 {
   std::lock_guard<std::mutex> lock(ctx->listener_mutex);
   auto & ev = ctx->graph_events;
+  const auto before = ev.size();
   ev.erase(
     std::remove(ev.begin(), ev.end(), std::make_pair(endpoint, type)), ev.end());
+  return ev.size() < before && ev.empty();
 }
 
 }  // namespace
@@ -224,18 +229,7 @@ void forget_graph_events(UdsContext * ctx, void * endpoint, rmw_event_type_t mat
   // another endpoint between the check and the unwatch below would otherwise
   // lose the doorbell watch it just made.
   std::lock_guard<std::recursive_mutex> registration(ctx->listener_registration_mutex);
-  bool none_left = false;
-  {
-    std::lock_guard<std::mutex> lock(ctx->listener_mutex);
-    auto & ev = ctx->graph_events;
-    const auto before = ev.size();
-    ev.erase(
-      std::remove_if(
-        ev.begin(), ev.end(), [endpoint](const auto & e) {return e.first == endpoint;}),
-      ev.end());
-    none_left = ev.size() < before && ev.empty();
-  }
-  if (none_left) {
+  if (unlist_graph_event(ctx, endpoint, matched_type)) {
     // Destroyed with its matched callback still set (rclcpp clears it first):
     // stop waking the listener on each registry mutation, as a clear does.
     listener_unwatch(ctx, ctx->doorbell_fd);
@@ -432,15 +426,10 @@ rmw_ret_t rmw_event_set_callback(
   if (!callback) {
     // Unlisted first: that waits out a listener recompute in flight, so no
     // listener-side fire can follow the clear.
-    rmw_uds::remove_graph_event(ctx, event->data, event->event_type);
+    const bool none_left = rmw_uds::unlist_graph_event(ctx, event->data, event->event_type);
     {
       std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
       ref.state->cb = {};
-    }
-    bool none_left = false;
-    {
-      std::lock_guard<std::mutex> lock(ctx->listener_mutex);
-      none_left = ctx->graph_events.empty();
     }
     if (none_left) {
       // Stop waking the listener on each registry mutation. A no-op if the

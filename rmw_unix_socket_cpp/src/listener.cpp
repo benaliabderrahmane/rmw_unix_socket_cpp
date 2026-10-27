@@ -157,6 +157,7 @@ static void listener_loop(UdsContext * ctx)
 static void listener_release_fds(UdsContext * ctx)
 {
   if (ctx->listener_wake_fd >= 0) {
+    std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);  // see listener_graph_changed
     close(ctx->listener_wake_fd);
     ctx->listener_wake_fd = -1;
   }
@@ -177,7 +178,10 @@ static rmw_ret_t listener_start(UdsContext * ctx)
     RMW_SET_ERROR_MSG("failed to create listener epoll");
     return RMW_RET_ERROR;
   }
-  ctx->listener_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  {
+    std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);  // see listener_graph_changed
+    ctx->listener_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  }
   if (ctx->listener_wake_fd < 0) {
     listener_release_fds(ctx);
     RMW_SET_ERROR_MSG("failed to create listener eventfd");
@@ -279,10 +283,16 @@ void listener_graph_changed(UdsContext * ctx)
   if (!ctx || ctx->matched_events.load(std::memory_order_acquire) == 0) {
     return;
   }
-  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
   signal_delivery_fds(ctx);
-  if (!ctx->graph_events.empty()) {
-    wake_listener(ctx);
+  // Not under listener_mutex, which the listener holds across a whole drain:
+  // an rmw_wait that saw the change must not stall behind one. The wake fd is
+  // replaced and closed under delivery_fds_mutex too, so that is enough here.
+  // A listener with no matched callback recomputes an empty list.
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
+  if (ctx->listener_wake_fd >= 0) {
+    uint64_t val = 1;
+    ssize_t ret = write(ctx->listener_wake_fd, &val, sizeof(val));
+    (void)ret;
   }
 }
 
