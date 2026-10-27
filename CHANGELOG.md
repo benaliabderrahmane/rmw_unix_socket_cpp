@@ -16,6 +16,18 @@ four copies of the receive loop that hid the gap are one.
 
 ### Added
 
+- **QoS status events: `message_lost` and both `matched` events** (#21).
+  `message_lost` counts gaps in each publisher's sequence numbers, which every
+  datagram already carries: datagrams the kernel or the sender dropped, plus
+  large-payload descriptors whose payload was gone. `matched` reports the
+  endpoints of the other kind on the topic, recomputed from the registry when
+  its generation moves, and an endpoint created into existing matches reports
+  them, as DDS does. Both work for a waiting executor and through event
+  callbacks; the listener watches the doorbell while a matched callback exists.
+  This fixes `ros2 bag record` on jazzy, which exited at startup because
+  rosbag2 always asks for `message_lost`, and image_pipeline's lazy nodes and
+  Nav2's costmap republish, which key off `matched`. Deadline and liveliness
+  (#24, #25), incompatible QoS and incompatible type (#92) stay refused.
 - **Listener thread for callback-driven delivery.** An endpoint that registers
   a listener callback is watched by one per-context thread that drains its
   socket and fires the callback with no application thread involved. It is
@@ -67,7 +79,7 @@ four copies of the receive loop that hid the gap are one.
 
 - **QoS status events are refused honestly.** `rmw_publisher_event_init` /
   `rmw_subscription_event_init` return `RMW_RET_UNSUPPORTED` for every event
-  type (#61) - the refusal `rclcpp` swallows - where reporting success made
+  type they do not report (#61) - the refusal `rclcpp` swallows - where reporting success made
   `EventsExecutor` crash. `rmw_event_set_callback` returned
   a failure with no error message behind it — the `": error not set"` half of
   the original `EventsExecutor` crash report. `rmw_take_event`,

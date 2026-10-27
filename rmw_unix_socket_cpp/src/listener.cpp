@@ -15,6 +15,7 @@
 #include "listener.hpp"
 
 #include "drain.hpp"
+#include "events.hpp"
 #include "logging.hpp"
 
 #include "rmw/error_handling.h"
@@ -26,6 +27,7 @@
 #include <system_error>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace rmw_uds
@@ -50,6 +52,19 @@ static void drain_eventfd(int fd)
   }
 }
 
+void signal_delivery_fds(UdsContext * ctx)
+{
+  if (!ctx) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
+  uint64_t val = 1;
+  for (const int delivery_fd : ctx->delivery_fds) {
+    ssize_t ret = write(delivery_fd, &val, sizeof(val));
+    (void)ret;
+  }
+}
+
 static void listener_loop(UdsContext * ctx)
 {
   struct epoll_event ready[16];
@@ -71,14 +86,19 @@ static void listener_loop(UdsContext * ctx)
       const int fd = ready[i].data.fd;
       if (fd == ctx->listener_wake_fd) {
         drain_eventfd(fd);
-        continue;  // Watch-list change or stop; the loop condition re-checks.
+        // Watch-list change or stop - the loop condition re-checks - or a
+        // graph change another thread saw (listener_graph_changed), so
+        // recompute the matched events; one generation compare each if not.
+        if (ctx->listener_running.load(std::memory_order_acquire)) {
+          std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+          notify_graph_events(ctx);
+        }
+        continue;
       }
 
       // Held across the drain: listener_unwatch() takes this mutex, so a
       // thread destroying an endpoint blocks here until the drain - and the
-      // callback it fires - has returned. It also guards delivery_fds, so a
-      // wait set cannot be deregistered and closed between the enqueue and
-      // the signal below.
+      // callback it fires - has returned.
       std::lock_guard<std::mutex> lock(ctx->listener_mutex);
       auto it = ctx->listener_targets.find(fd);
       if (it == ctx->listener_targets.end()) {
@@ -99,6 +119,22 @@ static void listener_loop(UdsContext * ctx)
           enqueued = drain_endpoint(
             drain_target(static_cast<UdsClient *>(entry.entity)));
           break;
+        case ARMED_DOORBELL: {
+            // Watched while matched callbacks exist: a registry mutation
+            // somewhere. The rmw_waits read this socket too, so if this drain
+            // is what sees the generation move it fans the change out to them,
+            // exactly as rmw_wait does: the graph guard conditions, and every
+            // delivery_fd below.
+            uint8_t buf[16];
+            while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
+            }
+            if (observe_generation(ctx)) {
+              trigger_graph_gcs(ctx);
+              enqueued = 1;
+            }
+            notify_graph_events(ctx);
+            break;
+          }
         default:
           break;
       }
@@ -112,11 +148,7 @@ static void listener_loop(UdsContext * ctx)
       // a read drains the whole counter and would otherwise let the first wait
       // set to wake consume a credit another one needed.
       if (enqueued > 0) {
-        uint64_t val = 1;
-        for (const int delivery_fd : ctx->delivery_fds) {
-          ssize_t ret = write(delivery_fd, &val, sizeof(val));
-          (void)ret;
-        }
+        signal_delivery_fds(ctx);
       }
     }
   }
@@ -125,6 +157,7 @@ static void listener_loop(UdsContext * ctx)
 static void listener_release_fds(UdsContext * ctx)
 {
   if (ctx->listener_wake_fd >= 0) {
+    std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);  // see listener_graph_changed
     close(ctx->listener_wake_fd);
     ctx->listener_wake_fd = -1;
   }
@@ -145,7 +178,10 @@ static rmw_ret_t listener_start(UdsContext * ctx)
     RMW_SET_ERROR_MSG("failed to create listener epoll");
     return RMW_RET_ERROR;
   }
-  ctx->listener_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  {
+    std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);  // see listener_graph_changed
+    ctx->listener_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  }
   if (ctx->listener_wake_fd < 0) {
     listener_release_fds(ctx);
     RMW_SET_ERROR_MSG("failed to create listener eventfd");
@@ -222,7 +258,12 @@ rmw_ret_t listener_set_callback(
   // which epoll reports level-triggered, so datagrams that arrived between the
   // two are delivered rather than dropped or double-reported.
   if (!callback) {
-    listener_unwatch(ctx, t.fd);
+    // A subscription's message_lost callback needs the socket drained too.
+    if (!(kind == ARMED_SUBSCRIPTION &&
+      message_lost_callback_set(static_cast<UdsSubscription *>(entity))))
+    {
+      listener_unwatch(ctx, t.fd);
+    }
     return RMW_RET_OK;
   }
   const rmw_ret_t ret = listener_watch(ctx, t.fd, kind, entity, uid);
@@ -237,12 +278,30 @@ rmw_ret_t listener_set_callback(
   return ret;
 }
 
+void listener_graph_changed(UdsContext * ctx)
+{
+  if (!ctx || ctx->matched_events.load(std::memory_order_acquire) == 0) {
+    return;
+  }
+  signal_delivery_fds(ctx);
+  // Not under listener_mutex, which the listener holds across a whole drain:
+  // an rmw_wait that saw the change must not stall behind one. The wake fd is
+  // replaced and closed under delivery_fds_mutex too, so that is enough here.
+  // A listener with no matched callback recomputes an empty list.
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
+  if (ctx->listener_wake_fd >= 0) {
+    uint64_t val = 1;
+    ssize_t ret = write(ctx->listener_wake_fd, &val, sizeof(val));
+    (void)ret;
+  }
+}
+
 void listener_add_delivery_fd(UdsContext * ctx, int fd)
 {
   if (!ctx || fd < 0) {
     return;
   }
-  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
   ctx->delivery_fds.push_back(fd);
 }
 
@@ -251,7 +310,7 @@ void listener_remove_delivery_fd(UdsContext * ctx, int fd)
   if (!ctx || fd < 0) {
     return;
   }
-  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
   auto & fds = ctx->delivery_fds;
   fds.erase(std::remove(fds.begin(), fds.end(), fd), fds.end());
 }

@@ -37,9 +37,9 @@ namespace rmw_uds
 // A listener callback runs on this thread, and listener_mutex is one per
 // CONTEXT and is held across the drain that fires it. So the restriction is
 // context-wide, not endpoint-local: a callback must not block, and must not
-// destroy, register on, or clear the callback of ANY endpoint in the context,
-// nor create or destroy a wait set - each of those takes listener_mutex and
-// would deadlock against the drain it was called from. Calling rmw_take on its
+// destroy, register on, or clear the callback of ANY endpoint in the context -
+// each of those takes listener_mutex and would deadlock against the drain it
+// was called from. Calling rmw_take on its
 // own endpoint IS allowed: drain_endpoint releases both drain_mutex and
 // queue_mutex before it notifies, so a callback runs holding only
 // callback_mutex. rclcpp's callbacks only push to a queue, which is what the
@@ -78,6 +78,16 @@ rmw_ret_t listener_set_callback(
 // listener writes into a recycled fd number.
 void listener_add_delivery_fd(UdsContext * ctx, int fd);
 void listener_remove_delivery_fd(UdsContext * ctx, int fd);
+
+// Wake every live wait set: signal each delivery eventfd. Safe from any
+// thread under any lock - it takes only delivery_fds_mutex, a leaf lock.
+void signal_delivery_fds(UdsContext * ctx);
+
+// A graph change was observed (see observe_generation). If the context has
+// matched events, signal every wait set's delivery_fd and wake the listener,
+// so whichever of them holds one recomputes it. Takes listener_mutex; a no-op
+// while the context has no matched event.
+void listener_graph_changed(UdsContext * ctx);
 
 // Stop and join the thread and release its fds. Idempotent, and a no-op when
 // the thread was never started.

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "events.hpp"
 #include "identifier.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
@@ -183,6 +184,9 @@ rmw_ret_t rmw_destroy_publisher(rmw_node_t * node, rmw_publisher_t * publisher)
 
   auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(publisher->data);
   if (pub_data) {
+    // Releases this publisher's matched event state, and waits out a listener
+    // recompute of it before the delete.
+    rmw_uds::forget_graph_events(pub_data->context, pub_data, RMW_EVENT_PUBLICATION_MATCHED);
     if (pub_data->context && pub_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
       rmw_uds::registry_remove(header, pub_data->registry_index);
@@ -376,15 +380,6 @@ rmw_ret_t rmw_publish(
     return transient_local_publish(pub_data, hdr, payload);
   }
 
-  hdr.sequence_number =
-    pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
-
-  // PERFORMANCE: only lock the registry when the graph generation has changed
-  // since we last cached the subscriber list. The hot path is purely local.
-  auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
-  uint64_t current_gen = rmw_uds::registry_generation(header);
-  auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
-
   // Non-latched path: serialize once, choosing the destination by size — a
   // large payload is written directly into the reserved ring record (no heap
   // payload, no staging copy) and only a descriptor crosses the socket; a
@@ -404,6 +399,16 @@ rmw_ret_t rmw_publish(
     RMW_SET_ERROR_MSG("failed to serialize message");
     return RMW_RET_ERROR;
   }
+
+  // Recipients, number and sends under send_mutex (see UdsPublisher).
+  // PERFORMANCE: only lock the registry when the graph generation has changed
+  // since we last cached the subscriber list. The hot path is purely local.
+  std::lock_guard<std::mutex> send_lock(pub_data->send_mutex);
+  auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
+  uint64_t current_gen = rmw_uds::registry_generation(header);
+  auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
+  hdr.sequence_number =
+    pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
 
   // Surface EMSGSIZE; soft drops (EAGAIN/ENOENT) are logged in send_to.
   bool config_error = false;
@@ -461,19 +466,20 @@ rmw_ret_t rmw_publish_serialized_message(
         serialized_message->buffer + serialized_message->buffer_length));
   }
 
-  hdr.sequence_number =
-    pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
-
-  // Reuse the cached subscriber list (refresh only on graph change)
-  auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
-  uint64_t current_gen = rmw_uds::registry_generation(header);
-  auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
-
   // Large non-TL payloads: stage once into the cycling ring, fan out descriptors.
   rmw_uds::ShmPayloadDescriptor desc;
   auto wire = rmw_uds::shm_prepare_send(
     pub_data->shm_ring, pub_data->shm_mutex, pub_data->context->domain_id,
     serialized_message->buffer, serialized_message->buffer_length, hdr, desc);
+
+  // Recipients, number and sends under send_mutex (see UdsPublisher); the
+  // cached subscriber list is refreshed only on a graph change.
+  std::lock_guard<std::mutex> send_lock(pub_data->send_mutex);
+  auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
+  uint64_t current_gen = rmw_uds::registry_generation(header);
+  auto sub_paths = refresh_sub_paths(pub_data, header, current_gen);
+  hdr.sequence_number =
+    pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
 
   bool config_error = false;
   if (sub_paths) {

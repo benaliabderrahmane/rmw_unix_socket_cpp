@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "drain.hpp"
+#include "events.hpp"
 #include "identifier.hpp"
 #include "listener.hpp"
 #include "logging.hpp"
@@ -74,6 +75,83 @@ static int epoll_wait_ns(
   }
   return epoll_wait(epfd, events, max_events, timeout_ms);
 }
+
+namespace rmw_uds
+{
+
+// The doorbell slot is registered LAZILY: only graph-event consumers need
+// registry wakeups (TRANSIENT_LOCAL replay is pull-based and needs none), so a
+// plain pub/sub process never registers one. Called by the first rmw_wait whose
+// set holds a graph guard condition or a matched event, and by a matched event
+// callback registration. The socket was bound at rmw_init, so a mutation either
+// predates the registration (caught by the caller's generation check after
+// this) or rings the already-bound socket.
+bool ensure_doorbell_registered(UdsContext * ctx)
+{
+  if (ctx->doorbell_registered.load(std::memory_order_acquire)) {
+    return true;
+  }
+  if (!ctx->registry_ptr) {
+    return false;
+  }
+  std::lock_guard<std::mutex> reg_lock(ctx->doorbell_reg_mutex);
+  if (ctx->doorbell_registered.load(std::memory_order_relaxed)) {
+    return true;
+  }
+  auto * reg_header = registry_header(ctx->registry_ptr);
+  RegistryEntry dentry;
+  std::memset(&dentry, 0, sizeof(dentry));
+  dentry.type = ENTRY_DOORBELL;
+  dentry.pid = getpid();
+  std::strncpy(dentry.socket_path, ctx->doorbell_path.c_str(), sizeof(dentry.socket_path) - 1);
+  const int32_t idx = registry_add(reg_header, dentry);
+  if (idx < 0) {
+    // Registry full. The flag stays unlatched, so the next call retries.
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000,
+      "registry full — graph-event doorbell unregistered; graph waits "
+      "degrade to polling until a slot frees");
+    return false;
+  }
+  ctx->doorbell_registry_index = idx;
+  ctx->doorbell_registered.store(true, std::memory_order_release);
+  return true;
+}
+
+bool observe_generation(UdsContext * ctx)
+{
+  if (!ctx || !ctx->registry_ptr) {
+    return false;
+  }
+  const uint64_t gen = registry_generation(registry_header(ctx->registry_ptr));
+  uint64_t seen = ctx->last_registry_generation.load(std::memory_order_relaxed);
+  // Only ever forward: an observer holding an older generation must not move
+  // it back and fan the same change out twice - or worse, skip a newer one.
+  while (gen > seen) {
+    if (ctx->last_registry_generation.compare_exchange_weak(
+        seen, gen, std::memory_order_relaxed, std::memory_order_relaxed))
+    {
+      return true;
+    }
+  }
+  return false;
+}
+
+void trigger_graph_gcs(UdsContext * ctx)
+{
+  // Wake graph listeners: trigger every node's graph guard condition (rclcpp's
+  // GraphListener waits on these). rmw_destroy_node removes a node's GC from
+  // this list under the same mutex before destroying it, so a freed guard
+  // condition is never triggered.
+  std::lock_guard<std::mutex> gc_lock(ctx->graph_gcs_mutex);
+  for (auto * gc : ctx->graph_gcs) {
+    if (rmw_trigger_guard_condition(gc) != RMW_RET_OK) {
+      rmw_reset_error();  // a wake-up hint: nothing to report the failure to
+    }
+  }
+}
+
+}  // namespace rmw_uds
 
 extern "C"
 {
@@ -137,8 +215,8 @@ rmw_ret_t rmw_destroy_wait_set(rmw_wait_set_t * wait_set)
 
   auto * ws_data = static_cast<rmw_uds::UdsWaitSet *>(wait_set->data);
   if (ws_data) {
-    // Deregister strictly BEFORE the close, under listener_mutex: the other
-    // order lets the listener write 8 bytes into a recycled fd number.
+    // Deregister strictly BEFORE the close, under delivery_fds_mutex: the
+    // other order lets a signal write 8 bytes into a recycled fd number.
     rmw_uds::listener_remove_delivery_fd(ws_data->context, ws_data->delivery_fd);
     if (ws_data->delivery_fd >= 0) {
       close(ws_data->delivery_fd);
@@ -175,61 +253,36 @@ rmw_ret_t rmw_wait(
   // those waits too.
   rmw_uds::UdsContext * ctx = ws_data->context;
 
-  // Lazy doorbell registration: only graph-event consumers need registry
-  // wakeups (TRANSIENT_LOCAL replay is pull-based and needs no wake at all),
-  // so the ENTRY_DOORBELL slot is registered on the first wait whose set
-  // holds one of this context's graph guard conditions. Ordering mirrors the
-  // eager rmw_init recipe this replaces: the socket was bound at rmw_init,
-  // registration happens HERE — strictly before the generation check below —
-  // so a mutation either predates the registration (caught by the check) or
-  // rings the already-bound socket. Registration failure (registry full)
-  // leaves the flag unlatched and retries on the next wait; it never turns
-  // the wait into an error.
-  bool graph_gc_unwired = false;  // graph GC waited on, doorbell unregistered
-  if (ctx && ctx->registry_ptr && guard_conditions &&
-    !ctx->doorbell_registered.load(std::memory_order_acquire))
-  {
-    bool has_graph_gc = false;
-    {
+  // Lazy doorbell registration (see ensure_doorbell_registered), on the first
+  // wait whose set holds one of this context's graph guard conditions or a
+  // matched event - strictly before the generation check below. Registration
+  // failure (registry full) never turns the wait into an error.
+  bool graph_gc_unwired = false;  // graph wake wanted, doorbell unregistered
+  if (ctx && ctx->registry_ptr && !ctx->doorbell_registered.load(std::memory_order_acquire)) {
+    bool wants_graph_wake = false;
+    if (guard_conditions) {
       std::lock_guard<std::mutex> gc_lock(ctx->graph_gcs_mutex);
       for (size_t i = 0;
-        !has_graph_gc && i < guard_conditions->guard_condition_count; ++i)
+        !wants_graph_wake && i < guard_conditions->guard_condition_count; ++i)
       {
         for (auto * gc : ctx->graph_gcs) {
           if (gc && gc->data == guard_conditions->guard_conditions[i]) {
-            has_graph_gc = true;
+            wants_graph_wake = true;
             break;
           }
         }
       }
     }
-    if (has_graph_gc) {
-      std::lock_guard<std::mutex> reg_lock(ctx->doorbell_reg_mutex);
-      if (!ctx->doorbell_registered.load(std::memory_order_relaxed)) {
-        auto * reg_header = rmw_uds::registry_header(ctx->registry_ptr);
-        rmw_uds::RegistryEntry dentry;
-        std::memset(&dentry, 0, sizeof(dentry));
-        dentry.type = rmw_uds::ENTRY_DOORBELL;
-        dentry.pid = getpid();
-        std::strncpy(dentry.socket_path, ctx->doorbell_path.c_str(),
-          sizeof(dentry.socket_path) - 1);
-        const int32_t idx = rmw_uds::registry_add(reg_header, dentry);
-        if (idx >= 0) {
-          ctx->doorbell_registry_index = idx;
-          ctx->doorbell_registered.store(true, std::memory_order_release);
-        } else {
-          // Registry full: this graph wait has no wakeup wiring. Returning an
-          // error would be executor-fatal, and blocking unbounded would lose
-          // graph events forever, so the block below is bounded instead: the
-          // wait degrades to a coarse retry loop (spurious OK wakes) until a
-          // slot frees up and registration succeeds.
-          graph_gc_unwired = true;
-          RMW_UDS_LOG_WARN_THROTTLE(
-            5000,
-            "registry full — graph-event doorbell unregistered; graph waits "
-            "degrade to polling until a slot frees");
-        }
-      }
+    for (size_t i = 0; events && !wants_graph_wake && i < events->event_count; ++i) {
+      const auto * ev = static_cast<const rmw_event_t *>(events->events[i]);
+      wants_graph_wake = ev && rmw_uds::event_is_graph_driven(ev);
+    }
+    if (wants_graph_wake && !rmw_uds::ensure_doorbell_registered(ctx)) {
+      // This graph wait has no wakeup wiring. Returning an error would be
+      // executor-fatal, and blocking unbounded would lose graph events
+      // forever, so the block below is bounded instead: the wait degrades to a
+      // coarse retry loop (spurious OK wakes) until registration succeeds.
+      graph_gc_unwired = true;
     }
   }
 
@@ -250,24 +303,12 @@ rmw_ret_t rmw_wait(
         while (recv(doorbell_fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
         }
       }
-      if (!(ctx && ctx->registry_ptr)) {
-        return;
-      }
-      auto * header = rmw_uds::registry_header(ctx->registry_ptr);
-      uint64_t gen = rmw_uds::registry_generation(header);
-      if (gen != ctx->last_registry_generation.load(std::memory_order_relaxed)) {
-        ctx->last_registry_generation.store(gen, std::memory_order_relaxed);
-
-        // Wake graph listeners: trigger every node's graph guard condition
-        // (rclcpp's GraphListener waits on these). rmw_destroy_node removes a
-        // node's GC from this list under the same mutex before destroying it,
-        // so a freed guard condition is never triggered.
-        {
-          std::lock_guard<std::mutex> gc_lock(ctx->graph_gcs_mutex);
-          for (auto * gc : ctx->graph_gcs) {
-            auto _r [[maybe_unused]] = rmw_trigger_guard_condition(gc);
-          }
-        }
+      // The ring may have been the one another wait or the listener was
+      // blocked on, so whoever sees the change tells them all (see
+      // observe_generation).
+      if (rmw_uds::observe_generation(ctx)) {
+        rmw_uds::trigger_graph_gcs(ctx);
+        rmw_uds::listener_graph_changed(ctx);
       }
     };
   run_generation_check();
@@ -289,6 +330,21 @@ rmw_ret_t rmw_wait(
   // Entities epoll could not watch (e.g. watch exhaustion): drained directly
   // each call below so they degrade to polling instead of vanishing.
   std::vector<rmw_uds::ArmedEntry> unarmed;
+  // Subscriptions armed only for a waited-on message_lost event: a loss is
+  // found by draining, and the caller need not have passed the subscription.
+  // Their queues are not progress - nobody here asked for their messages.
+  std::vector<const void *> event_only_subs;
+  // A drain for such an event may queue messages another wait set is blocked
+  // on, having emptied its socket, so it wakes the wait sets as the listener
+  // does.
+  auto drain_subscription = [&](rmw_uds::UdsSubscription * sub) {
+      const size_t enqueued = rmw_uds::drain_endpoint(rmw_uds::drain_target(sub));
+      if (enqueued > 0 &&
+        std::find(event_only_subs.begin(), event_only_subs.end(), sub) != event_only_subs.end())
+      {
+        rmw_uds::signal_delivery_fds(ws_data->context);
+      }
+    };
   {
     struct epoll_event ev;
     std::memset(&ev, 0, sizeof(ev));
@@ -365,6 +421,21 @@ rmw_ret_t rmw_wait(
     // the dispatch below therefore re-checks the caller's queues instead of
     // treating the wake itself as progress.
     register_fd(delivery_fd, rmw_uds::ARMED_DELIVERY, nullptr, 0);
+    for (size_t i = 0; events && i < events->event_count; ++i) {
+      const auto * event = static_cast<const rmw_event_t *>(events->events[i]);
+      if (!event || event->event_type != RMW_EVENT_MESSAGE_LOST) {
+        continue;
+      }
+      auto * sub = static_cast<rmw_uds::UdsSubscription *>(event->data);
+      bool requested = false;
+      for (size_t j = 0; subscriptions && !requested && j < subscriptions->subscriber_count; ++j) {
+        requested = subscriptions->subscribers[j] == sub;
+      }
+      if (!requested) {
+        event_only_subs.push_back(sub);
+        register_fd(sub->socket_fd, rmw_uds::ARMED_SUBSCRIPTION, sub, sub->uid);
+      }
+    }
   }
 
   // Fallback for entities epoll cannot watch: drain their sockets directly so
@@ -373,11 +444,9 @@ rmw_ret_t rmw_wait(
   // reads every caller GC directly.
   for (const auto & ue : unarmed) {
     switch (ue.kind) {
-      case rmw_uds::ARMED_SUBSCRIPTION: {
-          auto * sub = static_cast<rmw_uds::UdsSubscription *>(ue.entity);
-          rmw_uds::drain_endpoint(rmw_uds::drain_target(sub));
-          break;
-        }
+      case rmw_uds::ARMED_SUBSCRIPTION:
+        drain_subscription(static_cast<rmw_uds::UdsSubscription *>(ue.entity));
+        break;
       case rmw_uds::ARMED_SERVICE: {
           auto * srv = static_cast<rmw_uds::UdsService *>(ue.entity);
           rmw_uds::drain_endpoint(rmw_uds::drain_target(srv));
@@ -408,6 +477,18 @@ rmw_ret_t rmw_wait(
     while (read(delivery_fd, &val, sizeof(val)) == static_cast<ssize_t>(sizeof(val))) {
     }
   }
+
+  // Events the caller waits on with untaken status changes. A message_lost
+  // gains them in the drains, a matched one when the registry moves.
+  auto caller_event_ready = [&]() {
+      for (size_t i = 0; events && i < events->event_count; ++i) {
+        const auto * ev = static_cast<const rmw_event_t *>(events->events[i]);
+        if (ev && rmw_uds::event_has_unread(ev)) {
+          return true;
+        }
+      }
+      return false;
+    };
 
   auto caller_queue_has_work = [&]() {
       if (subscriptions) {
@@ -444,7 +525,7 @@ rmw_ret_t rmw_wait(
       return false;
     };
 
-  bool something_ready = caller_queue_has_work();
+  bool something_ready = caller_queue_has_work() || caller_event_ready();
 
   // Per-GC readiness from the consuming read below, carried to the output
   // pass. One read drains the whole eventfd counter, so we never write it back
@@ -563,9 +644,11 @@ rmw_ret_t rmw_wait(
         switch (entry.kind) {
           case rmw_uds::ARMED_SUBSCRIPTION: {
               auto * sub = static_cast<rmw_uds::UdsSubscription *>(entry.entity);
-              rmw_uds::drain_endpoint(rmw_uds::drain_target(sub));
+              drain_subscription(sub);
+              const bool requested = std::find(
+                event_only_subs.begin(), event_only_subs.end(), sub) == event_only_subs.end();
               std::lock_guard<std::mutex> lock(sub->queue_mutex);
-              if (!sub->message_queue.empty()) {
+              if (requested && !sub->message_queue.empty()) {
                 progressed = true;
               }
               break;
@@ -608,9 +691,10 @@ rmw_ret_t rmw_wait(
             rang = true;
             break;
           case rmw_uds::ARMED_DELIVERY: {
-              // The listener enqueued for some endpoint in this context. Drain
-              // the counter so a level-triggered fd cannot spin this loop, and
-              // note that the caller's queues need re-checking.
+              // The listener enqueued for some endpoint in this context, or a
+              // thread recorded a lost message. Drain the counter so a
+              // level-triggered fd cannot spin this loop, and note that the
+              // caller's queues need re-checking.
               uint64_t val;
               while (read(rfd, &val, sizeof(val)) ==
                 static_cast<ssize_t>(sizeof(val)))
@@ -631,6 +715,13 @@ rmw_ret_t rmw_wait(
         // says nothing about whether THIS caller's entities gained work. Only
         // a non-empty queue among them is progress.
         progressed = caller_queue_has_work();
+      }
+      if (!progressed) {
+        // A drain - above, or on another thread, which then signals this
+        // wait's delivery_fd - can find messages lost, and a graph change -
+        // seen here, or fanned out to that fd by whoever saw it - can move a
+        // match.
+        progressed = caller_event_ready();
       }
       if (poll_only) {
         if (n == 64) {
@@ -714,10 +805,16 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  // Events — not supported, set all to null
+  // Events: ready while they hold untaken status changes. An unsupported event
+  // never got past *_event_init, so it cannot be here.
   if (events) {
     for (size_t i = 0; i < events->event_count; ++i) {
-      events->events[i] = nullptr;
+      const auto * ev = static_cast<const rmw_event_t *>(events->events[i]);
+      if (ev && rmw_uds::event_has_unread(ev)) {
+        any_ready = true;
+      } else {
+        events->events[i] = nullptr;
+      }
     }
   }
 
