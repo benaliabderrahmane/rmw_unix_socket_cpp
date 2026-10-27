@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -1230,4 +1231,93 @@ TEST_F(EventTest, DestroyingTheLastMatchedCallbacksEndpointUnwatchesTheDoorbell)
   EXPECT_TRUE(doorbell_watched());
   ASSERT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, other));  // callback still set
   EXPECT_FALSE(doorbell_watched());
+}
+
+// The gap check does arithmetic on a number off the wire, which any local
+// process can write. Publishers number from 1: a datagram numbered 0 must not
+// become a baseline that the next number overflows against (0 then INT64_MAX
+// made seq - seen - 1 overflow and counted ~9.2e18 losses).
+TEST_F(EventTest, ADatagramNumberedBelowOneIsNotGapChecked)
+{
+  auto * data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+  rmw_uds::WireHeader hdr{};
+  hdr.gid[0] = 0xCD;  // a publisher this subscription has never heard from
+  const uint8_t payload[4] = {};
+  hdr.payload_size = sizeof(payload);
+  for (const int64_t seq : {int64_t{0}, std::numeric_limits<int64_t>::max()}) {
+    hdr.sequence_number = seq;
+    ASSERT_TRUE(send_raw(data->socket_path, hdr, payload, sizeof(payload)));
+  }
+  wait_on_sub(sub);  // both are queued; the wait drains them
+
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_MESSAGE_LOST));
+  rmw_message_lost_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
+  EXPECT_EQ(0u, st.total_count);
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+// The listener holds listener_mutex across a whole drain. An rmw_wait that
+// sees a graph change - here a GraphListener's, holding a matched event -
+// fans it out, and must not do so through listener_mutex: it would stall
+// behind the drain, and deadlock when a listener callback polls a wait set.
+TEST_F(EventTest, AWaitThatSeesAGraphChangeDoesNotWaitForTheListener)
+{
+  auto * ctx = reinterpret_cast<rmw_uds::UdsContext *>(context.impl);
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, pub, RMW_EVENT_PUBLICATION_MATCHED));
+  rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * second = rmw_create_subscription(node, ts, "/event_test_topic", &qos, &sub_opts);
+  ASSERT_NE(nullptr, second);  // a graph change nobody has seen yet
+
+  std::atomic<bool> returned{false};
+  std::unique_lock<std::mutex> drain(ctx->listener_mutex);  // as the listener holds it
+  std::thread waiter([&]() {
+      void * arr[1] = {&ev};
+      rmw_events_t events{1, arr};
+      rmw_time_t timeout{0, 0};
+      (void)rmw_wait(nullptr, nullptr, nullptr, nullptr, &events, ws, &timeout);
+      returned.store(true);
+    });
+  for (int waited = 0; !returned.load() && waited < 2000; waited += 5) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_TRUE(returned.load()) << "the wait blocked on listener_mutex";
+  drain.unlock();
+  waiter.join();
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, second));
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+// A datagram whose descriptor no longer resolves counts as one lost message -
+// but only a publish the gap check had not passed yet. One numbered at or
+// below what its publisher was already counted up to is not a new loss.
+TEST_F(EventTest, AnUnresolvableDescriptorAlreadyCountedIsNotCountedAgain)
+{
+  auto * data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+  rmw_uds::WireHeader hdr{};
+  hdr.gid[0] = 0xEF;  // a publisher this subscription has never heard from
+  const uint8_t payload[4] = {};
+  hdr.payload_size = sizeof(payload);
+  hdr.sequence_number = 5;
+  ASSERT_TRUE(send_raw(data->socket_path, hdr, payload, sizeof(payload)));  // baseline
+  hdr.msg_type = rmw_uds::SHM_PAYLOAD_FLAG;
+  const rmw_uds::ShmPayloadDescriptor desc{};  // names no ring
+  hdr.payload_size = sizeof(desc);
+  hdr.sequence_number = 3;
+  ASSERT_TRUE(send_raw(data->socket_path, hdr, &desc, sizeof(desc)));
+  wait_on_sub(sub);  // the baseline is queued; the wait drains both
+
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_MESSAGE_LOST));
+  rmw_message_lost_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
+  EXPECT_EQ(0u, st.total_count);
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
 }

@@ -125,13 +125,16 @@ size_t drain_endpoint(const DrainTarget & t)
       if (t.ignore_local && is_same_context(hdr, t.context_id)) {
         continue;  // ignore_local_publications: drop same-context publications
       }
-      if (t.last_sequence) {
+      bool fresh = false;  // a publish newer than any seen from its publisher
+      if (t.last_sequence && hdr.sequence_number > 0) {
         // message_lost. A publisher numbers each publish once, for every
         // subscriber, in send order (UdsPublisher::send_mutex), so a jump in
         // its sequence is datagrams that never arrived here (the kernel
         // dropped them, or the sender did on a full socket). Checked before
         // the dedup below, which drops on purpose. The first datagram from a
-        // publisher only sets the baseline.
+        // publisher only sets the baseline. Publishers number from 1, so a
+        // number below that is not one of their publishes, and keeping it out
+        // keeps the arithmetic below on wire values from overflowing.
         std::array<uint8_t, 16> key;
         std::memcpy(key.data(), hdr.gid, key.size());
         const int64_t seq = hdr.sequence_number;  // packed: no reference to it
@@ -158,8 +161,11 @@ size_t drain_endpoint(const DrainTarget & t)
           seen = &it->second;
         }
         if (seq > *seen) {
-          lost += static_cast<size_t>(seq - *seen - 1);
+          // Unsigned: exact for any seq > seen, whatever the wire carried.
+          lost += static_cast<size_t>(
+            static_cast<uint64_t>(seq) - static_cast<uint64_t>(*seen) - 1);
           *seen = seq;
+          fresh = true;
         }
       }
       if (t.replay_watermarks) {
@@ -187,8 +193,9 @@ size_t drain_endpoint(const DrainTarget & t)
       }
       if (!shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload)) {
         // shm descriptor unresolvable (sender gone / ring lapped): the
-        // datagram arrived but the message is gone, so it counts as lost.
-        lost += t.last_sequence ? 1 : 0;
+        // datagram arrived but the message is gone, so it counts as lost -
+        // once, and only as a publish the gap check had not already passed.
+        lost += fresh ? 1 : 0;
         continue;
       }
 
