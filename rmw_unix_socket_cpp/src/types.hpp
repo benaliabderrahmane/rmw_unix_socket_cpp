@@ -284,6 +284,9 @@ struct UdsContext
   // bytes into a recycled fd number. A leaf lock - nothing is taken under it -
   // so any thread can signal under whatever it holds: the listener under
   // listener_mutex, or a drain that records a loss inside a user callback.
+  // listener_wake_fd is also replaced and closed under it (as well as under
+  // listener_mutex), so listener_graph_changed can wake the listener from an
+  // rmw_wait without taking listener_mutex.
   //
   // listener_stopping is set while listener_stop() is between releasing
   // listener_mutex and finishing its join - it has to release it, because the
