@@ -26,8 +26,8 @@ four copies of the receive loop that hid the gap are one.
   callbacks; the listener watches the doorbell while a matched callback exists.
   This fixes `ros2 bag record` on jazzy, which exited at startup because
   rosbag2 always asks for `message_lost`, and image_pipeline's lazy nodes and
-  Nav2's costmap republish, which key off `matched`. Deadline, liveliness,
-  incompatible QoS and incompatible type stay refused.
+  Nav2's costmap republish, which key off `matched`. Deadline and liveliness
+  (#24, #25), incompatible QoS and incompatible type (#92) stay refused.
 - **Listener thread for callback-driven delivery.** An endpoint that registers
   a listener callback is watched by one per-context thread that drains its
   socket and fires the callback with no application thread involved. It is

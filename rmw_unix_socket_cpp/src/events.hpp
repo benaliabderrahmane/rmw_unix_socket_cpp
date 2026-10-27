@@ -37,8 +37,9 @@ bool event_has_unread(const rmw_event_t * event);
 // needs the doorbell, as a graph guard condition does.
 bool event_is_graph_driven(const rmw_event_t * event);
 
-// Record `lost` messages a drain found missing and fire the callback. The
-// caller must not hold the subscription's drain_mutex or queue_mutex.
+// Record `lost` messages a drain found missing, fire the callback, then signal
+// every wait set. The caller must not hold the subscription's drain_mutex or
+// queue_mutex.
 void record_message_lost(UdsSubscription * sub, size_t lost);
 
 // Listener thread, with listener_mutex held, after a doorbell ring: recompute
@@ -49,10 +50,11 @@ void notify_graph_events(UdsContext * ctx);
 // socket watched by the listener (see listener_set_callback).
 bool message_lost_callback_set(UdsSubscription * sub);
 
-// Drop the endpoint's entries from ctx->graph_events. Called by the endpoint
-// destroys before they free anything; takes listener_mutex, so it also waits
-// out a notify_graph_events() in flight.
-void forget_graph_events(UdsContext * ctx, void * endpoint);
+// Drop the endpoint's entries from ctx->graph_events and its count in
+// ctx->matched_events. `matched_type` is the endpoint's matched event type.
+// Called by the endpoint destroys before they free anything; takes
+// listener_mutex, so it also waits out a notify_graph_events() in flight.
+void forget_graph_events(UdsContext * ctx, void * endpoint, rmw_event_type_t matched_type);
 
 // Register the context's doorbell slot if it is not registered yet, so
 // registry mutations in any process ring it. Returns false only when the

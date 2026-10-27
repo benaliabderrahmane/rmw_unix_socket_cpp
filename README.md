@@ -148,7 +148,8 @@ events are reported; deadline, liveliness, incompatible-QoS and
 incompatible-type are refused with `RMW_RET_UNSUPPORTED`. Deadline and liveliness
 need a clock nothing here runs, and this transport delivers to every
 subscription on a topic whatever its QoS or type, so an incompatible-QoS event
-would report a failure that does not happen. `rclcpp` catches the refusal for
+would report a failure that does not happen (#92 plans QoS- and type-aware
+matching). `rclcpp` catches the refusal for
 the handlers it installs by default (with a warning per handler on kilted and
 later); on jazzy, a handler for a refused type that the application registers
 itself throws. The listener callbacks an `EventsExecutor` needs are supported. The full list and the reasoning behind each is in

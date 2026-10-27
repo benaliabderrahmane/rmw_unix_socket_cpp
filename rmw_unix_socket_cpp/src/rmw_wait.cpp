@@ -215,8 +215,8 @@ rmw_ret_t rmw_destroy_wait_set(rmw_wait_set_t * wait_set)
 
   auto * ws_data = static_cast<rmw_uds::UdsWaitSet *>(wait_set->data);
   if (ws_data) {
-    // Deregister strictly BEFORE the close, under listener_mutex: the other
-    // order lets the listener write 8 bytes into a recycled fd number.
+    // Deregister strictly BEFORE the close, under delivery_fds_mutex: the
+    // other order lets a signal write 8 bytes into a recycled fd number.
     rmw_uds::listener_remove_delivery_fd(ws_data->context, ws_data->delivery_fd);
     if (ws_data->delivery_fd >= 0) {
       close(ws_data->delivery_fd);
@@ -334,6 +334,17 @@ rmw_ret_t rmw_wait(
   // found by draining, and the caller need not have passed the subscription.
   // Their queues are not progress - nobody here asked for their messages.
   std::vector<const void *> event_only_subs;
+  // A drain for such an event may queue messages another wait set is blocked
+  // on, having emptied its socket, so it wakes the wait sets as the listener
+  // does.
+  auto drain_subscription = [&](rmw_uds::UdsSubscription * sub) {
+      const size_t enqueued = rmw_uds::drain_endpoint(rmw_uds::drain_target(sub));
+      if (enqueued > 0 &&
+        std::find(event_only_subs.begin(), event_only_subs.end(), sub) != event_only_subs.end())
+      {
+        rmw_uds::signal_delivery_fds(ws_data->context);
+      }
+    };
   {
     struct epoll_event ev;
     std::memset(&ev, 0, sizeof(ev));
@@ -433,11 +444,9 @@ rmw_ret_t rmw_wait(
   // reads every caller GC directly.
   for (const auto & ue : unarmed) {
     switch (ue.kind) {
-      case rmw_uds::ARMED_SUBSCRIPTION: {
-          auto * sub = static_cast<rmw_uds::UdsSubscription *>(ue.entity);
-          rmw_uds::drain_endpoint(rmw_uds::drain_target(sub));
-          break;
-        }
+      case rmw_uds::ARMED_SUBSCRIPTION:
+        drain_subscription(static_cast<rmw_uds::UdsSubscription *>(ue.entity));
+        break;
       case rmw_uds::ARMED_SERVICE: {
           auto * srv = static_cast<rmw_uds::UdsService *>(ue.entity);
           rmw_uds::drain_endpoint(rmw_uds::drain_target(srv));
@@ -635,7 +644,7 @@ rmw_ret_t rmw_wait(
         switch (entry.kind) {
           case rmw_uds::ARMED_SUBSCRIPTION: {
               auto * sub = static_cast<rmw_uds::UdsSubscription *>(entry.entity);
-              rmw_uds::drain_endpoint(rmw_uds::drain_target(sub));
+              drain_subscription(sub);
               const bool requested = std::find(
                 event_only_subs.begin(), event_only_subs.end(), sub) == event_only_subs.end();
               std::lock_guard<std::mutex> lock(sub->queue_mutex);
@@ -682,9 +691,10 @@ rmw_ret_t rmw_wait(
             rang = true;
             break;
           case rmw_uds::ARMED_DELIVERY: {
-              // The listener enqueued for some endpoint in this context. Drain
-              // the counter so a level-triggered fd cannot spin this loop, and
-              // note that the caller's queues need re-checking.
+              // The listener enqueued for some endpoint in this context, or a
+              // thread recorded a lost message. Drain the counter so a
+              // level-triggered fd cannot spin this loop, and note that the
+              // caller's queues need re-checking.
               uint64_t val;
               while (read(rfd, &val, sizeof(val)) ==
                 static_cast<ssize_t>(sizeof(val)))
@@ -707,9 +717,10 @@ rmw_ret_t rmw_wait(
         progressed = caller_queue_has_work();
       }
       if (!progressed) {
-        // A drain above can find messages lost, and a graph change - seen here,
-        // or fanned out to this wait's delivery_fd by whoever saw it - can
-        // move a match.
+        // A drain - above, or on another thread, which then signals this
+        // wait's delivery_fd - can find messages lost, and a graph change -
+        // seen here, or fanned out to that fd by whoever saw it - can move a
+        // match.
         progressed = caller_event_ready();
       }
       if (poll_only) {

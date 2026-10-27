@@ -52,10 +52,9 @@ static void drain_eventfd(int fd)
   }
 }
 
-// Wake every live wait set. Called with listener_mutex held, which guards
-// delivery_fds.
-static void signal_delivery_fds(UdsContext * ctx)
+void signal_delivery_fds(UdsContext * ctx)
 {
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
   uint64_t val = 1;
   for (const int delivery_fd : ctx->delivery_fds) {
     ssize_t ret = write(delivery_fd, &val, sizeof(val));
@@ -96,9 +95,7 @@ static void listener_loop(UdsContext * ctx)
 
       // Held across the drain: listener_unwatch() takes this mutex, so a
       // thread destroying an endpoint blocks here until the drain - and the
-      // callback it fires - has returned. It also guards delivery_fds, so a
-      // wait set cannot be deregistered and closed between the enqueue and
-      // the signal below.
+      // callback it fires - has returned.
       std::lock_guard<std::mutex> lock(ctx->listener_mutex);
       auto it = ctx->listener_targets.find(fd);
       if (it == ctx->listener_targets.end()) {
@@ -291,7 +288,7 @@ void listener_add_delivery_fd(UdsContext * ctx, int fd)
   if (!ctx || fd < 0) {
     return;
   }
-  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
   ctx->delivery_fds.push_back(fd);
 }
 
@@ -300,7 +297,7 @@ void listener_remove_delivery_fd(UdsContext * ctx, int fd)
   if (!ctx || fd < 0) {
     return;
   }
-  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
   auto & fds = ctx->delivery_fds;
   fds.erase(std::remove(fds.begin(), fds.end(), fd), fds.end());
 }

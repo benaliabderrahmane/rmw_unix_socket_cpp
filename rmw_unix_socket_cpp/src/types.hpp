@@ -201,6 +201,9 @@ struct UdsMatchedState
   int32_t current_count_change = 0;
   size_t unread = 0;
   UdsEventCallback cb;
+  // Counted in UdsContext::matched_events since the first event init on this
+  // endpoint; released when the endpoint is destroyed.
+  bool counted = false;
 };
 
 struct UdsMessageLostState
@@ -276,9 +279,11 @@ struct UdsContext
   // first consumes - including one that gained no work of its own and simply
   // discards it. The fds are created in rmw_create_wait_set, before any
   // listener exists, so a callback registered while a wait is already blocked
-  // still reaches it. Guarded by listener_mutex, which rmw_destroy_wait_set
-  // takes to deregister before it closes the fd - otherwise the listener
-  // writes 8 bytes into a recycled fd number.
+  // still reaches it. Guarded by delivery_fds_mutex, which rmw_destroy_wait_set
+  // takes to deregister before it closes the fd - otherwise a signal writes 8
+  // bytes into a recycled fd number. A leaf lock - nothing is taken under it -
+  // so any thread can signal under whatever it holds: the listener under
+  // listener_mutex, or a drain that records a loss inside a user callback.
   //
   // listener_stopping is set while listener_stop() is between releasing
   // listener_mutex and finishing its join - it has to release it, because the
@@ -306,13 +311,17 @@ struct UdsContext
   std::recursive_mutex listener_registration_mutex;
   std::unordered_map<int, ArmedEntry> listener_targets;
   std::vector<int> delivery_fds;
+  std::mutex delivery_fds_mutex;
   // Matched events with a callback registered, as (endpoint data, event type).
   // The listener watches the doorbell while any exist and recomputes these on
   // every graph change, so an executor that never waits still hears them.
-  // Guarded by listener_mutex; rmw_event_fini and the endpoint destroys remove
-  // their entries before the endpoint is freed.
+  // Guarded by listener_mutex; clearing the callback and the endpoint destroys
+  // remove their entries before the endpoint is freed.
   std::vector<std::pair<void *, rmw_event_type_t>> graph_events;
-  // Live matched events in this context, waited on or not. While it is zero a
+  // Endpoints in this context that have had a matched event, waited on or
+  // not, counted from the first init until the endpoint is destroyed: rcl's
+  // event fini never reaches an RMW (librmw implements rmw_event_fini itself),
+  // so the endpoint is the only lifetime this RMW sees. While it is zero a
   // graph change only triggers the graph guard conditions, as it always did;
   // otherwise whoever observes it also wakes every wait set and the listener
   // (listener_graph_changed), since any of them may hold a matched event.
@@ -367,11 +376,13 @@ struct UdsPublisher
   std::mutex shm_mutex;
   ShmRingWriter shm_ring;
 
-  // Held from numbering a volatile publish to its last send, after the
-  // message is serialized. Concurrent publishes on one publisher then reach
-  // every subscriber in sequence order, and a failed serialization consumes
-  // no number - either would read as a lost message to a subscriber's gap
-  // check (message_lost). The TRANSIENT_LOCAL path orders under cache_mutex.
+  // Held from choosing a volatile publish's recipients to its last send,
+  // after the message is serialized. Concurrent publishes on one publisher
+  // then reach every subscriber in sequence order, a subscriber that joins
+  // gets every publish numbered after its first, and a failed serialization
+  // consumes no number - each would otherwise read as a lost message to a
+  // subscriber's gap check (message_lost). Taken before sub_cache_mutex. The
+  // TRANSIENT_LOCAL path orders under cache_mutex.
   std::mutex send_mutex;
 
   // QoS status events. Recursive: an event callback may take its own event.
