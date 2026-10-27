@@ -55,6 +55,15 @@ void forget_graph_events(UdsContext * ctx, void * endpoint);
 // registry is full. Implemented in rmw_wait.cpp, its first user.
 bool ensure_doorbell_registered(UdsContext * ctx);
 
+// A doorbell ring is consumed by whichever reader gets it first - any rmw_wait
+// in the process, or the listener - so the one that sees the registry
+// generation move owns telling everyone else. observe_generation() advances
+// ctx->last_registry_generation and is true only for the caller that moved
+// it, which then calls trigger_graph_gcs() and listener_graph_changed().
+// Implemented in rmw_wait.cpp.
+bool observe_generation(UdsContext * ctx);
+void trigger_graph_gcs(UdsContext * ctx);
+
 }  // namespace rmw_uds
 
 #endif  // RMW_UNIX_SOCKET_CPP__EVENTS_HPP_
