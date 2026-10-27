@@ -24,6 +24,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -358,9 +359,9 @@ TEST_F(EventTest, TakeEventRejectsBadArguments)
   rmw_reset_error();
 }
 
-// rcl_event_fini skips rmw_event_fini when event->impl is NULL, which is what
-// rcl_*_event_init leaves behind after an RMW_RET_UNSUPPORTED - but a handle no
-// init filled in must still be harmless to finalize.
+// rcl never reaches this RMW's rmw_event_fini - librmw implements it, and
+// rmw_implementation does not forward it - but a direct caller's fini of a
+// handle no init filled in must still be harmless.
 TEST_F(EventTest, EventFiniOfAnUninitializedHandleIsANoOp)
 {
   rmw_event_t zero = rmw_get_zero_initialized_event();
@@ -526,7 +527,7 @@ TEST_F(EventTest, MatchedCallbackFiresWithNoThreadInWait)
   EXPECT_EQ(2u, st.current_count);
   EXPECT_EQ(1, st.current_count_change);
 
-  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));  // clears the callback first
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, second));
 }
 
@@ -538,6 +539,7 @@ TEST_F(EventTest, ReRegisteringAMatchedCallbackDoesNotRepayIt)
   ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, pub, RMW_EVENT_PUBLICATION_MATCHED));
   EventCounter counter;
   ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &counter));
+  OnExit clear{[&]() {(void)rmw_event_set_callback(&ev, nullptr, nullptr);}};
   ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &counter));
   EXPECT_EQ(1u, counter.calls.load());
   EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
@@ -576,6 +578,30 @@ TEST_F(EventTest, AChangeReadByAReRegistrationIsStillAnnounced)
 
   ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
   EXPECT_EQ(1, st.current_count_change);
+}
+
+// Event state is per endpoint and type, so a second handle on one endpoint
+// shares the first one's callback. Its init may be first to read a change,
+// and must announce it: the listener, finding that generation read, will not.
+TEST_F(EventTest, AChangeReadByASecondHandlesInitIsStillAnnounced)
+{
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, pub, RMW_EVENT_PUBLICATION_MATCHED));
+  EventCounter counter;
+  ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &counter));
+  OnExit clear{[&]() {(void)rmw_event_set_callback(&ev, nullptr, nullptr);}};
+  rmw_matched_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));  // the existing match
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * second = rmw_create_subscription(node, ts, "/event_test_topic", &qos, &sub_opts);
+  ASSERT_NE(nullptr, second);
+  OnExit destroy{[&]() {(void)rmw_destroy_subscription(node, second);}};
+  rmw_event_t other = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&other, pub, RMW_EVENT_PUBLICATION_MATCHED));
+  EXPECT_TRUE(await_calls(counter, 2)) << "the second init absorbed the new match";
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&other));
 }
 
 TEST_F(EventTest, MessageLostCountsSequenceGaps)
@@ -984,7 +1010,9 @@ TEST_F(EventTest, HistoryDeliveredByTheLateJoinerPullIsNotLost)
   hdr.payload_size = sizeof(payload);
   ASSERT_TRUE(send_raw(data->socket_path, hdr, payload, sizeof(payload)));
   ASSERT_EQ(RMW_RET_OK, rmw_publish(tl_pub, &msg, nullptr));  // live: sequence 4
-  wait_on_sub(tl_sub);  // a first arming drains the socket
+  // The replayed queue satisfies this wait at once; its non-blocking poll
+  // pass still drains the socket.
+  wait_on_sub(tl_sub);
 
   rmw_event_t ev = rmw_get_zero_initialized_event();
   ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, tl_sub, RMW_EVENT_MESSAGE_LOST));
@@ -993,4 +1021,191 @@ TEST_F(EventTest, HistoryDeliveredByTheLateJoinerPullIsNotLost)
   ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
   EXPECT_EQ(0u, st.total_count) << "sequence 3 came through the pull";
   EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+
+// A drain on one thread can empty a socket another thread's wait is blocked
+// on, and that wait's epoll then never sees the socket readable. Here a taker
+// spins on the subscription while a waiter blocks on its message_lost event
+// alone: the thread that records each loss has to wake the waiter.
+TEST_F(EventTest, AWaitWakesForALossAnotherThreadRecorded)
+{
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_MESSAGE_LOST));
+  rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  std::atomic<bool> stop{false};
+  std::atomic<size_t> reported{0};
+  std::thread waiter([&]() {
+      while (!stop.load()) {
+        void * arr[1] = {&ev};
+        rmw_events_t events{1, arr};
+        rmw_time_t timeout{1, 0};
+        (void)rmw_wait(nullptr, nullptr, nullptr, nullptr, &events, ws, &timeout);
+        if (arr[0]) {
+          rmw_message_lost_status_t st{};
+          bool taken = false;
+          (void)rmw_take_event(&ev, &st, &taken);
+          reported.fetch_add(st.total_count_change);
+        }
+      }
+    });
+  std::thread taker([&]() {
+      test_msgs::msg::BasicTypes msg;
+      while (!stop.load()) {
+        bool taken = false;
+        (void)rmw_take(sub, &msg, &taken, nullptr);
+      }
+    });
+  OnExit join{[&]() {
+      stop.store(true);
+      taker.join();
+      waiter.join();  // within its 1 s timeout
+      (void)rmw_destroy_wait_set(ws);
+      (void)rmw_event_fini(&ev);
+    }};
+
+  publish(0);  // baseline
+  size_t late = 0;
+  for (size_t gap = 1; gap <= 20; ++gap) {
+    skip_publications(pub, 1);
+    publish(static_cast<int32_t>(gap));
+    int waited = 0;
+    for (; reported.load() < gap && waited < 1500; waited += 1) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(gap, reported.load()) << "loss " << gap << " never reported";
+    late += waited >= 500 ? 1 : 0;  // reported only by the wait's own timeout
+  }
+  EXPECT_EQ(0u, late) << "the waiter slept through a loss another thread recorded";
+}
+
+// A publish that chose its recipients before a subscription joined, and was
+// numbered after a publish that reached it, would leave the newcomer a gap
+// that nothing dropped. Bystander subscriptions lengthen each send loop, so
+// the publishing threads queue on the send lock while one joins, and the
+// order they get it in is up to the scheduler. Each round sends at most 100
+// messages, few enough for the newcomer's socket, so no loss is real.
+TEST_F(EventTest, ASubscriptionThatJoinsMidPublishSeesNoFalseGap)
+{
+  auto sub_opts = rmw_get_default_subscription_options();
+  std::vector<rmw_subscription_t *> bystanders;
+  OnExit destroy{[&]() {
+      for (auto * b : bystanders) {(void)rmw_destroy_subscription(node, b);}
+    }};
+  for (int i = 0; i < 16; ++i) {
+    bystanders.push_back(rmw_create_subscription(node, ts, "/event_test_topic", &qos, &sub_opts));
+    ASSERT_NE(nullptr, bystanders.back());
+  }
+  rmw_qos_profile_t deep = qos;
+  deep.depth = 1000;
+
+  size_t false_losses = 0;
+  for (int round = 0; round < 100; ++round) {
+    std::atomic<bool> stop{false};
+    auto burst = [&]() {
+        test_msgs::msg::BasicTypes msg;
+        for (int i = 0; i < 25 && !stop.load(); ++i) {
+          (void)rmw_publish(pub, &msg, nullptr);
+        }
+      };
+    std::vector<std::thread> publishers;
+    for (int t = 0; t < 4; ++t) {
+      publishers.emplace_back(burst);
+    }
+    auto * joiner = rmw_create_subscription(node, ts, "/event_test_topic", &deep, &sub_opts);
+    for (auto & t : publishers) {
+      t.join();
+    }
+    ASSERT_NE(nullptr, joiner);
+    rmw_event_t ev = rmw_get_zero_initialized_event();
+    EXPECT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, joiner, RMW_EVENT_MESSAGE_LOST));
+    test_msgs::msg::BasicTypes msg;
+    bool got = false;
+    EXPECT_EQ(RMW_RET_OK, rmw_take(joiner, &msg, &got, nullptr));  // drains the socket first
+    rmw_message_lost_status_t st{};
+    bool taken = false;
+    EXPECT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
+    false_losses += st.total_count;
+    EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+    EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, joiner));
+  }
+  EXPECT_EQ(0u, false_losses);
+}
+
+// rcl's event fini never reaches an RMW (librmw implements rmw_event_fini), so
+// the endpoint is the only lifetime the matched count can follow. Left
+// counted, every later graph change in the process would wake every wait set.
+TEST_F(EventTest, ADestroyedEndpointReleasesItsMatchedCount)
+{
+  auto * ctx = reinterpret_cast<rmw_uds::UdsContext *>(context.impl);
+  const int before = ctx->matched_events.load();
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * other = rmw_create_publisher(node, ts, "/event_test_topic", &qos, &pub_opts);
+  ASSERT_NE(nullptr, other);
+  for (int i = 0; i < 2; ++i) {  // two handles on one endpoint count it once
+    rmw_event_t ev = rmw_get_zero_initialized_event();
+    ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, other, RMW_EVENT_PUBLICATION_MATCHED));
+  }
+  EXPECT_EQ(before + 1, ctx->matched_events.load());
+  ASSERT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, other));  // no fini, as under rcl
+  EXPECT_EQ(before, ctx->matched_events.load());
+}
+
+// A wait that holds a message_lost event without its subscription drains the
+// subscription for it, and may so empty the socket another wait set holding
+// the subscription is blocked on. It has to wake that wait for the messages
+// it queued.
+TEST_F(EventTest, AnEventOnlyWaitWakesTheWaitWhoseSocketItDrained)
+{
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_MESSAGE_LOST));
+  rmw_wait_set_t * event_ws = rmw_create_wait_set(&context, 1);
+  rmw_wait_set_t * sub_ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, event_ws);
+  ASSERT_NE(nullptr, sub_ws);
+  std::atomic<bool> stop{false};
+  std::atomic<size_t> received{0};
+  std::thread drainer([&]() {
+      while (!stop.load()) {
+        void * arr[1] = {&ev};
+        rmw_events_t events{1, arr};
+        rmw_time_t timeout{0, 1000000};
+        (void)rmw_wait(nullptr, nullptr, nullptr, nullptr, &events, event_ws, &timeout);
+      }
+    });
+  std::thread reader([&]() {
+      test_msgs::msg::BasicTypes msg;
+      while (!stop.load()) {
+        void * arr[1] = {sub->data};
+        rmw_subscriptions_t subs{1, arr};
+        rmw_time_t timeout{1, 0};
+        (void)rmw_wait(&subs, nullptr, nullptr, nullptr, nullptr, sub_ws, &timeout);
+        bool taken = true;
+        while (arr[0] && taken) {
+          (void)rmw_take(sub, &msg, &taken, nullptr);
+          received.fetch_add(taken ? 1 : 0);
+        }
+      }
+    });
+  OnExit join{[&]() {
+      stop.store(true);
+      drainer.join();
+      reader.join();  // within its 1 s timeout
+      (void)rmw_destroy_wait_set(event_ws);
+      (void)rmw_destroy_wait_set(sub_ws);
+      (void)rmw_event_fini(&ev);
+    }};
+
+  size_t late = 0;
+  for (size_t i = 1; i <= 20; ++i) {
+    publish(static_cast<int32_t>(i));
+    int waited = 0;
+    for (; received.load() < i && waited < 1500; waited += 1) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(i, received.load()) << "message " << i << " never taken";
+    late += waited >= 500 ? 1 : 0;  // taken only after the reader's timeout
+  }
+  EXPECT_EQ(0u, late) << "the reader slept through messages another wait queued";
 }

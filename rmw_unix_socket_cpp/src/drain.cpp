@@ -222,7 +222,8 @@ size_t drain_endpoint(const DrainTarget & t)
     }
   }
 
-  // With drain_mutex released, like the notification below.
+  // With drain_mutex released, like the notification below. Signals every
+  // wait set itself, so the return value below counts enqueues only.
   if (lost > 0 && t.lost_sub) {
     record_message_lost(t.lost_sub, lost);
   }
@@ -237,12 +238,9 @@ size_t drain_endpoint(const DrainTarget & t)
   // once per event - so an overflow that pushed 100 and popped 90 must report
   // 10, or the executor spends 90 takes finding nothing. At most one pop per
   // push, so dropped never exceeds enqueued.
-  // Non-zero whenever a waiter has something new to see, a recorded loss
-  // included, so the listener signals the wait sets (see drain.hpp).
-  const size_t progress = enqueued + (lost > 0 ? 1 : 0);
   const size_t gained = enqueued - dropped;
   if (gained == 0 || !t.callback_mutex) {
-    return progress;
+    return enqueued;
   }
   // Notified with queue_mutex released. A callback is user code, and one that
   // calls rmw_take on its own endpoint would deadlock against a queue lock
@@ -252,7 +250,7 @@ size_t drain_endpoint(const DrainTarget & t)
   if (*t.callback) {
     (*t.callback)(*t.callback_user_data, gained);
   }
-  return progress;
+  return enqueued;
 }
 
 }  // namespace rmw_uds

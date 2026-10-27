@@ -187,11 +187,14 @@ Tests the QoS status events: which types are accepted or refused, the entry poin
 | `MatchedWaitWakesWhenAnotherWaitConsumesTheRing` | A wait holding only a publisher's matched event wakes while another wait set drains the doorbell | The image_pipeline lazy node beside a GraphListener: the change has to reach this wait set's `delivery_fd`. |
 | `ConcurrentPublishesOnOnePublisherAreNotLost` | Two threads publish 2000 each on one publisher; message_lost never exceeds what is actually missing | Numbered outside a lock, datagrams reached the subscriber out of order and counted as lost: 750 false losses of 4000 before the send lock. |
 | `GapsFromAnIgnoredLocalPublisherAreNotLost` | A subscription ignoring its own context's publications counts no loss from that publisher's gaps | What a subscription drops on purpose cannot be lost to it. |
+| `AChangeReadByASecondHandlesInitIsStillAnnounced` | A match that a second handle's init is first to read fires the callback registered through the first | Event state is per endpoint, so the init reads for both handles; the listener stays silent on a generation already read. Failed 10/10 before. |
 | `AChangeReadByAReRegistrationIsStillAnnounced` | A match that a callback re-registration is first to read still fires the callback | `rclcpp` registers twice, and the listener, finding that generation read, stays silent. Never fired before the fix. |
 | `AMessageLostCallbackAloneWatchesTheSocket` | With only a message_lost callback set, a gap fires it | An `EventsExecutor` may set no message callback; nothing else would drain the socket. |
 | `AWaitHoldingOnlyAMessageLostEventFindsTheGap` | A wait holding only a message_lost event drains the subscription, reports the event, and does not report the queued message | The rmw contract does not require waiting on the subscription with its events. |
 | `AnUnresolvableShmDescriptorCountsAsLost` | A forged descriptor naming no ring, alone on the socket, counts as one loss and queues nothing | What a gone or lapping sender leaves: the datagram arrived, the message did not. |
 | `HistoryDeliveredByTheLateJoinerPullIsNotLost` | A TRANSIENT_LOCAL late joiner whose socket holds a sequence below the pull's watermark counts no loss at the next live message | The pull delivered the sequences between; counted from the socket alone, one was lost. |
+| `AWaitWakesForALossAnotherThreadRecorded` | A wait blocked on a message_lost event wakes promptly for each of 20 losses while another thread's `rmw_take` drains the socket first | A drain can empty the socket the wait's epoll watches; the thread that records the loss must signal every wait set. Before, 19 or 20 of 20 waited out their timeout. |
+| `ASubscriptionThatJoinsMidPublishSeesNoFalseGap` | Over 100 rounds of four threads publishing while a subscription joins, the newcomer counts no loss | A publish that chose its recipients before the join, numbered after one that reached the newcomer, leaves a gap nothing dropped. Failed 4 of 10 runs before recipients were chosen under the send lock. |
 
 ### test_rmw_graph.cpp
 
@@ -232,7 +235,6 @@ Tests QoS policies, TRANSIENT_LOCAL (latched), and multi-endpoint scenarios.
 | Deadline / lifespan QoS | Not enforced — these are timer-based policies that require background monitoring. The listener thread is event-driven, not timer-driven (socket readiness, never a clock), so it does not make them enforceable. Accepted as a known limitation for this lightweight implementation. |
 | Deadline, liveliness, incompatible-QoS and incompatible-type events | Not generated. `test_rmw_event.cpp` tests the refusal instead: `rmw_event_type_is_supported` returns `false` for them and both `*_event_init` functions reject with `RMW_RET_UNSUPPORTED`, which `rclcpp` catches for the handlers it installs by default. |
 | `message_lost` from a real kernel drop | `test_rmw_event.cpp` injects the sequence gap a drop leaves instead of making the kernel drop datagrams, which a test cannot do on demand. |
-| The listener's wait-set signal after a drain that found only a loss | It matters to a wait only in the short window between the listener's receive loop and its loss record, where a test cannot place one on demand. `AnUnresolvableShmDescriptorCountsAsLost` covers that drain itself. |
 | Stress / scale tests (200+ nodes) | Requires a launch file and process management. Can be tested with the `test200.launch.xml` launch file separately. |
 
 ---
