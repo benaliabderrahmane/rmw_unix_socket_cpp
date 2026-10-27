@@ -45,6 +45,10 @@ void record_message_lost(UdsSubscription * sub, size_t lost);
 // every matched event in ctx->graph_events and fire the ones that changed.
 void notify_graph_events(UdsContext * ctx);
 
+// True while the subscription has a message_lost callback, which keeps its
+// socket watched by the listener (see listener_set_callback).
+bool message_lost_callback_set(UdsSubscription * sub);
+
 // Drop the endpoint's entries from ctx->graph_events. Called by the endpoint
 // destroys before they free anything; takes listener_mutex, so it also waits
 // out a notify_graph_events() in flight.

@@ -254,7 +254,12 @@ rmw_ret_t listener_set_callback(
   // which epoll reports level-triggered, so datagrams that arrived between the
   // two are delivered rather than dropped or double-reported.
   if (!callback) {
-    listener_unwatch(ctx, t.fd);
+    // A subscription's message_lost callback needs the socket drained too.
+    if (!(kind == ARMED_SUBSCRIPTION &&
+      message_lost_callback_set(static_cast<UdsSubscription *>(entity))))
+    {
+      listener_unwatch(ctx, t.fd);
+    }
     return RMW_RET_OK;
   }
   const rmw_ret_t ret = listener_watch(ctx, t.fd, kind, entity, uid);

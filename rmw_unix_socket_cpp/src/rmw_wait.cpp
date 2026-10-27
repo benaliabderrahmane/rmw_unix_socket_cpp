@@ -145,7 +145,9 @@ void trigger_graph_gcs(UdsContext * ctx)
   // condition is never triggered.
   std::lock_guard<std::mutex> gc_lock(ctx->graph_gcs_mutex);
   for (auto * gc : ctx->graph_gcs) {
-    auto _r [[maybe_unused]] = rmw_trigger_guard_condition(gc);
+    if (rmw_trigger_guard_condition(gc) != RMW_RET_OK) {
+      rmw_reset_error();  // a wake-up hint: nothing to report the failure to
+    }
   }
 }
 
@@ -328,6 +330,10 @@ rmw_ret_t rmw_wait(
   // Entities epoll could not watch (e.g. watch exhaustion): drained directly
   // each call below so they degrade to polling instead of vanishing.
   std::vector<rmw_uds::ArmedEntry> unarmed;
+  // Subscriptions armed only for a waited-on message_lost event: a loss is
+  // found by draining, and the caller need not have passed the subscription.
+  // Their queues are not progress - nobody here asked for their messages.
+  std::vector<const void *> event_only_subs;
   {
     struct epoll_event ev;
     std::memset(&ev, 0, sizeof(ev));
@@ -404,6 +410,21 @@ rmw_ret_t rmw_wait(
     // the dispatch below therefore re-checks the caller's queues instead of
     // treating the wake itself as progress.
     register_fd(delivery_fd, rmw_uds::ARMED_DELIVERY, nullptr, 0);
+    for (size_t i = 0; events && i < events->event_count; ++i) {
+      const auto * event = static_cast<const rmw_event_t *>(events->events[i]);
+      if (!event || event->event_type != RMW_EVENT_MESSAGE_LOST) {
+        continue;
+      }
+      auto * sub = static_cast<rmw_uds::UdsSubscription *>(event->data);
+      bool requested = false;
+      for (size_t j = 0; subscriptions && !requested && j < subscriptions->subscriber_count; ++j) {
+        requested = subscriptions->subscribers[j] == sub;
+      }
+      if (!requested) {
+        event_only_subs.push_back(sub);
+        register_fd(sub->socket_fd, rmw_uds::ARMED_SUBSCRIPTION, sub, sub->uid);
+      }
+    }
   }
 
   // Fallback for entities epoll cannot watch: drain their sockets directly so
@@ -615,8 +636,10 @@ rmw_ret_t rmw_wait(
           case rmw_uds::ARMED_SUBSCRIPTION: {
               auto * sub = static_cast<rmw_uds::UdsSubscription *>(entry.entity);
               rmw_uds::drain_endpoint(rmw_uds::drain_target(sub));
+              const bool requested = std::find(
+                event_only_subs.begin(), event_only_subs.end(), sub) == event_only_subs.end();
               std::lock_guard<std::mutex> lock(sub->queue_mutex);
-              if (!sub->message_queue.empty()) {
+              if (requested && !sub->message_queue.empty()) {
                 progressed = true;
               }
               break;

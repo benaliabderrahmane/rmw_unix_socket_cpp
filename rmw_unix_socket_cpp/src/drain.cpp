@@ -141,7 +141,18 @@ size_t drain_endpoint(const DrainTarget & t)
         if (!seen || key != seen_key) {
           auto it = t.last_sequence->find(key);
           if (it == t.last_sequence->end()) {
-            it = t.last_sequence->emplace(key, seq - 1).first;  // baseline: no gap
+            // The baseline is the first datagram - or, for a TRANSIENT_LOCAL
+            // late joiner, the creation-time pull's watermark when higher:
+            // sequences up to it came through the pull, not the socket.
+            int64_t base = seq - 1;
+            if (t.replay_watermarks) {
+              std::lock_guard<std::mutex> lock(*t.queue_mutex);
+              auto w = t.replay_watermarks->find(key);
+              if (w != t.replay_watermarks->end() && w->second > base) {
+                base = w->second;
+              }
+            }
+            it = t.last_sequence->emplace(key, base).first;
           }
           seen_key = key;
           seen = &it->second;
@@ -226,9 +237,12 @@ size_t drain_endpoint(const DrainTarget & t)
   // once per event - so an overflow that pushed 100 and popped 90 must report
   // 10, or the executor spends 90 takes finding nothing. At most one pop per
   // push, so dropped never exceeds enqueued.
+  // Non-zero whenever a waiter has something new to see, a recorded loss
+  // included, so the listener signals the wait sets (see drain.hpp).
+  const size_t progress = enqueued + (lost > 0 ? 1 : 0);
   const size_t gained = enqueued - dropped;
   if (gained == 0 || !t.callback_mutex) {
-    return enqueued;
+    return progress;
   }
   // Notified with queue_mutex released. A callback is user code, and one that
   // calls rmw_take on its own endpoint would deadlock against a queue lock
@@ -238,7 +252,7 @@ size_t drain_endpoint(const DrainTarget & t)
   if (*t.callback) {
     (*t.callback)(*t.callback_user_data, gained);
   }
-  return enqueued;
+  return progress;
 }
 
 }  // namespace rmw_uds
