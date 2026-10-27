@@ -183,6 +183,10 @@ Tests the QoS status events: which types are accepted or refused, the entry poin
 | `MessageLostIsReportedByTheWaitThatFoundIt` | A wait holding the subscription and its message_lost event reports the event from the drain that found the gap | rosbag2's recorder runs a waiting executor; before this, `ros2 bag record` exited at startup on jazzy. |
 | `MessageLostCallbackFiresFromTheListenerDrain` | With a message callback set, the listener's drain fires the message_lost callback | The `EventsExecutor` path: no thread waits or takes. |
 | `EventCallbackFiresOncePerUntakenBatch` | Two losses before a take fire one callback, the take collects both, and a loss after it fires again | The executor takes once per callback; a callback per change would leave takes with nothing new. |
+| `MatchedCallbackFiresWhenAnotherWaitConsumesTheRing` | A matched callback fires while a GraphListener-style thread keeps draining the doorbell | Every rmw_wait and the listener read one doorbell; whoever sees the generation move must wake the listener. Failed 2 of 10 runs before the fan-out. |
+| `MatchedWaitWakesWhenAnotherWaitConsumesTheRing` | A wait holding only a publisher's matched event wakes while another wait set drains the doorbell | The image_pipeline lazy node beside a GraphListener: the change has to reach this wait set's `delivery_fd`. |
+| `ConcurrentPublishesOnOnePublisherAreNotLost` | Two threads publish 2000 each on one publisher; message_lost never exceeds what is actually missing | Numbered outside a lock, datagrams reached the subscriber out of order and counted as lost: 750 false losses of 4000 before the send lock. |
+| `GapsFromAnIgnoredLocalPublisherAreNotLost` | A subscription ignoring its own context's publications counts no loss from that publisher's gaps | What a subscription drops on purpose cannot be lost to it. |
 
 ### test_rmw_graph.cpp
 

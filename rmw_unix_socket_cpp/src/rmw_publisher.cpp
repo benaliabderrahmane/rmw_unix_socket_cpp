@@ -380,9 +380,6 @@ rmw_ret_t rmw_publish(
     return transient_local_publish(pub_data, hdr, payload);
   }
 
-  hdr.sequence_number =
-    pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
-
   // PERFORMANCE: only lock the registry when the graph generation has changed
   // since we last cached the subscriber list. The hot path is purely local.
   auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
@@ -408,6 +405,11 @@ rmw_ret_t rmw_publish(
     RMW_SET_ERROR_MSG("failed to serialize message");
     return RMW_RET_ERROR;
   }
+
+  // Numbered only now, and sent under send_mutex (see UdsPublisher).
+  std::lock_guard<std::mutex> send_lock(pub_data->send_mutex);
+  hdr.sequence_number =
+    pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
 
   // Surface EMSGSIZE; soft drops (EAGAIN/ENOENT) are logged in send_to.
   bool config_error = false;
@@ -465,9 +467,6 @@ rmw_ret_t rmw_publish_serialized_message(
         serialized_message->buffer + serialized_message->buffer_length));
   }
 
-  hdr.sequence_number =
-    pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
-
   // Reuse the cached subscriber list (refresh only on graph change)
   auto * header = rmw_uds::registry_header(pub_data->context->registry_ptr);
   uint64_t current_gen = rmw_uds::registry_generation(header);
@@ -478,6 +477,11 @@ rmw_ret_t rmw_publish_serialized_message(
   auto wire = rmw_uds::shm_prepare_send(
     pub_data->shm_ring, pub_data->shm_mutex, pub_data->context->domain_id,
     serialized_message->buffer, serialized_message->buffer_length, hdr, desc);
+
+  // Numbered only now, and sent under send_mutex (see UdsPublisher).
+  std::lock_guard<std::mutex> send_lock(pub_data->send_mutex);
+  hdr.sequence_number =
+    pub_data->sequence_number.fetch_add(1, std::memory_order_relaxed);
 
   bool config_error = false;
   if (sub_paths) {

@@ -74,8 +74,11 @@ MatchedRef matched_of(void * endpoint, rmw_event_type_t type)
 // Re-read the peers if the registry generation moved since the last
 // recompute, and record the difference. The first recompute reports every
 // peer that already exists, as DDS reports the matches an endpoint is created
-// into. Returns true when something changed. The caller holds *ref.mutex.
-bool recompute(const MatchedRef & ref)
+// into. With `notify`, a change that starts an untaken batch fires the
+// callback - from whichever path noticed it, so a wait that absorbs a change
+// cannot leave an EventsExecutor unaware of it. Returns true when something
+// changed. The caller holds *ref.mutex.
+bool recompute(const MatchedRef & ref, bool notify)
 {
   if (!ref.ctx || !ref.ctx->registry_ptr) {
     return false;
@@ -111,7 +114,10 @@ bool recompute(const MatchedRef & ref)
   st.total_count += added;
   st.total_count_change += added;
   st.current_count_change += static_cast<int32_t>(added) - static_cast<int32_t>(removed);
-  ++st.unread;
+  // One take credit per batch, as in record_message_lost.
+  if (st.unread++ == 0 && notify && st.cb.callback) {
+    st.cb.callback(st.cb.user_data, 1);
+  }
   return true;
 }
 
@@ -126,11 +132,14 @@ bool event_init(
   rmw_event->data = endpoint;
   rmw_event->event_type = event_type;
   if (is_matched_type(event_type)) {
+    const MatchedRef ref = matched_of(endpoint, event_type);
+    if (ref.ctx) {
+      ref.ctx->matched_events.fetch_add(1, std::memory_order_release);
+    }
     // Recompute now, so matches that already exist are reported as soon as
     // the event is waited on, taken or given a callback.
-    const MatchedRef ref = matched_of(endpoint, event_type);
     std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
-    recompute(ref);
+    recompute(ref, false);
   }
   return true;
 }
@@ -155,7 +164,7 @@ bool event_has_unread(const rmw_event_t * event)
   if (is_matched_type(event->event_type)) {
     const MatchedRef ref = matched_of(event->data, event->event_type);
     std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
-    recompute(ref);
+    recompute(ref, true);
     return ref.state->unread > 0;
   }
   return false;
@@ -184,11 +193,7 @@ void notify_graph_events(UdsContext * ctx)
   for (const auto & [endpoint, type] : ctx->graph_events) {
     const MatchedRef ref = matched_of(endpoint, type);
     std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
-    // unread == 1: this change is the first since the last take (see
-    // record_message_lost).
-    if (recompute(ref) && ref.state->unread == 1 && ref.state->cb.callback) {
-      ref.state->cb.callback(ref.state->cb.user_data, 1);
-    }
+    recompute(ref, true);
   }
 }
 
@@ -257,6 +262,7 @@ rmw_ret_t rmw_take_event(
   RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
     event_handle, event_handle->implementation_identifier,
     rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  RMW_CHECK_ARGUMENT_FOR_NULL(event_handle->data, RMW_RET_INVALID_ARGUMENT);
   // Like the DDS RMWs, a take always succeeds and reports the current status,
   // with zero changes when nothing is new: rcl turns taken == false into
   // RCL_RET_EVENT_TAKE_FAILED, which rclcpp logs as an error.
@@ -276,7 +282,7 @@ rmw_ret_t rmw_take_event(
   if (rmw_uds::is_matched_type(event_handle->event_type)) {
     const auto ref = rmw_uds::matched_of(event_handle->data, event_handle->event_type);
     std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
-    rmw_uds::recompute(ref);
+    rmw_uds::recompute(ref, false);  // no callback: this take collects the change
     auto & st = *ref.state;
     auto * info = static_cast<rmw_matched_status_t *>(event_info);
     info->total_count = st.total_count;
@@ -298,13 +304,22 @@ rmw_ret_t rmw_event_fini(rmw_event_t * event)
   // A handle no init ever filled in has nothing to release. rcl never gets
   // here with one - rcl_event_fini skips the call when rcl_*_event_init freed
   // its impl after RMW_RET_UNSUPPORTED - but fini stays harmless for it.
-  if (!event->implementation_identifier || !rmw_event_type_is_supported(event->event_type)) {
+  if (!event->implementation_identifier || !event->data ||
+    !rmw_event_type_is_supported(event->event_type))
+  {
     return RMW_RET_OK;
   }
   // Clears the callback and, for matched, the listener's graph entry. The
   // endpoint is still alive: rcl finalizes an event before its publisher or
   // subscription.
-  return rmw_event_set_callback(event, nullptr, nullptr);
+  const rmw_ret_t ret = rmw_event_set_callback(event, nullptr, nullptr);
+  if (ret == RMW_RET_OK && rmw_uds::is_matched_type(event->event_type)) {
+    auto * ctx = rmw_uds::matched_of(event->data, event->event_type).ctx;
+    if (ctx) {
+      ctx->matched_events.fetch_sub(1, std::memory_order_release);
+    }
+  }
+  return ret;
 }
 
 bool rmw_event_type_is_supported(rmw_event_type_t event_type)
@@ -328,6 +343,7 @@ rmw_ret_t rmw_event_set_callback(
     RMW_SET_ERROR_MSG("event callbacks are not supported for this event type");
     return RMW_RET_UNSUPPORTED;
   }
+  RMW_CHECK_ARGUMENT_FOR_NULL(event->data, RMW_RET_INVALID_ARGUMENT);
 
   // Untaken changes are paid out as one take credit, and only when a callback
   // takes over from none: rclcpp sets it twice in a row on purpose (a stack
@@ -347,56 +363,74 @@ rmw_ret_t rmw_event_set_callback(
 
   const auto ref = rmw_uds::matched_of(event->data, event->event_type);
   rmw_uds::UdsContext * ctx = ref.ctx;
-  // Serialised per context like listener_set_callback, so a concurrent set and
-  // clear leave the callback and its graph_events entry agreeing.
-  std::lock_guard<std::recursive_mutex> registration(ctx->listener_registration_mutex);
-  {
-    std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
-    const bool taking_over = !ref.state->cb.callback;
-    ref.state->cb = {callback, user_data};
-    rmw_uds::recompute(ref);
-    if (callback && taking_over && ref.state->unread > 0) {
-      callback(user_data, 1);
-    }
+  if (!ctx) {
+    RMW_SET_ERROR_MSG("event endpoint has no context");
+    return RMW_RET_ERROR;
   }
-
-  // Outside event_mutex: the listener holds listener_mutex while it takes an
-  // event_mutex in notify_graph_events(), so the other order would deadlock.
-  rmw_uds::remove_graph_event(ctx, event->data, event->event_type);
+  // Serialised per context like listener_set_callback, so a concurrent set and
+  // clear leave the callback and its graph_events entry agreeing. event_mutex
+  // is never held while listener_mutex is taken here: the listener takes them
+  // in the other order, in notify_graph_events().
+  std::lock_guard<std::recursive_mutex> registration(ctx->listener_registration_mutex);
   if (!callback) {
+    // Unlisted first: that waits out a listener recompute in flight, so no
+    // listener-side fire can follow the clear.
+    rmw_uds::remove_graph_event(ctx, event->data, event->event_type);
+    {
+      std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
+      ref.state->cb = {};
+    }
     bool none_left = false;
     {
       std::lock_guard<std::mutex> lock(ctx->listener_mutex);
       none_left = ctx->graph_events.empty();
     }
     if (none_left) {
-      // Stop waking the listener, and through it every wait set, on each
-      // registry mutation. A no-op if the doorbell was never watched.
+      // Stop waking the listener on each registry mutation. A no-op if the
+      // doorbell was never watched.
       rmw_uds::listener_unwatch(ctx, ctx->doorbell_fd);
     }
     return RMW_RET_OK;
   }
+
+  // Watch, then list, then recompute - the register-before-snapshot order
+  // rmw_wait uses - so a registry change at any point either lands in the
+  // recompute below or rings a doorbell the listener serves with this event
+  // listed.
+  if (ctx->doorbell_fd >= 0 && rmw_uds::ensure_doorbell_registered(ctx)) {
+    const rmw_ret_t ret = rmw_uds::listener_watch(
+      ctx, ctx->doorbell_fd, rmw_uds::ARMED_DOORBELL, nullptr, 0);
+    if (ret != RMW_RET_OK) {
+      return ret;  // nothing is set yet
+    }
+  } else {
+    // No doorbell (registry full, or its socket never bound): nothing wakes
+    // the listener for this context. The callback still fires for what this
+    // registration finds and for what a wait in this process sees, so the
+    // event is degraded rather than failed.
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000,
+      "no graph doorbell (registry full?): matched callbacks miss graph changes "
+      "until one is registered");
+  }
   {
     std::lock_guard<std::mutex> lock(ctx->listener_mutex);
-    ctx->graph_events.emplace_back(event->data, event->event_type);
+    auto & ev = ctx->graph_events;
+    const auto entry = std::make_pair(event->data, event->event_type);
+    if (std::find(ev.begin(), ev.end(), entry) == ev.end()) {
+      ev.push_back(entry);
+    }
   }
-  if (ctx->doorbell_fd < 0 || !rmw_uds::ensure_doorbell_registered(ctx)) {
-    // No doorbell (registry full, or its socket never bound): no process can
-    // ring this context. The callback still fires for what a take or the next
-    // registration finds, so this is a degraded event, not a failed one.
-    RMW_UDS_LOG_WARN_THROTTLE(
-      5000, "no graph doorbell: matched callbacks fire only on take or registration");
-    return RMW_RET_OK;
-  }
-  const rmw_ret_t ret = rmw_uds::listener_watch(
-    ctx, ctx->doorbell_fd, rmw_uds::ARMED_DOORBELL, nullptr, 0);
-  if (ret != RMW_RET_OK) {
-    // A failure has to mean the callback is not set, as in listener_set_callback.
-    rmw_uds::remove_graph_event(ctx, event->data, event->event_type);
+  {
     std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
-    ref.state->cb = {};
+    const bool taking_over = !ref.state->cb.callback;
+    ref.state->cb = {callback, user_data};
+    rmw_uds::recompute(ref, false);
+    if (taking_over && ref.state->unread > 0) {
+      callback(user_data, 1);
+    }
   }
-  return ret;
+  return RMW_RET_OK;
 }
 
 }  // extern "C"

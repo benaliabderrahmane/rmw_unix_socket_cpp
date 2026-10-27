@@ -52,6 +52,17 @@ static void drain_eventfd(int fd)
   }
 }
 
+// Wake every live wait set. Called with listener_mutex held, which guards
+// delivery_fds.
+static void signal_delivery_fds(UdsContext * ctx)
+{
+  uint64_t val = 1;
+  for (const int delivery_fd : ctx->delivery_fds) {
+    ssize_t ret = write(delivery_fd, &val, sizeof(val));
+    (void)ret;
+  }
+}
+
 static void listener_loop(UdsContext * ctx)
 {
   struct epoll_event ready[16];
@@ -73,7 +84,14 @@ static void listener_loop(UdsContext * ctx)
       const int fd = ready[i].data.fd;
       if (fd == ctx->listener_wake_fd) {
         drain_eventfd(fd);
-        continue;  // Watch-list change or stop; the loop condition re-checks.
+        // Watch-list change or stop - the loop condition re-checks - or a
+        // graph change another thread saw (listener_graph_changed), so
+        // recompute the matched events; one generation compare each if not.
+        if (ctx->listener_running.load(std::memory_order_acquire)) {
+          std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+          notify_graph_events(ctx);
+        }
+        continue;
       }
 
       // Held across the drain: listener_unwatch() takes this mutex, so a
@@ -103,15 +121,18 @@ static void listener_loop(UdsContext * ctx)
           break;
         case ARMED_DOORBELL: {
             // Watched while matched callbacks exist: a registry mutation
-            // somewhere. Drain the ring, then recompute those events. The
-            // rmw_waits share this socket, so the delivery_fds below are
-            // signalled even when nothing here changed: a wait whose ring this
-            // consumed re-reads the generation on that wake.
+            // somewhere. The rmw_waits read this socket too, so if this drain
+            // is what sees the generation move it fans the change out to them,
+            // exactly as rmw_wait does: the graph guard conditions, and every
+            // delivery_fd below.
             uint8_t buf[16];
             while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
             }
+            if (observe_generation(ctx)) {
+              trigger_graph_gcs(ctx);
+              enqueued = 1;
+            }
             notify_graph_events(ctx);
-            enqueued = 1;
             break;
           }
         default:
@@ -127,11 +148,7 @@ static void listener_loop(UdsContext * ctx)
       // a read drains the whole counter and would otherwise let the first wait
       // set to wake consume a credit another one needed.
       if (enqueued > 0) {
-        uint64_t val = 1;
-        for (const int delivery_fd : ctx->delivery_fds) {
-          ssize_t ret = write(delivery_fd, &val, sizeof(val));
-          (void)ret;
-        }
+        signal_delivery_fds(ctx);
       }
     }
   }
@@ -250,6 +267,18 @@ rmw_ret_t listener_set_callback(
     *t.callback_user_data = nullptr;
   }
   return ret;
+}
+
+void listener_graph_changed(UdsContext * ctx)
+{
+  if (!ctx || ctx->matched_events.load(std::memory_order_acquire) == 0) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  signal_delivery_fds(ctx);
+  if (!ctx->graph_events.empty()) {
+    wake_listener(ctx);
+  }
 }
 
 void listener_add_delivery_fd(UdsContext * ctx, int fd)

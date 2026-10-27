@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <thread>
 
 #include "test_msgs/msg/basic_types.hpp"
@@ -107,6 +108,43 @@ struct EventCounter
     auto * self = const_cast<EventCounter *>(static_cast<const EventCounter *>(user_data));
     self->calls.fetch_add(1);
     self->events.fetch_add(n);
+  }
+};
+
+// Runs on every exit, so a failed ASSERT cannot leave a joinable thread
+// (std::terminate) or a callback pointing at a stack object.
+struct OnExit
+{
+  std::function<void()> f;
+  ~OnExit() {f();}
+};
+
+// Spins rmw_wait on the node's graph guard condition in its own thread, as
+// rclcpp's GraphListener does. Every rmw_wait drains the context's doorbell,
+// so this competes for every ring.
+struct GraphWaiter
+{
+  std::atomic<bool> stop{false};
+  rmw_wait_set_t * ws = nullptr;
+  std::thread thread;
+  GraphWaiter(rmw_context_t & context, const rmw_node_t * node)
+  {
+    ws = rmw_create_wait_set(&context, 1);
+    const rmw_guard_condition_t * gc = rmw_node_get_graph_guard_condition(node);
+    thread = std::thread([this, gc]() {
+        while (!stop.load()) {
+          void * arr[1] = {gc->data};
+          rmw_guard_conditions_t gcs{1, arr};
+          rmw_time_t timeout{0, 20000000};
+          (void)rmw_wait(nullptr, &gcs, nullptr, nullptr, nullptr, ws, &timeout);
+        }
+      });
+  }
+  ~GraphWaiter()
+  {
+    stop.store(true);
+    thread.join();
+    (void)rmw_destroy_wait_set(ws);
   }
 };
 
@@ -409,6 +447,7 @@ TEST_F(EventTest, MatchedEventWakesABlockedWait)
       wait_ret = rmw_wait(nullptr, nullptr, nullptr, nullptr, &events, ws, &timeout);
       was_ready = arr[0] != nullptr;
     });
+  OnExit join_waiter{[&]() {if (waiter.joinable()) {waiter.join();}}};
   std::this_thread::sleep_for(std::chrono::milliseconds(100));  // let it block
 
   auto sub_opts = rmw_get_default_subscription_options();
@@ -435,6 +474,7 @@ TEST_F(EventTest, MatchedCallbackFiresWithNoThreadInWait)
   ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, pub, RMW_EVENT_PUBLICATION_MATCHED));
   EventCounter counter;
   ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &counter));
+  OnExit clear{[&]() {(void)rmw_event_set_callback(&ev, nullptr, nullptr);}};
   // The existing match was paid out at registration, as one take credit.
   EXPECT_EQ(1u, counter.calls.load());
   EXPECT_EQ(1u, counter.events.load());
@@ -553,6 +593,10 @@ TEST_F(EventTest, MessageLostCallbackFiresFromTheListenerDrain)
   ASSERT_EQ(
     RMW_RET_OK,
     rmw_subscription_set_on_new_message_callback(sub, EventCounter::fire, &messages));
+  OnExit clear{[&]() {
+      (void)rmw_subscription_set_on_new_message_callback(sub, nullptr, nullptr);
+      (void)rmw_event_set_callback(&ev, nullptr, nullptr);
+    }};
 
   publish(1);
   ASSERT_TRUE(await_calls(messages, 1));  // baseline, drained by the listener
@@ -598,5 +642,144 @@ TEST_F(EventTest, EventCallbackFiresOncePerUntakenBatch)
   publish(4);
   wait_on_sub(sub);
   EXPECT_EQ(2u, lost.calls.load()) << "a change after a take starts a new batch";
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+// --- review regressions -------------------------------------------------------
+
+// The listener and every rmw_wait in the process read one doorbell socket, so
+// a GraphListener's wait can consume the ring a matched callback needed.
+// Whoever sees the generation move has to tell the listener.
+TEST_F(EventTest, MatchedCallbackFiresWhenAnotherWaitConsumesTheRing)
+{
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, pub, RMW_EVENT_PUBLICATION_MATCHED));
+  EventCounter counter;
+  ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &counter));
+  OnExit clear{[&]() {(void)rmw_event_set_callback(&ev, nullptr, nullptr);}};
+  rmw_matched_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));  // the existing match
+
+  GraphWaiter graph(context, node);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * second = rmw_create_subscription(node, ts, "/event_test_topic", &qos, &sub_opts);
+  ASSERT_NE(nullptr, second);
+  OnExit destroy{[&]() {(void)rmw_destroy_subscription(node, second);}};
+  EXPECT_TRUE(await_calls(counter, 2)) << "a wait consumed the ring and the listener never heard";
+}
+
+// The same theft between two wait sets: one waits on graph changes, the other
+// on a publisher's matched event alone - the image_pipeline lazy node beside a
+// GraphListener.
+TEST_F(EventTest, MatchedWaitWakesWhenAnotherWaitConsumesTheRing)
+{
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, pub, RMW_EVENT_PUBLICATION_MATCHED));
+  rmw_matched_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));  // the existing match
+
+  GraphWaiter graph(context, node);
+  rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  std::atomic<bool> was_ready{false};
+  std::thread waiter([&]() {
+      void * arr[1] = {&ev};
+      rmw_events_t events{1, arr};
+      rmw_time_t timeout{3, 0};
+      (void)rmw_wait(nullptr, nullptr, nullptr, nullptr, &events, ws, &timeout);
+      was_ready = arr[0] != nullptr;
+    });
+  OnExit join_waiter{[&]() {if (waiter.joinable()) {waiter.join();}}};
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));  // both waits block
+
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * second = rmw_create_subscription(node, ts, "/event_test_topic", &qos, &sub_opts);
+  ASSERT_NE(nullptr, second);
+  waiter.join();
+  EXPECT_TRUE(was_ready.load()) << "the matched wait slept through the change";
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, second));
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+// Two threads publishing on one publisher. Numbered before the send, outside
+// any lock, their datagrams could reach a subscriber out of sequence order,
+// and the gap check would count a message that arrived as lost. Real drops
+// are allowed here - a burst can overflow the socket - but never more loss
+// than is actually missing.
+TEST_F(EventTest, ConcurrentPublishesOnOnePublisherAreNotLost)
+{
+  rmw_qos_profile_t deep = qos;
+  deep.depth = 5000;  // so every arrival grows the queue and is counted
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * counted = rmw_create_subscription(node, ts, "/event_test_topic", &deep, &sub_opts);
+  ASSERT_NE(nullptr, counted);
+  OnExit destroy{[&]() {(void)rmw_destroy_subscription(node, counted);}};
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, counted, RMW_EVENT_MESSAGE_LOST));
+  EventCounter arrived;
+  ASSERT_EQ(
+    RMW_RET_OK,
+    rmw_subscription_set_on_new_message_callback(counted, EventCounter::fire, &arrived));
+  OnExit clear{[&]() {
+      (void)rmw_subscription_set_on_new_message_callback(counted, nullptr, nullptr);
+    }};
+
+  constexpr size_t per_thread = 2000;
+  auto burst = [&]() {
+      test_msgs::msg::BasicTypes msg;
+      for (size_t i = 0; i < per_thread; ++i) {
+        msg.int32_value = static_cast<int32_t>(i);
+        (void)rmw_publish(pub, &msg, nullptr);
+      }
+    };
+  std::thread a(burst);
+  std::thread b(burst);
+  a.join();
+  b.join();
+  for (int waited = 0; waited < 2000 && arrived.events.load() < 2 * per_thread; waited += 5) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+
+  rmw_message_lost_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
+  const size_t missing = 2 * per_thread - arrived.events.load();
+  EXPECT_LE(st.total_count, missing) << "counted " << st.total_count << " lost of "
+                                     << missing << " missing";
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+// A subscription that ignores its own context's publications drops them on
+// purpose, so a gap in that publisher's numbering is no loss to it.
+TEST_F(EventTest, GapsFromAnIgnoredLocalPublisherAreNotLost)
+{
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub_opts.ignore_local_publications = true;
+  auto * ignoring = rmw_create_subscription(node, ts, "/event_test_topic", &qos, &sub_opts);
+  ASSERT_NE(nullptr, ignoring);
+  OnExit destroy{[&]() {(void)rmw_destroy_subscription(node, ignoring);}};
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, ignoring, RMW_EVENT_MESSAGE_LOST));
+
+  publish(1);
+  skip_publications(pub, 5);
+  publish(2);
+  rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  void * arr[1] = {ignoring->data};
+  rmw_subscriptions_t subs{1, arr};
+  rmw_time_t timeout{0, 200000000};  // drains both datagrams, takes nothing
+  (void)rmw_wait(&subs, nullptr, nullptr, nullptr, nullptr, ws, &timeout);
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+
+  rmw_message_lost_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
+  EXPECT_EQ(0u, st.total_count);
   EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
 }

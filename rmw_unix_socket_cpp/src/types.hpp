@@ -308,10 +308,15 @@ struct UdsContext
   std::vector<int> delivery_fds;
   // Matched events with a callback registered, as (endpoint data, event type).
   // The listener watches the doorbell while any exist and recomputes these on
-  // every ring, so an executor that never waits still hears graph changes.
+  // every graph change, so an executor that never waits still hears them.
   // Guarded by listener_mutex; rmw_event_fini and the endpoint destroys remove
   // their entries before the endpoint is freed.
   std::vector<std::pair<void *, rmw_event_type_t>> graph_events;
+  // Live matched events in this context, waited on or not. While it is zero a
+  // graph change only triggers the graph guard conditions, as it always did;
+  // otherwise whoever observes it also wakes every wait set and the listener
+  // (listener_graph_changed), since any of them may hold a matched event.
+  std::atomic<int> matched_events{0};
 };
 
 // Node data
@@ -361,6 +366,13 @@ struct UdsPublisher
   // several threads publish on the same publisher.
   std::mutex shm_mutex;
   ShmRingWriter shm_ring;
+
+  // Held from numbering a volatile publish to its last send, after the
+  // message is serialized. Concurrent publishes on one publisher then reach
+  // every subscriber in sequence order, and a failed serialization consumes
+  // no number - either would read as a lost message to a subscriber's gap
+  // check (message_lost). The TRANSIENT_LOCAL path orders under cache_mutex.
+  std::mutex send_mutex;
 
   // QoS status events. Recursive: an event callback may take its own event.
   std::recursive_mutex event_mutex;
