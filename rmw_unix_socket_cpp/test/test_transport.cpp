@@ -37,6 +37,21 @@ protected:
   }
 };
 
+TEST_F(TransportTest, MakePeerLabelFormatsNodeAndTopic)
+{
+  EXPECT_EQ(
+    "node '/ns/talker' on topic '/chatter'",
+    rmw_uds::make_peer_label("/ns", "talker", "/chatter"));
+  // Root namespace "/" collapses to a single leading slash (not "//talker").
+  EXPECT_EQ(
+    "node '/talker' on topic '/chatter'",
+    rmw_uds::make_peer_label("/", "talker", "/chatter"));
+  // Empty namespace behaves like root; a null topic drops the topic clause.
+  EXPECT_EQ("node '/talker'", rmw_uds::make_peer_label("", "talker", nullptr));
+  // All-null is tolerated (name falls back to a placeholder).
+  EXPECT_EQ("node '/<unknown>'", rmw_uds::make_peer_label(nullptr, nullptr, nullptr));
+}
+
 TEST_F(TransportTest, CreateBoundSocket)
 {
   auto path = rmw_uds::make_socket_path(domain_id, "test");
