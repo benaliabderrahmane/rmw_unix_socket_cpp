@@ -143,13 +143,16 @@ for the full rationale.
 Localhost only; Linux only; no DDS interoperability. Loaned (zero-copy) messages,
 dynamic message types, network flow endpoints, and content filtering return
 `RMW_RET_UNSUPPORTED`. `deadline`, `lifespan`, and `liveliness` QoS are accepted
-but not enforced, and no QoS status event (`matched`, incompatible-QoS,
-incompatible-type, `message_lost`) is generated: both `*_event_init` functions
-return `RMW_RET_UNSUPPORTED` for every type. `rclcpp` catches that for the
-handlers it installs by default (with a warning per handler on kilted and
-later), but on jazzy a handler the application registers itself throws — so
-`ros2 bag record`, which always asks for `message_lost`, exits at startup. The
-listener callbacks an `EventsExecutor` needs are supported. The full list and the reasoning behind each is in
+but not enforced. Of the QoS status events, `message_lost` and both `matched`
+events are reported; deadline, liveliness, incompatible-QoS and
+incompatible-type are refused with `RMW_RET_UNSUPPORTED`. Deadline and liveliness
+need a clock nothing here runs, and this transport delivers to every
+subscription on a topic whatever its QoS or type, so an incompatible-QoS event
+would report a failure that does not happen (#92 plans QoS- and type-aware
+matching). `rclcpp` catches the refusal for
+the handlers it installs by default (with a warning per handler on kilted and
+later); on jazzy, a handler for a refused type that the application registers
+itself throws. The listener callbacks an `EventsExecutor` needs are supported. The full list and the reasoning behind each is in
 [DESIGN.md → Limitations and Unsupported Features](rmw_unix_socket_cpp/DESIGN.md#limitations-and-unsupported-features).
 
 ## Documentation
