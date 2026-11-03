@@ -475,6 +475,7 @@ rmw_ret_t rmw_event_set_callback(
   // rmw_wait uses - so a registry change at any point either lands in the
   // recompute below or rings a doorbell the listener serves with this event
   // listed.
+  bool doorbell_wanted = false;
   if (ctx->doorbell_fd >= 0 && rmw_uds::ensure_doorbell_registered(ctx)) {
     const rmw_ret_t ret = rmw_uds::listener_watch(
       ctx, ctx->doorbell_fd, rmw_uds::ARMED_DOORBELL, nullptr, 0);
@@ -492,7 +493,7 @@ rmw_ret_t rmw_event_set_callback(
     if (ret != RMW_RET_OK) {
       return ret;  // nothing is set yet
     }
-    ctx->doorbell_watch_wanted.store(true, std::memory_order_release);
+    doorbell_wanted = true;  // flagged once listed, below
     RMW_UDS_LOG_WARN_THROTTLE(
       5000,
       "no graph doorbell (registry full?): matched callbacks hear no graph "
@@ -521,6 +522,13 @@ rmw_ret_t rmw_event_set_callback(
     }
     RMW_SET_ERROR_MSG("out of memory registering the matched event callback");
     return RMW_RET_BAD_ALLOC;
+  }
+  if (doorbell_wanted) {
+    // Only now that the event is listed: a listener retry that saw the flag
+    // with nothing listed would clear it and watch nothing, leaving this
+    // callback deaf. (Setters and destroys are serialised on
+    // listener_registration_mutex, so no clear can come between.)
+    ctx->doorbell_watch_wanted.store(true, std::memory_order_release);
   }
   {
     const auto callbacks = rmw_uds::lock_callbacks(ref.callbacks);
