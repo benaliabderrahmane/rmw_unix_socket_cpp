@@ -21,6 +21,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -155,12 +156,19 @@ size_t drain_endpoint(const DrainTarget & t)
                 base = w->second;
               }
             }
-            it = t.last_sequence->emplace(key, base).first;
+            try {
+              it = t.last_sequence->emplace(key, base).first;
+            } catch (const std::bad_alloc &) {
+              // Out of memory: skip this datagram's check rather than let the
+              // exception escape a C entry point or the listener thread. The
+              // next datagram from the publisher tries again.
+              it = t.last_sequence->end();
+            }
           }
           seen_key = key;
-          seen = &it->second;
+          seen = it == t.last_sequence->end() ? nullptr : &it->second;
         }
-        if (seq > *seen) {
+        if (seen && seq > *seen) {
           // Unsigned: exact for any seq > seen, whatever the wire carried.
           lost += static_cast<size_t>(
             static_cast<uint64_t>(seq) - static_cast<uint64_t>(*seen) - 1);
