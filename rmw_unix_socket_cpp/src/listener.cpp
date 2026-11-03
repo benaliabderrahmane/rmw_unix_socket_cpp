@@ -320,9 +320,9 @@ rmw_ret_t listener_set_callback(
   // which epoll reports level-triggered, so datagrams that arrived between the
   // two are delivered rather than dropped or double-reported.
   if (!callback) {
-    // A subscription's message_lost callback needs the socket drained too.
+    // Another callback on a subscription may still need the socket drained.
     if (!(kind == ARMED_SUBSCRIPTION &&
-      message_lost_callback_set(static_cast<UdsSubscription *>(entity))))
+      subscription_needs_listener(static_cast<UdsSubscription *>(entity))))
     {
       listener_unwatch(ctx, t.fd);
     }

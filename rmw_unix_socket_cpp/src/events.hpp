@@ -46,9 +46,11 @@ void record_message_lost(UdsSubscription * sub, size_t lost);
 // every matched event in ctx->graph_events and fire the ones that changed.
 void notify_graph_events(UdsContext * ctx);
 
-// True while the subscription has a message_lost callback, which keeps its
-// socket watched by the listener (see listener_set_callback).
-bool message_lost_callback_set(UdsSubscription * sub);
+// True while any callback on the subscription needs its socket watched by the
+// listener: the message callback, or the message_lost callback (a loss is
+// found by draining). The one place that knows every such callback, so each
+// clear path asks it before unwatching - add a new socket watcher here.
+bool subscription_needs_listener(UdsSubscription * sub);
 
 // Drop the endpoint's entries from ctx->graph_events and its count in
 // ctx->matched_events. `matched_type` is the endpoint's matched event type.
