@@ -52,6 +52,19 @@ static void drain_eventfd(int fd)
   }
 }
 
+static thread_local int t_own_delivery_fd = -1;
+
+OwnDeliveryFd::OwnDeliveryFd(int fd)
+: previous_(t_own_delivery_fd)
+{
+  t_own_delivery_fd = fd;
+}
+
+OwnDeliveryFd::~OwnDeliveryFd()
+{
+  t_own_delivery_fd = previous_;
+}
+
 void signal_delivery_fds(UdsContext * ctx)
 {
   if (!ctx) {
@@ -60,6 +73,9 @@ void signal_delivery_fds(UdsContext * ctx)
   std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
   uint64_t val = 1;
   for (const int delivery_fd : ctx->delivery_fds) {
+    if (delivery_fd == t_own_delivery_fd) {
+      continue;
+    }
     ssize_t ret = write(delivery_fd, &val, sizeof(val));
     (void)ret;
   }

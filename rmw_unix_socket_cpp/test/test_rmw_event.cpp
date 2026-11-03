@@ -27,6 +27,7 @@
 #include <thread>
 #include <vector>
 
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
@@ -1447,5 +1448,64 @@ TEST_F(EventTest, AMatchedCallbackThatTakesCannotDeadlockAMessageCallback)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
   EXPECT_TRUE(cb.entered.load());
   rmw_reset_error();
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+// Whether anyone signalled a wait set since it last drained its delivery fd,
+// without consuming the signal.
+static bool delivery_signalled(rmw_wait_set_t * ws)
+{
+  pollfd p{static_cast<rmw_uds::UdsWaitSet *>(ws->data)->delivery_fd, POLLIN, 0};
+  return poll(&p, 1, 0) == 1;
+}
+
+// A loss signals the wait sets so that a wait holding the message_lost event
+// re-checks it. With no such event on the subscription nothing can hold one:
+// the signal would only wake every wait set in the process, on every gap of
+// every lossy topic. The loss is still counted, for an event made later.
+TEST_F(EventTest, ALossWithNoMessageLostEventWakesNoWaitSet)
+{
+  rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  OnExit destroy{[&]() {(void)rmw_destroy_wait_set(ws);}};
+  test_msgs::msg::BasicTypes msg;
+  bool taken = false;
+  publish(1);
+  ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &msg, &taken, nullptr));  // baseline
+  skip_publications(pub, 3);
+  publish(2);
+  ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &msg, &taken, nullptr));  // finds the gap
+  EXPECT_FALSE(delivery_signalled(ws)) << "a loss nobody can wait on woke a wait set";
+
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_MESSAGE_LOST));
+  rmw_message_lost_status_t st{};
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));
+  EXPECT_EQ(3u, st.total_count);
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+// The rmw_wait that drains a subscription for its message_lost event re-checks
+// its own events right after, so the signals that drain sends - for the loss,
+// and for the messages it queued - are for the other wait sets. Its own would
+// only make its next epoll pass, or its next call, return at once for nothing.
+TEST_F(EventTest, AWaitDoesNotSignalItsOwnDeliveryFd)
+{
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_MESSAGE_LOST));
+  publish(1);
+  wait_on_sub(sub);  // baseline
+  skip_publications(pub, 3);
+  publish(2);
+
+  rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  OnExit destroy{[&]() {(void)rmw_destroy_wait_set(ws);}};
+  void * ev_arr[1] = {&ev};
+  rmw_events_t events{1, ev_arr};
+  rmw_time_t timeout{2, 0};
+  EXPECT_EQ(RMW_RET_OK, rmw_wait(nullptr, nullptr, nullptr, nullptr, &events, ws, &timeout));
+  EXPECT_NE(nullptr, ev_arr[0]) << "the wait did not report the loss it drained";
+  EXPECT_FALSE(delivery_signalled(ws)) << "the wait signalled its own delivery fd";
   EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
 }
