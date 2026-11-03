@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
 #include <mutex>
 #include <system_error>
@@ -81,9 +82,53 @@ void signal_delivery_fds(UdsContext * ctx)
   }
 }
 
+// A matched callback listed while the registry was full has no doorbell to
+// watch (doorbell_watch_wanted). Retried on the listener's wakes - at most once
+// a second while the registry stays full, since a failed registry_add scans
+// for stale slots - and immediately once a wait has registered the doorbell,
+// which wakes this thread. The watch is made under listener_mutex only while a
+// matched callback is still listed, so a concurrent clear, which unlists under
+// the same mutex before it unwatches, cannot be undone here; then the matched
+// events are recomputed for whatever the deaf window missed.
+static void retry_doorbell_watch(
+  UdsContext * ctx, std::chrono::steady_clock::time_point & last_try)
+{
+  if (!ctx->doorbell_watch_wanted.load(std::memory_order_acquire) || ctx->doorbell_fd < 0) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (!ctx->doorbell_registered.load(std::memory_order_acquire) &&
+    now - last_try < std::chrono::seconds(1))
+  {
+    return;
+  }
+  last_try = now;
+  if (!ensure_doorbell_registered(ctx)) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  ctx->doorbell_watch_wanted.store(false, std::memory_order_relaxed);
+  if (ctx->graph_events.empty() || ctx->listener_targets.count(ctx->doorbell_fd) != 0) {
+    return;
+  }
+  struct epoll_event ev;
+  std::memset(&ev, 0, sizeof(ev));
+  ev.events = EPOLLIN;
+  ev.data.fd = ctx->doorbell_fd;
+  if (epoll_ctl(ctx->listener_epoll_fd, EPOLL_CTL_ADD, ctx->doorbell_fd, &ev) != 0 &&
+    errno != EEXIST)
+  {
+    ctx->doorbell_watch_wanted.store(true, std::memory_order_relaxed);  // next wake retries
+    return;
+  }
+  ctx->listener_targets[ctx->doorbell_fd] = ArmedEntry{ARMED_DOORBELL, nullptr, 0};
+  notify_graph_events(ctx);
+}
+
 static void listener_loop(UdsContext * ctx)
 {
   struct epoll_event ready[16];
+  std::chrono::steady_clock::time_point last_doorbell_try{};
   while (ctx->listener_running.load(std::memory_order_acquire)) {
     const int n = epoll_wait(ctx->listener_epoll_fd, ready, 16, -1);
     if (n < 0) {
@@ -98,6 +143,7 @@ static void listener_loop(UdsContext * ctx)
         std::strerror(errno), errno);
       return;
     }
+    retry_doorbell_watch(ctx, last_doorbell_try);
     for (int i = 0; i < n; ++i) {
       const int fd = ready[i].data.fd;
       if (fd == ctx->listener_wake_fd) {
@@ -379,6 +425,18 @@ rmw_ret_t listener_watch(
   // notice them.
   wake_listener(ctx);
   return RMW_RET_OK;
+}
+
+rmw_ret_t listener_ensure_running(UdsContext * ctx)
+{
+  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  // The same shutdown guard as listener_watch.
+  if (ctx->is_shutdown.load(std::memory_order_acquire) || ctx->listener_stopping ||
+    ctx->listener_running.load(std::memory_order_relaxed))
+  {
+    return RMW_RET_OK;
+  }
+  return listener_start(ctx);
 }
 
 void listener_unwatch(UdsContext * ctx, int fd)

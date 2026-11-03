@@ -94,27 +94,35 @@ bool ensure_doorbell_registered(UdsContext * ctx)
   if (!ctx->registry_ptr) {
     return false;
   }
-  std::lock_guard<std::mutex> reg_lock(ctx->doorbell_reg_mutex);
-  if (ctx->doorbell_registered.load(std::memory_order_relaxed)) {
-    return true;
+  {
+    std::lock_guard<std::mutex> reg_lock(ctx->doorbell_reg_mutex);
+    if (ctx->doorbell_registered.load(std::memory_order_relaxed)) {
+      return true;
+    }
+    auto * reg_header = registry_header(ctx->registry_ptr);
+    RegistryEntry dentry;
+    std::memset(&dentry, 0, sizeof(dentry));
+    dentry.type = ENTRY_DOORBELL;
+    dentry.pid = getpid();
+    std::strncpy(dentry.socket_path, ctx->doorbell_path.c_str(), sizeof(dentry.socket_path) - 1);
+    const int32_t idx = registry_add(reg_header, dentry);
+    if (idx < 0) {
+      // Registry full. The flag stays unlatched, so the next call retries.
+      RMW_UDS_LOG_WARN_THROTTLE(
+        5000,
+        "registry full — graph-event doorbell unregistered; graph waits "
+        "degrade to polling until a slot frees");
+      return false;
+    }
+    ctx->doorbell_registry_index = idx;
+    ctx->doorbell_registered.store(true, std::memory_order_release);
   }
-  auto * reg_header = registry_header(ctx->registry_ptr);
-  RegistryEntry dentry;
-  std::memset(&dentry, 0, sizeof(dentry));
-  dentry.type = ENTRY_DOORBELL;
-  dentry.pid = getpid();
-  std::strncpy(dentry.socket_path, ctx->doorbell_path.c_str(), sizeof(dentry.socket_path) - 1);
-  const int32_t idx = registry_add(reg_header, dentry);
-  if (idx < 0) {
-    // Registry full. The flag stays unlatched, so the next call retries.
-    RMW_UDS_LOG_WARN_THROTTLE(
-      5000,
-      "registry full — graph-event doorbell unregistered; graph waits "
-      "degrade to polling until a slot frees");
-    return false;
+  // A matched callback listed while the registry was full is waiting for
+  // this doorbell: wake the listener to take it up (doorbell_watch_wanted).
+  // Outside doorbell_reg_mutex, which stays a leaf.
+  if (ctx->doorbell_watch_wanted.load(std::memory_order_acquire)) {
+    listener_graph_changed(ctx);
   }
-  ctx->doorbell_registry_index = idx;
-  ctx->doorbell_registered.store(true, std::memory_order_release);
   return true;
 }
 
