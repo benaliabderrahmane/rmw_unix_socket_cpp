@@ -249,10 +249,11 @@ void notify_graph_events(UdsContext * ctx)
   }
 }
 
-bool message_lost_callback_set(UdsSubscription * sub)
+bool subscription_needs_listener(UdsSubscription * sub)
 {
+  const auto callbacks = lock_callbacks(&sub->callback_mutex);
   std::lock_guard<std::recursive_mutex> lock(sub->event_mutex);
-  return sub->message_lost.cb.callback != nullptr;
+  return sub->on_new_message_cb != nullptr || sub->message_lost.cb.callback != nullptr;
 }
 
 void forget_graph_events(UdsContext * ctx, void * endpoint, rmw_event_type_t matched_type)
@@ -436,15 +437,8 @@ rmw_ret_t rmw_event_set_callback(
         callback(user_data, 1);
       }
     }
-    if (!callback) {
-      bool message_callback = false;
-      {
-        std::lock_guard<std::recursive_mutex> lock(sub->callback_mutex);
-        message_callback = sub->on_new_message_cb != nullptr;
-      }
-      if (!message_callback) {
-        rmw_uds::listener_unwatch(ctx, sub->socket_fd);
-      }
+    if (!callback && !rmw_uds::subscription_needs_listener(sub)) {
+      rmw_uds::listener_unwatch(ctx, sub->socket_fd);
     }
     return RMW_RET_OK;
   }

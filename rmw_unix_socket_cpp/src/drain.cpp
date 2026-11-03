@@ -111,8 +111,14 @@ size_t drain_endpoint(const DrainTarget & t)
 
     WireHeader hdr;
     std::vector<uint8_t> payload;
-    std::array<uint8_t, 16> seen_key{};  // message_lost: last publisher looked up
-    int64_t * seen = nullptr;
+    // The publisher the two lookups below were made for. A drain usually
+    // carries one publisher's datagrams back to back, so each map is searched
+    // once per publisher per drain, not per datagram; std::map entries never
+    // move, so the pointers stay valid.
+    std::array<uint8_t, 16> cached_key{};
+    bool cached = false;
+    int64_t * seen = nullptr;             // message_lost: its high-water mark
+    const int64_t * watermark = nullptr;  // TRANSIENT_LOCAL: its pull watermark
 
     while (recv_from(t.fd, hdr, payload)) {
       if ((hdr.msg_type & ~SHM_PAYLOAD_FLAG) != t.msg_type) {
@@ -126,6 +132,21 @@ size_t drain_endpoint(const DrainTarget & t)
       if (t.ignore_local && is_same_context(hdr, t.context_id)) {
         continue;  // ignore_local_publications: drop same-context publications
       }
+      std::array<uint8_t, 16> key;
+      std::memcpy(key.data(), hdr.gid, key.size());
+      if (!cached || key != cached_key) {
+        cached_key = key;
+        cached = true;
+        seen = nullptr;
+        watermark = nullptr;
+        if (t.replay_watermarks) {
+          std::lock_guard<std::mutex> lock(*t.queue_mutex);
+          auto w = t.replay_watermarks->find(key);
+          if (w != t.replay_watermarks->end()) {
+            watermark = &w->second;
+          }
+        }
+      }
       bool fresh = false;  // a publish newer than any seen from its publisher
       if (t.last_sequence && hdr.sequence_number > 0) {
         // message_lost. A publisher numbers each publish once, for every
@@ -136,25 +157,16 @@ size_t drain_endpoint(const DrainTarget & t)
         // publisher only sets the baseline. Publishers number from 1, so a
         // number below that is not one of their publishes, and keeping it out
         // keeps the arithmetic below on wire values from overflowing.
-        std::array<uint8_t, 16> key;
-        std::memcpy(key.data(), hdr.gid, key.size());
         const int64_t seq = hdr.sequence_number;  // packed: no reference to it
-        // A drain usually carries one publisher's datagrams back to back, so
-        // the map is searched once per publisher per drain, not per datagram.
-        // std::map entries never move, so the pointer stays valid.
-        if (!seen || key != seen_key) {
+        if (!seen) {
           auto it = t.last_sequence->find(key);
           if (it == t.last_sequence->end()) {
             // The baseline is the first datagram - or, for a TRANSIENT_LOCAL
             // late joiner, the creation-time pull's watermark when higher:
             // sequences up to it came through the pull, not the socket.
             int64_t base = seq - 1;
-            if (t.replay_watermarks) {
-              std::lock_guard<std::mutex> lock(*t.queue_mutex);
-              auto w = t.replay_watermarks->find(key);
-              if (w != t.replay_watermarks->end() && w->second > base) {
-                base = w->second;
-              }
+            if (watermark && *watermark > base) {
+              base = *watermark;
             }
             try {
               it = t.last_sequence->emplace(key, base).first;
@@ -165,7 +177,6 @@ size_t drain_endpoint(const DrainTarget & t)
               it = t.last_sequence->end();
             }
           }
-          seen_key = key;
           seen = it == t.last_sequence->end() ? nullptr : &it->second;
         }
         if (seen && seq > *seen) {
@@ -176,7 +187,7 @@ size_t drain_endpoint(const DrainTarget & t)
           fresh = true;
         }
       }
-      if (t.replay_watermarks) {
+      if (watermark && hdr.sequence_number <= *watermark) {
         // TRANSIENT_LOCAL dedup: drop this datagram when its sample was already
         // delivered by the creation-time pull - the sender's GID has a watermark
         // and the sequence number is at or below it. Sequence numbers are
@@ -186,18 +197,7 @@ size_t drain_endpoint(const DrainTarget & t)
         // publisher's ring at pull time - history DDS would not owe a late
         // joiner either. Checked before the descriptor resolve so a duplicate
         // never maps a segment.
-        std::array<uint8_t, 16> key;
-        std::memcpy(key.data(), hdr.gid, key.size());
-        bool dup = false;
-        {
-          std::lock_guard<std::mutex> lock(*t.queue_mutex);
-          auto it = t.replay_watermarks->find(key);
-          dup = it != t.replay_watermarks->end() &&
-            hdr.sequence_number <= it->second;
-        }
-        if (dup) {
-          continue;
-        }
+        continue;
       }
       if (!shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload)) {
         // shm descriptor unresolvable (sender gone / ring lapped): the
