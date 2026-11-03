@@ -50,7 +50,7 @@ bool is_matched_type(rmw_event_type_t type)
 
 // A matched event's state, and what it is matched against: a publisher's
 // peers are the subscriptions on its topic and vice versa - exactly who a
-// publish reaches (refresh_sub_paths matches on the topic alone).
+// publish reaches (refresh_subscribers matches on the topic alone).
 struct MatchedRef
 {
   std::recursive_mutex * mutex;
@@ -85,7 +85,7 @@ bool recompute(const MatchedRef & ref, bool notify)
   }
   auto * header = registry_header(ref.ctx->registry_ptr);
   // Loaded before the query: a mutation during it leaves this generation
-  // behind, so the next recompute queries again (as refresh_sub_paths does).
+  // behind, so the next recompute queries again (as refresh_subscribers does).
   const uint64_t gen = registry_generation(header);
   UdsMatchedState & st = *ref.state;
   if (st.computed && gen == st.generation) {
