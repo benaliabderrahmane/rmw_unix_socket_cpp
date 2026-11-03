@@ -24,6 +24,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <new>
 #include <mutex>
 #include <system_error>
 #include <sys/epoll.h>
@@ -83,9 +84,10 @@ void signal_delivery_fds(UdsContext * ctx)
 }
 
 // A matched callback listed while the registry was full has no doorbell to
-// watch (doorbell_watch_wanted). Retried on the listener's wakes - at most once
-// a second while the registry stays full, since a failed registry_add scans
-// for stale slots - and immediately once a wait has registered the doorbell,
+// watch (doorbell_watch_wanted). Retried after every listener pass - at most
+// once a second while the registry stays full, since a failed registry_add
+// scans for stale slots, and the loop then wakes on its own within the second
+// (listener_loop) - and immediately once a wait has registered the doorbell,
 // which wakes this thread. The watch is made under listener_mutex only while a
 // matched callback is still listed, so a concurrent clear, which unlists under
 // the same mutex before it unwatches, cannot be undone here; then the matched
@@ -118,10 +120,18 @@ static void retry_doorbell_watch(
   if (epoll_ctl(ctx->listener_epoll_fd, EPOLL_CTL_ADD, ctx->doorbell_fd, &ev) != 0 &&
     errno != EEXIST)
   {
-    ctx->doorbell_watch_wanted.store(true, std::memory_order_relaxed);  // next wake retries
+    ctx->doorbell_watch_wanted.store(true, std::memory_order_relaxed);  // the next pass retries
     return;
   }
-  ctx->listener_targets[ctx->doorbell_fd] = ArmedEntry{ARMED_DOORBELL, nullptr, 0};
+  try {
+    ctx->listener_targets[ctx->doorbell_fd] = ArmedEntry{ARMED_DOORBELL, nullptr, 0};
+  } catch (const std::bad_alloc &) {
+    // Not on the listener thread, where it would std::terminate: unwatch and
+    // let the next pass retry.
+    (void)epoll_ctl(ctx->listener_epoll_fd, EPOLL_CTL_DEL, ctx->doorbell_fd, nullptr);
+    ctx->doorbell_watch_wanted.store(true, std::memory_order_relaxed);
+    return;
+  }
   notify_graph_events(ctx);
 }
 
@@ -130,7 +140,12 @@ static void listener_loop(UdsContext * ctx)
   struct epoll_event ready[16];
   std::chrono::steady_clock::time_point last_doorbell_try{};
   while (ctx->listener_running.load(std::memory_order_acquire)) {
-    const int n = epoll_wait(ctx->listener_epoll_fd, ready, 16, -1);
+    // Event-driven: no timeout, except while a matched callback waits for a
+    // doorbell the full registry had no slot for. Then the loop also wakes
+    // within the second to retry, as rmw_wait bounds its block while its own
+    // doorbell is unregistered - a degraded state, polled until a slot frees.
+    const int timeout_ms = ctx->doorbell_watch_wanted.load(std::memory_order_acquire) ? 1000 : -1;
+    const int n = epoll_wait(ctx->listener_epoll_fd, ready, 16, timeout_ms);
     if (n < 0) {
       if (errno == EINTR) {
         continue;
@@ -143,7 +158,6 @@ static void listener_loop(UdsContext * ctx)
         std::strerror(errno), errno);
       return;
     }
-    retry_doorbell_watch(ctx, last_doorbell_try);
     for (int i = 0; i < n; ++i) {
       const int fd = ready[i].data.fd;
       if (fd == ctx->listener_wake_fd) {
@@ -213,6 +227,11 @@ static void listener_loop(UdsContext * ctx)
         signal_delivery_fds(ctx);
       }
     }
+    // After the ready fds - so after the wake fd is drained: a retry flag set
+    // and woken for before the drain is seen here, and one set after it
+    // leaves the wake fd readable for the next pass. Checking first and
+    // draining after would consume a wake whose flag the check missed.
+    retry_doorbell_watch(ctx, last_doorbell_try);
   }
 }
 
