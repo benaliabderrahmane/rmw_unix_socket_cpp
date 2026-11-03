@@ -1530,11 +1530,12 @@ TEST_F(EventTest, AMatchedCallbackRegisteredWhileTheRegistryIsFullHearsLaterChan
   auto * header = rmw_uds::registry_header(ctx->registry_ptr);
   ASSERT_FALSE(ctx->doorbell_registered.load());
   // Full, cheaply (as test_registry does): no slot above the high-water mark,
-  // and fillers in every free slot below it - there may be none.
+  // and fillers in every free slot below it. Two fillers are added before the
+  // clamp, so two slots can be freed later by removing them: max_entries is a
+  // plain field the listener thread reads while it retries the doorbell, so
+  // it is written only before that thread exists and after it has stopped
+  // retrying (the callback is cleared before `restore` runs).
   const uint32_t original_max = header->max_entries;
-  const uint32_t full_max = header->high_water_slot.load();
-  ASSERT_LE(full_max + 2, original_max);
-  header->max_entries = full_max;
   std::vector<int32_t> fillers;
   OnExit restore{[&]() {
       for (const int32_t idx : fillers) {
@@ -1547,6 +1548,12 @@ TEST_F(EventTest, AMatchedCallbackRegisteredWhileTheRegistryIsFullHearsLaterChan
   filler.type = rmw_uds::ENTRY_NODE;
   filler.pid = getpid();
   std::strncpy(filler.node_name, "filler", sizeof(filler.node_name) - 1);
+  for (int i = 0; i < 2; ++i) {
+    const int32_t idx = rmw_uds::registry_add(header, filler);
+    ASSERT_GE(idx, 0);
+    fillers.push_back(idx);
+  }
+  header->max_entries = header->high_water_slot.load();
   for (int32_t idx; (idx = rmw_uds::registry_add(header, filler)) >= 0; ) {
     fillers.push_back(idx);
   }
@@ -1564,9 +1571,11 @@ TEST_F(EventTest, AMatchedCallbackRegisteredWhileTheRegistryIsFullHearsLaterChan
   const size_t before = counter.calls.load();
 
   // Two slots free - one for the doorbell, one for the subscription below -
-  // and a wait holding a matched event registers the doorbell. Freed above
-  // the clamp rather than by removing fillers, of which there may be none.
-  header->max_entries = full_max + 2;
+  // and a wait holding a matched event registers the doorbell.
+  for (int i = 0; i < 2; ++i) {
+    rmw_uds::registry_remove(header, fillers.back());
+    fillers.pop_back();
+  }
   rmw_event_t sub_ev = rmw_get_zero_initialized_event();
   ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&sub_ev, sub, RMW_EVENT_SUBSCRIPTION_MATCHED));
   rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
