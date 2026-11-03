@@ -58,6 +58,7 @@ struct MatchedRef
   UdsContext * ctx;
   const std::string * topic;
   RegistryEntryType peer_type;
+  std::recursive_mutex * callbacks;  // see lock_callbacks; null for a publisher
 };
 
 MatchedRef matched_of(void * endpoint, rmw_event_type_t type)
@@ -65,10 +66,25 @@ MatchedRef matched_of(void * endpoint, rmw_event_type_t type)
   if (type == RMW_EVENT_PUBLICATION_MATCHED) {
     auto * pub = static_cast<UdsPublisher *>(endpoint);
     return {&pub->event_mutex, &pub->matched, pub->context, &pub->topic_name,
-      ENTRY_SUBSCRIPTION};
+      ENTRY_SUBSCRIPTION, nullptr};
   }
   auto * sub = static_cast<UdsSubscription *>(endpoint);
-  return {&sub->event_mutex, &sub->matched, sub->context, &sub->topic_name, ENTRY_PUBLISHER};
+  return {&sub->event_mutex, &sub->matched, sub->context, &sub->topic_name, ENTRY_PUBLISHER,
+    &sub->callback_mutex};
+}
+
+// A subscription runs its message callback under callback_mutex and its status
+// callbacks under event_mutex, and any of them may take on the subscription: a
+// take that drains a message needs callback_mutex, one that finds a gap needs
+// event_mutex. Two callbacks on two threads would then each hold one lock and
+// wait for the other. So a status callback also holds callback_mutex, taken
+// first: one callback at a time per subscription, the locks always in this
+// order. Both are recursive, so a callback re-entered on its own thread still
+// runs. A publisher has no message callback; it passes null.
+std::unique_lock<std::recursive_mutex> lock_callbacks(std::recursive_mutex * callbacks)
+{
+  return callbacks ? std::unique_lock<std::recursive_mutex>(*callbacks) :
+         std::unique_lock<std::recursive_mutex>();
 }
 
 // Re-read the peers if the registry generation moved since the last
@@ -133,6 +149,7 @@ bool event_init(
   rmw_event->event_type = event_type;
   if (is_matched_type(event_type)) {
     const MatchedRef ref = matched_of(endpoint, event_type);
+    const auto callbacks = lock_callbacks(ref.callbacks);
     std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
     if (ref.ctx && !ref.state->counted) {
       ref.state->counted = true;
@@ -171,6 +188,7 @@ bool event_has_unread(const rmw_event_t * event)
   }
   if (is_matched_type(event->event_type)) {
     const MatchedRef ref = matched_of(event->data, event->event_type);
+    const auto callbacks = lock_callbacks(ref.callbacks);
     std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
     recompute(ref, true);
     return ref.state->unread > 0;
@@ -186,6 +204,7 @@ bool event_is_graph_driven(const rmw_event_t * event)
 void record_message_lost(UdsSubscription * sub, size_t lost)
 {
   {
+    const auto callbacks = lock_callbacks(&sub->callback_mutex);
     std::lock_guard<std::recursive_mutex> lock(sub->event_mutex);
     auto & st = sub->message_lost;
     st.total_count += lost;
@@ -209,6 +228,7 @@ void notify_graph_events(UdsContext * ctx)
 {
   for (const auto & [endpoint, type] : ctx->graph_events) {
     const MatchedRef ref = matched_of(endpoint, type);
+    const auto callbacks = lock_callbacks(ref.callbacks);
     std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
     recompute(ref, true);
   }
@@ -391,6 +411,7 @@ rmw_ret_t rmw_event_set_callback(
       }
     }
     {
+      const auto callbacks = rmw_uds::lock_callbacks(&sub->callback_mutex);
       std::lock_guard<std::recursive_mutex> lock(sub->event_mutex);
       auto & st = sub->message_lost;
       const bool taking_over = !st.cb.callback;
@@ -472,6 +493,7 @@ rmw_ret_t rmw_event_set_callback(
     }
   }
   {
+    const auto callbacks = rmw_uds::lock_callbacks(ref.callbacks);
     std::lock_guard<std::recursive_mutex> lock(*ref.mutex);
     const bool taking_over = !ref.state->cb.callback;
     ref.state->cb = {callback, user_data};
