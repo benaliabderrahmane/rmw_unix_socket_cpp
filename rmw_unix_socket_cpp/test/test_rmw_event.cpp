@@ -1521,6 +1521,26 @@ TEST_F(EventTest, AWaitDoesNotSignalItsOwnDeliveryFd)
   EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
 }
 
+// With no doorbell socket at all (its bind failed at rmw_init) there is
+// nothing to register or watch, ever: a matched callback must not leave the
+// listener polling for one once a second for the rest of its life.
+TEST_F(EventTest, AMatchedCallbackWithNoDoorbellSocketDoesNotPollForOne)
+{
+  auto * ctx = reinterpret_cast<rmw_uds::UdsContext *>(context.impl);
+  const int doorbell_fd = ctx->doorbell_fd;
+  ctx->doorbell_fd = -1;  // as when the bind failed; no listener runs yet
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  EventCounter counter;
+  OnExit restore{[&]() {
+      (void)rmw_event_set_callback(&ev, nullptr, nullptr);
+      ctx->doorbell_fd = doorbell_fd;
+    }};
+  ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, pub, RMW_EVENT_PUBLICATION_MATCHED));
+  ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &counter));
+  EXPECT_FALSE(ctx->doorbell_watch_wanted.load()) << "the listener retries a doorbell that cannot exist";
+  EXPECT_TRUE(await_calls(counter, 1));  // the existing match is still reported
+}
+
 // The registry-full tests clamp and fill the registry. They get a private
 // one - their own domain, its registry unlinked before and after each test,
 // as test_registry does - so a crashed or concurrent run never leaves a

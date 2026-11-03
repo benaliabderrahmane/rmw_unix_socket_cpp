@@ -482,13 +482,21 @@ rmw_ret_t rmw_event_set_callback(
     if (ret != RMW_RET_OK) {
       return ret;  // nothing is set yet
     }
+  } else if (ctx->doorbell_fd < 0) {
+    // No doorbell socket at all (its bind failed at rmw_init): nothing will
+    // ever ring, and no retry can make one. The callback still fires for
+    // what this registration finds and for what a wait in this process sees.
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000,
+      "no graph doorbell socket: matched callbacks hear graph changes only "
+      "through this process's waits");
   } else {
-    // No doorbell (registry full, or its socket never bound): nothing rings
-    // the listener for this context. The callback still fires for what this
-    // registration finds and for what a wait in this process sees. The
-    // listener retries the doorbell on each wake, and a wait that registers
-    // it wakes the listener (ensure_doorbell_registered) - so the listener
-    // must exist even though it watches nothing for this callback yet.
+    // Registry full: nothing rings the listener for this context yet. The
+    // callback still fires for what this registration finds and for what a
+    // wait in this process sees. The listener retries the doorbell (see
+    // retry_doorbell_watch), and a wait that registers it wakes the listener
+    // (ensure_doorbell_registered) - so the listener must exist even though
+    // it watches nothing for this callback yet.
     const rmw_ret_t ret = rmw_uds::listener_ensure_running(ctx);
     if (ret != RMW_RET_OK) {
       return ret;  // nothing is set yet
