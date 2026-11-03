@@ -1227,11 +1227,20 @@ TEST_F(EventTest, DestroyingTheLastMatchedCallbacksEndpointUnwatchesTheDoorbell)
   auto * other = rmw_create_publisher(node, ts, "/event_test_topic", &qos, &pub_opts);
   ASSERT_NE(nullptr, other);
   rmw_event_t ev = rmw_get_zero_initialized_event();
-  ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, other, RMW_EVENT_PUBLICATION_MATCHED));
   EventCounter counter;
+  // An ASSERT below that returns early must not leave `other` alive with a
+  // callback pointing at `counter`, which the listener would later fire.
+  OnExit cleanup{[&]() {
+      if (other) {
+        (void)rmw_event_set_callback(&ev, nullptr, nullptr);
+        (void)rmw_destroy_publisher(node, other);
+      }
+    }};
+  ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, other, RMW_EVENT_PUBLICATION_MATCHED));
   ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &counter));
   EXPECT_TRUE(doorbell_watched());
   ASSERT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, other));  // callback still set
+  other = nullptr;
   EXPECT_FALSE(doorbell_watched());
 }
 
