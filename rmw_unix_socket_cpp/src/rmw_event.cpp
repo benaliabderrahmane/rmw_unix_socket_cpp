@@ -267,6 +267,7 @@ void forget_graph_events(UdsContext * ctx, void * endpoint, rmw_event_type_t mat
   if (unlist_graph_event(ctx, endpoint, matched_type)) {
     // Destroyed with its matched callback still set (rclcpp clears it first):
     // stop waking the listener on each registry mutation, as a clear does.
+    ctx->doorbell_watch_wanted.store(false, std::memory_order_release);
     listener_unwatch(ctx, ctx->doorbell_fd);
   }
   const MatchedRef ref = matched_of(endpoint, matched_type);
@@ -468,8 +469,9 @@ rmw_ret_t rmw_event_set_callback(
       ref.state->cb = {};
     }
     if (none_left) {
-      // Stop waking the listener on each registry mutation. A no-op if the
-      // doorbell was never watched.
+      // Stop waking the listener on each registry mutation, and retrying a
+      // doorbell no callback needs. A no-op if it was never watched.
+      ctx->doorbell_watch_wanted.store(false, std::memory_order_release);
       rmw_uds::listener_unwatch(ctx, ctx->doorbell_fd);
     }
     return RMW_RET_OK;
@@ -486,18 +488,21 @@ rmw_ret_t rmw_event_set_callback(
       return ret;  // nothing is set yet
     }
   } else {
-    // No doorbell (registry full, or its socket never bound): nothing wakes
+    // No doorbell (registry full, or its socket never bound): nothing rings
     // the listener for this context. The callback still fires for what this
-    // registration finds and for what a wait in this process sees, so the
-    // event is degraded rather than failed.
-    // shortcut: no retry - a callback registration made while the registry is
-    // full stays deaf to other processes until a later matched callback
-    // registration finds a free slot; add a retry if full registries happen.
+    // registration finds and for what a wait in this process sees. The
+    // listener retries the doorbell on each wake, and a wait that registers
+    // it wakes the listener (ensure_doorbell_registered) - so the listener
+    // must exist even though it watches nothing for this callback yet.
+    const rmw_ret_t ret = rmw_uds::listener_ensure_running(ctx);
+    if (ret != RMW_RET_OK) {
+      return ret;  // nothing is set yet
+    }
+    ctx->doorbell_watch_wanted.store(true, std::memory_order_release);
     RMW_UDS_LOG_WARN_THROTTLE(
       5000,
-      "no graph doorbell (registry full?): matched callbacks hear no other "
-      "process's graph changes until a matched callback is registered with a "
-      "free slot");
+      "no graph doorbell (registry full?): matched callbacks hear no graph "
+      "change until a registry slot frees and the doorbell is registered");
   }
   bool listed = true;
   bool none_listed = false;

@@ -53,6 +53,11 @@ namespace rmw_uds
 rmw_ret_t listener_watch(
   UdsContext * ctx, int fd, uint8_t kind, void * entity, uint64_t uid);
 
+// Start the context's listener thread if it is not running yet, with nothing
+// watched but its wake fd - for a matched callback that has no doorbell yet
+// and needs the thread to retry one (doorbell_watch_wanted).
+rmw_ret_t listener_ensure_running(UdsContext * ctx);
+
 // Stop watching `fd`. Blocks until an in-flight drain has returned - of any
 // endpoint, since listener_mutex is per context - so the caller may destroy
 // the endpoint afterwards. A no-op for an fd that was never watched.

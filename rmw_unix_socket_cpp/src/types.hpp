@@ -333,6 +333,10 @@ struct UdsContext
   // otherwise whoever observes it also wakes every wait set and the listener
   // (listener_graph_changed), since any of them may hold a matched event.
   std::atomic<int> matched_events{0};
+  // A matched callback was listed while the doorbell could not be registered
+  // (registry full), so the listener does not watch it. The listener retries
+  // on each wake, and watches it while graph_events is non-empty.
+  std::atomic<bool> doorbell_watch_wanted{false};
 };
 
 // Node data

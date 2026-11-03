@@ -40,6 +40,7 @@
 #include "rmw/qos_profiles.h"
 #include "rosidl_typesupport_cpp/message_type_support.hpp"
 
+#include "registry.hpp"
 #include "shm_transport.hpp"
 #include "types.hpp"
 
@@ -1508,4 +1509,72 @@ TEST_F(EventTest, AWaitDoesNotSignalItsOwnDeliveryFd)
   EXPECT_NE(nullptr, ev_arr[0]) << "the wait did not report the loss it drained";
   EXPECT_FALSE(delivery_signalled(ws)) << "the wait signalled its own delivery fd";
   EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+// A matched callback registered while the registry is full gets no doorbell.
+// Once one is registered later - here by a wait, after slots free - the
+// listener must take it up: an EventsExecutor never waits, so otherwise the
+// callback hears no graph change for the rest of the endpoint's life.
+TEST_F(EventTest, AMatchedCallbackRegisteredWhileTheRegistryIsFullHearsLaterChanges)
+{
+  auto * ctx = reinterpret_cast<rmw_uds::UdsContext *>(context.impl);
+  auto * header = rmw_uds::registry_header(ctx->registry_ptr);
+  ASSERT_FALSE(ctx->doorbell_registered.load());
+  // Full, cheaply (as test_registry does): no slot above the high-water mark,
+  // and fillers in every free slot below it.
+  const uint32_t original_max = header->max_entries;
+  header->max_entries = header->high_water_slot.load();
+  std::vector<int32_t> fillers;
+  OnExit restore{[&]() {
+      for (const int32_t idx : fillers) {
+        rmw_uds::registry_remove(header, idx);
+      }
+      header->max_entries = original_max;
+    }};
+  rmw_uds::RegistryEntry filler;
+  std::memset(&filler, 0, sizeof(filler));
+  filler.type = rmw_uds::ENTRY_NODE;
+  filler.pid = getpid();
+  std::strncpy(filler.node_name, "filler", sizeof(filler.node_name) - 1);
+  for (int32_t idx; (idx = rmw_uds::registry_add(header, filler)) >= 0; ) {
+    fillers.push_back(idx);
+  }
+
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_publisher_event_init(&ev, pub, RMW_EVENT_PUBLICATION_MATCHED));
+  EventCounter counter;
+  ASSERT_EQ(RMW_RET_OK, rmw_event_set_callback(&ev, EventCounter::fire, &counter));
+  OnExit clear{[&]() {(void)rmw_event_set_callback(&ev, nullptr, nullptr);}};
+  ASSERT_FALSE(ctx->doorbell_registered.load()) << "the registry was not full";
+  ASSERT_TRUE(await_calls(counter, 1));  // the existing match
+  rmw_matched_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));  // as the executor would
+  const size_t before = counter.calls.load();
+
+  // Two slots free - one for the doorbell, one for the subscription below -
+  // and a wait holding a matched event registers the doorbell.
+  for (int i = 0; i < 2; ++i) {
+    rmw_uds::registry_remove(header, fillers.back());
+    fillers.pop_back();
+  }
+  rmw_event_t sub_ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&sub_ev, sub, RMW_EVENT_SUBSCRIPTION_MATCHED));
+  rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  OnExit destroy_ws{[&]() {(void)rmw_destroy_wait_set(ws);}};
+  void * arr[1] = {&sub_ev};
+  rmw_events_t events{1, arr};
+  rmw_time_t timeout{0, 0};
+  (void)rmw_wait(nullptr, nullptr, nullptr, nullptr, &events, ws, &timeout);
+  ASSERT_TRUE(ctx->doorbell_registered.load());
+
+  // Nothing in this process waits from here on: only the listener can hear it.
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * second = rmw_create_subscription(node, ts, "/event_test_topic", &qos, &sub_opts);
+  ASSERT_NE(nullptr, second);
+  OnExit destroy_second{[&]() {(void)rmw_destroy_subscription(node, second);}};
+  EXPECT_TRUE(await_calls(counter, before + 1))
+    << "the matched callback stayed deaf after the doorbell was registered";
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&sub_ev));
 }
