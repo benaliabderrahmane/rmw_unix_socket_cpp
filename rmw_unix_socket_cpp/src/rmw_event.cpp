@@ -529,6 +529,10 @@ rmw_ret_t rmw_event_set_callback(
     // callback deaf. (Setters and destroys are serialised on
     // listener_registration_mutex, so no clear can come between.)
     ctx->doorbell_watch_wanted.store(true, std::memory_order_release);
+    // Then wake the listener to retry: a wait may have registered the
+    // doorbell after this call's attempt failed but before the flag was set,
+    // found no flag, and woken no one.
+    rmw_uds::listener_graph_changed(ctx);
   }
   {
     const auto callbacks = rmw_uds::lock_callbacks(ref.callbacks);
