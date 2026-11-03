@@ -286,6 +286,10 @@ rmw_ret_t rmw_wait(
     }
   }
 
+  // Every signal this wait sends goes to the other wait sets (see
+  // OwnDeliveryFd): it re-checks its own queues and events after each.
+  const rmw_uds::OwnDeliveryFd own_delivery(ws_data->delivery_fd);
+
   const int doorbell_fd = ctx ? ctx->doorbell_fd : -1;
   // This wait set's own delivery eventfd. Armed unconditionally: gating it on
   // a listener-running flag read here would arm nothing for a wait that

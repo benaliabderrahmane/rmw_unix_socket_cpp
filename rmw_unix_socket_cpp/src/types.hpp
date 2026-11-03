@@ -212,6 +212,10 @@ struct UdsMessageLostState
   size_t total_count_change = 0;
   size_t unread = 0;
   UdsEventCallback cb;
+  // Set at the first event init and never cleared (rcl's event fini never
+  // reaches an RMW). Until then no wait can hold the event, so a loss is
+  // counted without signalling the wait sets.
+  bool has_event = false;
 };
 
 // Per-context implementation data

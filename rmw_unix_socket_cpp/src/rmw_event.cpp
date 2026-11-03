@@ -160,6 +160,10 @@ bool event_init(
     // state is per endpoint, so another handle's callback may be registered,
     // and the listener will not announce a generation this read first.
     recompute(ref, true);
+  } else if (event_type == RMW_EVENT_MESSAGE_LOST) {
+    auto * sub = static_cast<UdsSubscription *>(endpoint);
+    std::lock_guard<std::recursive_mutex> lock(sub->event_mutex);
+    sub->message_lost.has_event = true;
   }
   return true;
 }
@@ -203,10 +207,12 @@ bool event_is_graph_driven(const rmw_event_t * event)
 
 void record_message_lost(UdsSubscription * sub, size_t lost)
 {
+  bool has_event = false;
   {
     const auto callbacks = lock_callbacks(&sub->callback_mutex);
     std::lock_guard<std::recursive_mutex> lock(sub->event_mutex);
     auto & st = sub->message_lost;
+    has_event = st.has_event;
     st.total_count += lost;
     st.total_count_change += lost;
     // One take credit per batch: a callback fires only when the event goes
@@ -218,8 +224,8 @@ void record_message_lost(UdsSubscription * sub, size_t lost)
   // Strictly after the record, from whichever thread drained: the drain may
   // have emptied a socket another wait set is blocked on, and its epoll then
   // never sees that socket readable. The wait re-checks its events on a
-  // delivery wake (see rmw_wait).
-  if (sub->context) {
+  // delivery wake (see rmw_wait). Only when a wait can hold the event at all.
+  if (has_event && sub->context) {
     signal_delivery_fds(sub->context);
   }
 }
