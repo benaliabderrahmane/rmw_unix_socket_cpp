@@ -16,6 +16,7 @@
 #include <array>
 #include <cstring>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 
@@ -108,10 +109,18 @@ bool recompute(const MatchedRef & ref, bool notify)
     return false;
   }
   std::set<std::array<uint8_t, 16>> now;
-  for (const auto & r : registry_query(header, ref.peer_type, ref.topic->c_str(), nullptr, nullptr)) {
-    std::array<uint8_t, 16> gid;
-    std::memcpy(gid.data(), r.gid, gid.size());
-    now.insert(gid);
+  try {
+    for (const auto & r : registry_query(header, ref.peer_type, ref.topic->c_str(), nullptr, nullptr)) {
+      std::array<uint8_t, 16> gid;
+      std::memcpy(gid.data(), r.gid, gid.size());
+      now.insert(gid);
+    }
+  } catch (const std::bad_alloc &) {
+    // Callers run under extern "C" entry points and on the listener thread,
+    // where an escaping exception is undefined behavior or std::terminate.
+    // The peers and generation stay as they were, so the next check retries.
+    RMW_UDS_LOG_ERROR_THROTTLE(5000, "matched: out of memory reading the registry; retrying later");
+    return false;
   }
   size_t added = 0;
   size_t removed = 0;
@@ -490,13 +499,29 @@ rmw_ret_t rmw_event_set_callback(
       "process's graph changes until a matched callback is registered with a "
       "free slot");
   }
+  bool listed = true;
+  bool none_listed = false;
   {
     std::lock_guard<std::mutex> lock(ctx->listener_mutex);
     auto & ev = ctx->graph_events;
     const auto entry = std::make_pair(event->data, event->event_type);
     if (std::find(ev.begin(), ev.end(), entry) == ev.end()) {
-      ev.push_back(entry);
+      try {
+        ev.push_back(entry);
+      } catch (const std::bad_alloc &) {
+        listed = false;
+        none_listed = ev.empty();
+      }
     }
+  }
+  if (!listed) {
+    // Nothing is set yet; give the doorbell watch back if no other matched
+    // callback needs it.
+    if (none_listed) {
+      rmw_uds::listener_unwatch(ctx, ctx->doorbell_fd);
+    }
+    RMW_SET_ERROR_MSG("out of memory registering the matched event callback");
+    return RMW_RET_BAD_ALLOC;
   }
   {
     const auto callbacks = rmw_uds::lock_callbacks(ref.callbacks);
