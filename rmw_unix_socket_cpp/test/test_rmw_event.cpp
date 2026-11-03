@@ -1321,3 +1321,131 @@ TEST_F(EventTest, AnUnresolvableDescriptorAlreadyCountedIsNotCountedAgain)
   EXPECT_EQ(0u, st.total_count);
   EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
 }
+
+// A status callback that takes on its own subscription, as the callback rules
+// allow: it publishes, so its take drains a message and notifies under
+// callback_mutex.
+struct TakingCallback
+{
+  rmw_publisher_t * pub = nullptr;
+  rmw_subscription_t * sub = nullptr;
+  std::atomic<bool> entered{false};
+  static void fire(const void * user_data, size_t)
+  {
+    auto * self = const_cast<TakingCallback *>(static_cast<const TakingCallback *>(user_data));
+    self->entered.store(true);
+    test_msgs::msg::BasicTypes msg;
+    (void)rmw_publish(self->pub, &msg, nullptr);
+    bool taken = false;
+    (void)rmw_take(self->sub, &msg, &taken, nullptr);
+  }
+};
+
+// A take can reach either of a subscription's callback locks: draining a
+// message notifies under callback_mutex, finding a gap records the loss under
+// event_mutex. So a message callback and a status callback that both take, on
+// two threads, must not each hold one lock while waiting for the other. Here
+// the test holds callback_mutex as a message callback on another thread does;
+// that callback's take, finding a gap, would need event_mutex - which a loss
+// callback must not be holding while it waits for callback_mutex.
+TEST_F(EventTest, ALossCallbackThatTakesCannotDeadlockAMessageCallback)
+{
+  auto * data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_MESSAGE_LOST));
+  publish(1);
+  wait_on_sub(sub);  // baseline
+  skip_publications(pub, 3);
+  publish(2);  // a gap, left in the socket
+
+  // Installed directly, not through rmw_event_set_callback, so the listener
+  // does not watch the socket: the take below is the only drain.
+  TakingCallback cb;
+  cb.pub = pub;
+  cb.sub = sub;
+  {
+    std::lock_guard<std::recursive_mutex> lock(data->event_mutex);
+    data->message_lost.cb = {TakingCallback::fire, &cb};
+  }
+  OnExit clear{[&]() {
+      std::lock_guard<std::recursive_mutex> lock(data->event_mutex);
+      data->message_lost.cb = {};
+    }};
+
+  std::unique_lock<std::recursive_mutex> message_callback(data->callback_mutex);
+  std::thread drainer([&]() {
+      test_msgs::msg::BasicTypes msg;
+      bool taken = false;
+      (void)rmw_take(sub, &msg, &taken, nullptr);  // finds the gap
+    });
+  for (int waited = 0; !cb.entered.load() && waited < 1000; waited += 5) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  std::unique_lock<std::recursive_mutex> loss(data->event_mutex, std::try_to_lock);
+  EXPECT_TRUE(loss.owns_lock())
+    << "a loss callback holds event_mutex while waiting for callback_mutex: a message "
+    "callback whose take finds a gap would wait for event_mutex forever";
+  if (loss.owns_lock()) {
+    loss.unlock();
+  }
+  message_callback.unlock();
+  drainer.join();
+  EXPECT_TRUE(cb.entered.load());
+  rmw_reset_error();
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}
+
+// The same for a subscription's matched callback, which a wait fires when it
+// reads a graph change.
+TEST_F(EventTest, AMatchedCallbackThatTakesCannotDeadlockAMessageCallback)
+{
+  auto * data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+  rmw_event_t ev = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&ev, sub, RMW_EVENT_SUBSCRIPTION_MATCHED));
+  rmw_matched_status_t st{};
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take_event(&ev, &st, &taken));  // the existing match
+  auto pub_opts = rmw_get_default_publisher_options();
+  auto * second = rmw_create_publisher(node, ts, "/event_test_topic", &qos, &pub_opts);
+  ASSERT_NE(nullptr, second);  // a match nobody has read yet
+  OnExit destroy{[&]() {(void)rmw_destroy_publisher(node, second);}};
+
+  // Installed directly, as above, so only the wait below reads the match.
+  TakingCallback cb;
+  cb.pub = pub;
+  cb.sub = sub;
+  {
+    std::lock_guard<std::recursive_mutex> lock(data->event_mutex);
+    data->matched.cb = {TakingCallback::fire, &cb};
+  }
+  OnExit clear{[&]() {
+      std::lock_guard<std::recursive_mutex> lock(data->event_mutex);
+      data->matched.cb = {};
+    }};
+
+  rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  std::unique_lock<std::recursive_mutex> message_callback(data->callback_mutex);
+  std::thread waiter([&]() {
+      void * arr[1] = {&ev};
+      rmw_events_t events{1, arr};
+      rmw_time_t timeout{0, 0};
+      (void)rmw_wait(nullptr, nullptr, nullptr, nullptr, &events, ws, &timeout);
+    });
+  for (int waited = 0; !cb.entered.load() && waited < 1000; waited += 5) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  std::unique_lock<std::recursive_mutex> matched(data->event_mutex, std::try_to_lock);
+  EXPECT_TRUE(matched.owns_lock())
+    << "a matched callback holds event_mutex while waiting for callback_mutex: a message "
+    "callback that takes its matched event would wait for event_mutex forever";
+  if (matched.owns_lock()) {
+    matched.unlock();
+  }
+  message_callback.unlock();
+  waiter.join();
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_TRUE(cb.entered.load());
+  rmw_reset_error();
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&ev));
+}

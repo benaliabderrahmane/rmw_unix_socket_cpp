@@ -453,6 +453,8 @@ struct UdsSubscription
   ShmReaderCache shm_cache;
 
   // QoS status events. Recursive: an event callback may take its own event.
+  // A status callback also holds callback_mutex, taken first (lock_callbacks
+  // in rmw_event.cpp), so it never waits on a message callback's lock.
   std::recursive_mutex event_mutex;
   UdsMatchedState matched;
   UdsMessageLostState message_lost;
