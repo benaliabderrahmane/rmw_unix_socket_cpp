@@ -87,6 +87,9 @@ when it only fixes. The default is `patch`.
 
 `--no-push` holds the tag back until `main` has the release: bloom's upstream
 branch is `main`, so before the merge its `:{auto}` version is still the old one.
+If the release PR needs a fix first, land it on `devel`, then move the local tag
+to the new tip (`git fetch origin && git tag -f v0.6.0 origin/devel`) before
+pushing it.
 
 Merge the release PR with a merge commit, as v0.5.0 was (#63). A squash gives
 `main` a commit `devel` lacks, and the next release PR conflicts with it.
@@ -107,8 +110,9 @@ Push the tag, let `release.yml` go green, then run bloom.
 ## CHANGELOG.rst
 
 `CHANGELOG.rst` must sit next to `package.xml`; bloom reads nowhere else. Each PR
-adds its entry under the `Forthcoming` heading at the top, and
-`catkin_prepare_release` renames that heading to the new version and date.
+adds its entry under the `Forthcoming` heading at the top, creating that heading
+(`Forthcoming` over `-----------`) above the newest version when a release has
+just consumed it; `catkin_prepare_release` renames it to the new version and date.
 Version headings are `0.5.0 (2026-08-27)` over a `------` underline, and a
 version body may contain only paragraphs, bullet lists and transitions — REP-132
 forbids sub-sections and `catkin_pkg` drops anything else silently, which ships

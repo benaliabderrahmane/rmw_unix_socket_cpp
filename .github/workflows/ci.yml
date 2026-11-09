@@ -151,8 +151,11 @@ jobs:
           warnings = io.StringIO()
           tree = publish_doctree(changelog.rst, settings_overrides={'warning_stream': warnings})
           assert not warnings.getvalue(), f'docutils: {warnings.getvalue()}'
+          # Link targets and substitution definitions are dropped too, but the
+          # text that uses them is already resolved, so nothing is lost.
           kept = (nodes.title, nodes.paragraph, nodes.bullet_list,
-                  nodes.enumerated_list, nodes.transition, nodes.comment)
+                  nodes.enumerated_list, nodes.transition, nodes.comment,
+                  nodes.target, nodes.substitution_definition)
           for section in tree.findall(nodes.section):
               title = section.next_node(nodes.title).astext()
               if title != 'Forthcoming':
