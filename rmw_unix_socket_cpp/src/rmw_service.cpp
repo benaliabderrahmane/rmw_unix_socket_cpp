@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "drain.hpp"
 #include "identifier.hpp"
+#include "listener.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
 #include "serialization.hpp"
@@ -153,6 +155,9 @@ rmw_ret_t rmw_destroy_service(rmw_node_t * node, rmw_service_t * service)
 
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
   if (srv_data) {
+    // Stop the listener watching this socket first: listener_unwatch blocks
+    // until an in-flight drain has returned, so the delete below cannot race it.
+    rmw_uds::listener_unwatch(srv_data->context, srv_data->socket_fd);
     if (srv_data->context && srv_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(srv_data->context->registry_ptr);
       rmw_uds::registry_remove(header, srv_data->registry_index);
@@ -188,25 +193,7 @@ rmw_ret_t rmw_take_request(
   *taken = false;
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
 
-  // Drain socket
-  rmw_uds::WireHeader hdr;
-  std::vector<uint8_t> payload;
-  while (rmw_uds::recv_from(srv_data->socket_fd, hdr, payload)) {
-    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 1) {payload.clear(); continue;}
-    if (!rmw_uds::shm_resolve_incoming(
-        srv_data->shm_cache, srv_data->context->domain_id, hdr, payload))
-    {
-      payload.clear();
-      continue;
-    }
-    rmw_uds::ReceivedMessage msg;
-    msg.header = hdr;
-    msg.payload = std::move(payload);
-    msg.received_timestamp_ns = system_now_ns();
-    std::lock_guard<std::mutex> lock(srv_data->queue_mutex);
-    srv_data->request_queue.push_back(std::move(msg));
-    payload.clear();
-  }
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(srv_data));
 
   std::lock_guard<std::mutex> lock(srv_data->queue_mutex);
   // Drop-garbage-and-continue: one corrupt datagram must not destroy a
@@ -374,17 +361,9 @@ rmw_ret_t rmw_service_set_on_new_request_callback(
     service, service->implementation_identifier,
     rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
   auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
-  std::lock_guard<std::mutex> lock(srv_data->callback_mutex);
-  srv_data->on_new_request_cb = callback;
-  srv_data->on_new_request_user_data = user_data;
-
-  if (callback) {
-    std::lock_guard<std::mutex> qlock(srv_data->queue_mutex);
-    if (!srv_data->request_queue.empty()) {
-      callback(user_data, srv_data->request_queue.size());
-    }
-  }
-  return RMW_RET_OK;
+  return rmw_uds::listener_set_callback(
+    srv_data->context, rmw_uds::drain_target(srv_data),
+    rmw_uds::ARMED_SERVICE, srv_data, srv_data->uid, callback, user_data);
 }
 
 }  // extern "C"

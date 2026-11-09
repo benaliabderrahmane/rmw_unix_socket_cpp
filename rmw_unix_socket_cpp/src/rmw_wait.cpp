@@ -12,19 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "drain.hpp"
 #include "identifier.hpp"
+#include "listener.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
-#include "transport.hpp"
 #include "types.hpp"
 
 #include <algorithm>
-#include <array>
+#include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstring>
+#include <ctime>
 #include <limits>
-#include <map>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -44,79 +45,34 @@ static int64_t steady_now_ns()
     std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-static int64_t wall_now_ns()
+// Block in epoll for up to `timeout_ns` nanoseconds; -1 blocks forever.
+// epoll_pwait2 (Linux 5.11, glibc 2.35) takes the timeout with nanosecond
+// resolution. epoll_wait only takes milliseconds, so it is the fallback where
+// epoll_pwait2 is missing: an older glibc at build time, or an older kernel
+// (ENOSYS) or a container seccomp profile that blocks it (EPERM) at run time.
+static int epoll_wait_ns(
+  int epfd, struct epoll_event * events, int max_events, int64_t timeout_ns)
 {
-  return std::chrono::duration_cast<std::chrono::nanoseconds>(
-    std::chrono::system_clock::now().time_since_epoch()).count();
-}
-
-// Drain a socket into a message queue (subscription, service, or client).
-// `shm_cache`/`domain_id` resolve large-payload descriptors: topic, request,
-// and response messages can all carry SHM_PAYLOAD_FLAG, so every caller passes
-// its own reader cache. If `ignore_local` is true, `context_id` is compared
-// against the sender context id embedded in WireHeader::gid and matching
-// same-context publications are dropped (subscriptions only; services/clients
-// leave ignore_local=false to disable the check).
-static void drain_socket(
-  int fd,
-  std::mutex & queue_mutex,
-  std::deque<rmw_uds::ReceivedMessage> & queue,
-  size_t max_depth,
-  uint8_t expected_msg_type,
-  rmw_uds::ShmReaderCache & shm_cache,
-  size_t domain_id,
-  bool ignore_local = false,
-  uint64_t context_id = 0,
-  std::map<std::array<uint8_t, 16>, int64_t> * replay_watermarks = nullptr)
-{
-  rmw_uds::WireHeader hdr;
-  std::vector<uint8_t> payload;
-
-  while (rmw_uds::recv_from(fd, hdr, payload)) {
-    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != expected_msg_type) {
-      payload.clear();
-      continue;
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 35))
+  static std::atomic<bool> pwait2_unavailable{false};
+  if (!pwait2_unavailable.load(std::memory_order_relaxed)) {
+    struct timespec ts;
+    ts.tv_sec = static_cast<time_t>(timeout_ns / 1000000000);
+    ts.tv_nsec = static_cast<decltype(ts.tv_nsec)>(timeout_ns % 1000000000);
+    int n = epoll_pwait2(epfd, events, max_events, timeout_ns < 0 ? nullptr : &ts, nullptr);
+    if (n >= 0 || (errno != ENOSYS && errno != EPERM)) {
+      return n;
     }
-    if (replay_watermarks) {
-      // TRANSIENT_LOCAL dedup (subscriptions only): drop a datagram whose
-      // sample the creation-time pull already delivered. Checked before the
-      // descriptor resolve so a duplicate never maps a segment.
-      std::array<uint8_t, 16> key;
-      std::memcpy(key.data(), hdr.gid, key.size());
-      bool dup = false;
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex);
-        auto it = replay_watermarks->find(key);
-        dup = it != replay_watermarks->end() &&
-          hdr.sequence_number <= it->second;
-      }
-      if (dup) {
-        payload.clear();
-        continue;
-      }
-    }
-    if (!rmw_uds::shm_resolve_incoming(shm_cache, domain_id, hdr, payload)) {
-      payload.clear();
-      continue;  // shm descriptor unresolvable (sender gone / ring lapped)
-    }
-    if (ignore_local && rmw_uds::is_same_context(hdr, context_id)) {
-      payload.clear();
-      continue;  // ignore_local_publications: drop same-context publications
-    }
-
-    rmw_uds::ReceivedMessage msg;
-    msg.header = hdr;
-    msg.payload = std::move(payload);
-    msg.received_timestamp_ns = wall_now_ns();
-
-    {
-      std::lock_guard<std::mutex> lock(queue_mutex);
-      queue.push_back(std::move(msg));
-      while (queue.size() > max_depth) {
-        queue.pop_front();
-      }
-    }
+    pwait2_unavailable.store(true, std::memory_order_relaxed);
   }
+#endif
+  // Round up so the fallback never returns before the caller's deadline.
+  int timeout_ms = -1;
+  if (timeout_ns >= 0) {
+    timeout_ms = static_cast<int>(std::min<int64_t>(
+      (timeout_ns + 999999) / 1000000, std::numeric_limits<int>::max()));
+  }
+  return epoll_wait(epfd, events, max_events, timeout_ms);
 }
 
 extern "C"
@@ -144,13 +100,27 @@ rmw_wait_set_t * rmw_create_wait_set(rmw_context_t * context, size_t max_conditi
     return nullptr;
   }
 
+  // Created here, before any listener exists, so a callback registered while
+  // this wait set is already blocked in epoll_wait still has an armed fd to
+  // signal. Resolving it at the top of rmw_wait instead would read a
+  // listener-running flag that is still false and arm nothing at all.
+  ws_data->delivery_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  if (ws_data->delivery_fd < 0) {
+    close(ws_data->epoll_fd);
+    delete ws_data;
+    RMW_SET_ERROR_MSG("failed to create the wait set's delivery eventfd");
+    return nullptr;
+  }
+
   auto * ws = rmw_wait_set_allocate();
   if (!ws) {
+    close(ws_data->delivery_fd);
     close(ws_data->epoll_fd);
     delete ws_data;
     RMW_SET_ERROR_MSG("failed to allocate rmw_wait_set_t");
     return nullptr;
   }
+  rmw_uds::listener_add_delivery_fd(ws_data->context, ws_data->delivery_fd);
 
   ws->implementation_identifier = rmw_uds::identifier;
   ws->data = ws_data;
@@ -167,6 +137,12 @@ rmw_ret_t rmw_destroy_wait_set(rmw_wait_set_t * wait_set)
 
   auto * ws_data = static_cast<rmw_uds::UdsWaitSet *>(wait_set->data);
   if (ws_data) {
+    // Deregister strictly BEFORE the close, under listener_mutex: the other
+    // order lets the listener write 8 bytes into a recycled fd number.
+    rmw_uds::listener_remove_delivery_fd(ws_data->context, ws_data->delivery_fd);
+    if (ws_data->delivery_fd >= 0) {
+      close(ws_data->delivery_fd);
+    }
     if (ws_data->epoll_fd >= 0) {
       close(ws_data->epoll_fd);
     }
@@ -258,6 +234,12 @@ rmw_ret_t rmw_wait(
   }
 
   const int doorbell_fd = ctx ? ctx->doorbell_fd : -1;
+  // This wait set's own delivery eventfd. Armed unconditionally: gating it on
+  // a listener-running flag read here would arm nothing for a wait that
+  // blocked before the first callback was registered, and rmw.h allows that
+  // registration from any thread at any time. A process that never registers
+  // one just holds an eventfd nobody writes.
+  const int delivery_fd = ws_data->delivery_fd;
   auto run_generation_check = [&]() {
       // Drain the doorbell strictly BEFORE reading the generation: paired with
       // ring_doorbells running strictly AFTER the bump, a mutation either lands
@@ -377,6 +359,12 @@ rmw_ret_t rmw_wait(
     // It has no entity, so uid 0 (never handed out by next_entity_uid) arms
     // it exactly once for the life of the wait set.
     register_fd(doorbell_fd, rmw_uds::ARMED_DOORBELL, nullptr, 0);
+    // This wait set's delivery eventfd. Like the doorbell it has no entity, so
+    // uid 0 arms it once for the life of the wait set. The listener signals it
+    // for any endpoint it drains, which need not be one this wait set holds —
+    // the dispatch below therefore re-checks the caller's queues instead of
+    // treating the wake itself as progress.
+    register_fd(delivery_fd, rmw_uds::ARMED_DELIVERY, nullptr, 0);
   }
 
   // Fallback for entities epoll cannot watch: drain their sockets directly so
@@ -387,22 +375,17 @@ rmw_ret_t rmw_wait(
     switch (ue.kind) {
       case rmw_uds::ARMED_SUBSCRIPTION: {
           auto * sub = static_cast<rmw_uds::UdsSubscription *>(ue.entity);
-          drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-            sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id,
-            sub->ignore_local_publications, sub->context->context_id,
-            &sub->replayed_watermarks);
+          rmw_uds::drain_endpoint(rmw_uds::drain_target(sub));
           break;
         }
       case rmw_uds::ARMED_SERVICE: {
           auto * srv = static_cast<rmw_uds::UdsService *>(ue.entity);
-          drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1,
-            srv->shm_cache, srv->context->domain_id);
+          rmw_uds::drain_endpoint(rmw_uds::drain_target(srv));
           break;
         }
       case rmw_uds::ARMED_CLIENT: {
           auto * cli = static_cast<rmw_uds::UdsClient *>(ue.entity);
-          drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2,
-            cli->shm_cache, cli->context->domain_id);
+          rmw_uds::drain_endpoint(rmw_uds::drain_target(cli));
           break;
         }
       default:
@@ -410,50 +393,63 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  // 3. Check if anything is already ready, without blocking. drain_socket()
+  // 3. Check if anything is already ready, without blocking. drain_endpoint()
   // reads until EAGAIN, so an earlier wait can leave more messages queued than
   // rmw_take has consumed since. Those are invisible to epoll (their socket is
   // already empty), so the internal queues must be checked directly. This is a
   // mutex and a deque test per entity, no syscalls.
-  bool something_ready = false;
+  // Drain the delivery eventfd strictly BEFORE the queue scan below. Paired
+  // with the listener signalling strictly AFTER it enqueues, a message it took
+  // off a socket either shows up in this scan or leaves the level-triggered
+  // eventfd readable for the epoll below — the wait cannot end up blocked on
+  // an empty socket whose datagram is already sitting in the queue.
+  if (delivery_fd >= 0) {
+    uint64_t val;
+    while (read(delivery_fd, &val, sizeof(val)) == static_cast<ssize_t>(sizeof(val))) {
+    }
+  }
+
+  auto caller_queue_has_work = [&]() {
+      if (subscriptions) {
+        for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
+          if (!subscriptions->subscribers[i]) {continue;}
+          auto * sub =
+            static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
+          std::lock_guard<std::mutex> lock(sub->queue_mutex);
+          if (!sub->message_queue.empty()) {
+            return true;
+          }
+        }
+      }
+      if (services) {
+        for (size_t i = 0; i < services->service_count; ++i) {
+          if (!services->services[i]) {continue;}
+          auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
+          std::lock_guard<std::mutex> lock(srv->queue_mutex);
+          if (!srv->request_queue.empty()) {
+            return true;
+          }
+        }
+      }
+      if (clients) {
+        for (size_t i = 0; i < clients->client_count; ++i) {
+          if (!clients->clients[i]) {continue;}
+          auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
+          std::lock_guard<std::mutex> lock(cli->queue_mutex);
+          if (!cli->response_queue.empty()) {
+            return true;
+          }
+        }
+      }
+      return false;
+    };
+
+  bool something_ready = caller_queue_has_work();
 
   // Per-GC readiness from the consuming read below, carried to the output
   // pass. One read drains the whole eventfd counter, so we never write it back
   // (a non-atomic read-back would race a concurrent trigger and inflate it).
   std::vector<bool> gc_triggered;
-
-  if (subscriptions) {
-    for (size_t i = 0; i < subscriptions->subscriber_count; ++i) {
-      if (!subscriptions->subscribers[i]) {continue;}
-      auto * sub = static_cast<rmw_uds::UdsSubscription *>(subscriptions->subscribers[i]);
-      std::lock_guard<std::mutex> lock(sub->queue_mutex);
-      if (!sub->message_queue.empty()) {
-        something_ready = true;
-      }
-    }
-  }
-
-  if (services) {
-    for (size_t i = 0; i < services->service_count; ++i) {
-      if (!services->services[i]) {continue;}
-      auto * srv = static_cast<rmw_uds::UdsService *>(services->services[i]);
-      std::lock_guard<std::mutex> lock(srv->queue_mutex);
-      if (!srv->request_queue.empty()) {
-        something_ready = true;
-      }
-    }
-  }
-
-  if (clients) {
-    for (size_t i = 0; i < clients->client_count; ++i) {
-      if (!clients->clients[i]) {continue;}
-      auto * cli = static_cast<rmw_uds::UdsClient *>(clients->clients[i]);
-      std::lock_guard<std::mutex> lock(cli->queue_mutex);
-      if (!cli->response_queue.empty()) {
-        something_ready = true;
-      }
-    }
-  }
 
   if (guard_conditions) {
     gc_triggered.assign(guard_conditions->guard_condition_count, false);
@@ -470,19 +466,17 @@ rmw_ret_t rmw_wait(
     }
   }
 
-  // Compute timeout. -1 means block forever (epoll_wait sentinel).
-  int timeout_ms = -1;
+  // Compute timeout in nanoseconds. -1 means block forever.
+  int64_t timeout_ns = -1;
   if (wait_timeout) {
     // Accumulate in int64_t; RMW_DURATION_INFINITE (~9.2e12 ms) overflows int.
     int64_t ms = static_cast<int64_t>(wait_timeout->sec) * 1000 +
       static_cast<int64_t>(wait_timeout->nsec) / 1000000;
     if (ms > std::numeric_limits<int>::max()) {
-      timeout_ms = -1;  // Infinite (or beyond epoll's range) -> block forever
+      timeout_ns = -1;  // Infinite (or beyond epoll's range) -> block forever
     } else {
-      timeout_ms = static_cast<int>(ms);
-      if (timeout_ms == 0 && wait_timeout->nsec > 0) {
-        timeout_ms = 1;  // At least 1ms
-      }
+      timeout_ns = static_cast<int64_t>(wait_timeout->sec) * 1000000000 +
+        static_cast<int64_t>(wait_timeout->nsec);
     }
   }
 
@@ -495,9 +489,9 @@ rmw_ret_t rmw_wait(
   // re-blocks. RMW_RET_TIMEOUT surfaces only at the caller's own deadline; an
   // infinite wait never surfaces a synthetic timeout. EINTR re-enters the
   // loop, so a signal neither returns TIMEOUT early nor busy-loops.
-  const bool infinite = (timeout_ms < 0);
+  const bool infinite = (timeout_ns < 0);
   const int64_t caller_deadline_ns =
-    infinite ? 0 : steady_now_ns() + static_cast<int64_t>(timeout_ms) * 1000000;
+    infinite ? 0 : steady_now_ns() + timeout_ns;
   // 4. Block on epoll, then drain only the fds it reported ready. This is what
   // keeps the wait O(ready) instead of O(entities in the wait set). When step 3
   // already found queued work we still make one non-blocking pass, so an entity
@@ -508,26 +502,24 @@ rmw_ret_t rmw_wait(
   {
     struct epoll_event ready_events[64];
     while (true) {
-      int block_ms = 0;
+      int64_t block_ns = 0;
       if (!poll_only) {
-        block_ms = -1;
+        block_ns = -1;
         if (!infinite) {
           const int64_t rem_ns = caller_deadline_ns - steady_now_ns();
-          const int64_t rem_ms = (rem_ns > 0) ? (rem_ns + 999999) / 1000000 : 0;  // ceil
-          block_ms = static_cast<int>(
-            std::min<int64_t>(rem_ms, std::numeric_limits<int>::max()));
+          block_ns = (rem_ns > 0) ? rem_ns : 0;
         }
         if ((graph_gc_unwired || !unarmed.empty()) &&
-          (block_ms < 0 || block_ms > 200))
+          (block_ns < 0 || block_ns > 200000000))
         {
           // No doorbell wiring (registry full), or an entity epoll cannot
           // watch: never block unbounded, or its event is silently lost
           // forever. The early return is a spurious wake (OK, nothing ready)
           // that lets the next rmw_wait retry registration / re-drain.
-          block_ms = 200;
+          block_ns = 200000000;  // 200 ms
         }
       }
-      int n = epoll_wait(ws_data->epoll_fd, ready_events, 64, block_ms);
+      int n = epoll_wait_ns(ws_data->epoll_fd, ready_events, 64, block_ns);
       if (n < 0) {
         if (errno == EINTR) {
           continue;
@@ -540,7 +532,7 @@ rmw_ret_t rmw_wait(
       }
       // Only actual progress ends the wait: an entity the caller waits on now
       // holds data, or a guard condition fired. A wake alone is not enough. A
-      // doorbell ring carries no caller work, and a datagram that drain_socket
+      // doorbell ring carries no caller work, and a datagram that drain_endpoint
       // filters out (an ignored local publication, a replayed-duplicate
       // TRANSIENT_LOCAL sample, a foreign message type, an unresolvable shm
       // descriptor) leaves the queue empty. Ending the wait on those would
@@ -548,6 +540,7 @@ rmw_ret_t rmw_wait(
       // such message.
       bool progressed = false;
       bool rang = false;
+      bool delivered = false;
       for (int e = 0; e < n; ++e) {
         const int rfd = ready_events[e].data.fd;
         auto it = ws_data->armed.find(rfd);
@@ -570,10 +563,7 @@ rmw_ret_t rmw_wait(
         switch (entry.kind) {
           case rmw_uds::ARMED_SUBSCRIPTION: {
               auto * sub = static_cast<rmw_uds::UdsSubscription *>(entry.entity);
-              drain_socket(sub->socket_fd, sub->queue_mutex, sub->message_queue,
-                sub->queue_depth, 0, sub->shm_cache, sub->context->domain_id,
-                sub->ignore_local_publications, sub->context->context_id,
-                &sub->replayed_watermarks);
+              rmw_uds::drain_endpoint(rmw_uds::drain_target(sub));
               std::lock_guard<std::mutex> lock(sub->queue_mutex);
               if (!sub->message_queue.empty()) {
                 progressed = true;
@@ -582,8 +572,7 @@ rmw_ret_t rmw_wait(
             }
           case rmw_uds::ARMED_SERVICE: {
               auto * srv = static_cast<rmw_uds::UdsService *>(entry.entity);
-              drain_socket(srv->socket_fd, srv->queue_mutex, srv->request_queue, 100, 1,
-                srv->shm_cache, srv->context->domain_id);
+              rmw_uds::drain_endpoint(rmw_uds::drain_target(srv));
               std::lock_guard<std::mutex> lock(srv->queue_mutex);
               if (!srv->request_queue.empty()) {
                 progressed = true;
@@ -592,8 +581,7 @@ rmw_ret_t rmw_wait(
             }
           case rmw_uds::ARMED_CLIENT: {
               auto * cli = static_cast<rmw_uds::UdsClient *>(entry.entity);
-              drain_socket(cli->socket_fd, cli->queue_mutex, cli->response_queue, 100, 2,
-                cli->shm_cache, cli->context->domain_id);
+              rmw_uds::drain_endpoint(rmw_uds::drain_target(cli));
               std::lock_guard<std::mutex> lock(cli->queue_mutex);
               if (!cli->response_queue.empty()) {
                 progressed = true;
@@ -619,12 +607,30 @@ rmw_ret_t rmw_wait(
           case rmw_uds::ARMED_DOORBELL:
             rang = true;
             break;
+          case rmw_uds::ARMED_DELIVERY: {
+              // The listener enqueued for some endpoint in this context. Drain
+              // the counter so a level-triggered fd cannot spin this loop, and
+              // note that the caller's queues need re-checking.
+              uint64_t val;
+              while (read(rfd, &val, sizeof(val)) ==
+                static_cast<ssize_t>(sizeof(val)))
+              {
+              }
+              delivered = true;
+              break;
+            }
           default:
             break;
         }
       }
       if (rang) {
         run_generation_check();  // Drains the doorbell, triggers graph GCs.
+      }
+      if (delivered && !progressed) {
+        // The listener drains endpoints across the whole context, so the wake
+        // says nothing about whether THIS caller's entities gained work. Only
+        // a non-empty queue among them is progress.
+        progressed = caller_queue_has_work();
       }
       if (poll_only) {
         if (n == 64) {
