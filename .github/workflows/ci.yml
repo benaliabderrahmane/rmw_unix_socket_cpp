@@ -104,7 +104,9 @@ jobs:
 
   release-metadata:
     name: release metadata
-    runs-on: ubuntu-latest
+    # Pinned: Ubuntu's python3-catkin-pkg imports pkg_resources, which newer
+    # setuptools no longer ship, so a moving ubuntu-latest would break this job.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -114,6 +116,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends python3-catkin-pkg
           python3 - <<'PY'
+          import io
           import re
 
           from catkin_pkg.changelog import get_changelog_from_path
@@ -133,27 +136,31 @@ jobs:
           changelog = get_changelog_from_path(PKG)
           assert changelog is not None, f'no CHANGELOG.rst in {PKG}/'
           versions = [v for v, _, _ in changelog.foreach_version()]
+          assert versions, 'CHANGELOG.rst has no version heading catkin_pkg can parse'
           assert pkg.version == versions[-1], \
               f'package.xml {pkg.version} is not the newest changelog entry {versions[-1]}'
-          for version, date, content in changelog.foreach_version():
-              assert date, f'{version} has no parseable date'
+          for version, _, content in changelog.foreach_version():
               assert content, f'{version} body is empty'
 
-          # The parsed view above is not enough: REP-132 allows only paragraphs
-          # and lists under a version heading, and catkin_pkg drops sub-sections
-          # silently. A version with an intro paragraph plus sub-sections still
-          # parses non-empty while every bullet under them is lost, so check the
-          # raw rst structure too.
-          tree = publish_doctree(
-              changelog.rst,
-              settings_overrides={'report_level': 5, 'warning_stream': False})
+          # The parsed view above cannot see what catkin_pkg drops, and it drops
+          # silently: a heading that is not "X.Y.Z (date)" with everything under
+          # it, a version whose date does not parse, and anything under a version
+          # but paragraphs, lists and transitions (REP-132). So hold the raw rst
+          # to exactly what it keeps. Forthcoming gets the same check, since
+          # catkin_prepare_release turns it into the next version.
+          warnings = io.StringIO()
+          tree = publish_doctree(changelog.rst, settings_overrides={'warning_stream': warnings})
+          assert not warnings.getvalue(), f'docutils: {warnings.getvalue()}'
+          kept = (nodes.title, nodes.paragraph, nodes.bullet_list,
+                  nodes.enumerated_list, nodes.transition, nodes.comment)
           for section in tree.findall(nodes.section):
               title = section.next_node(nodes.title).astext()
-              if not re.match(r'^\d+\.\d+\.\d+ \(', title):
-                  continue
-              nested = [s.next_node(nodes.title).astext()
-                        for s in section.findall(nodes.section) if s is not section]
-              assert not nested, f'{title} has rst sub-sections {nested}, which are dropped'
+              if title != 'Forthcoming':
+                  version = re.match(r'^(\d+\.\d+\.\d+) \(', title)
+                  assert version, f'"{title}" is not a version heading: catkin_pkg drops it and its content'
+                  assert version.group(1) in versions, f'"{title}" does not parse, so catkin_pkg drops it'
+              dropped = [type(c).__name__ for c in section.children if not isinstance(c, kept)]
+              assert not dropped, f'"{title}" holds {dropped}, which catkin_pkg drops'
 
           # rst has no nested inline markup, so ``code`` inside **bold** emits
           # the backticks literally and docutils reports nothing.
