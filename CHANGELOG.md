@@ -137,6 +137,25 @@ four copies of the receive loop that hid the gap are one.
   words. `bench_registry_ring` (7400 used slots, 4 doorbells, cold cache):
   ~63 us to ~28 us per mutation, and with no doorbell registered ~40 us to
   ~4 us; the cost no longer grows with the number of slots.
+- **Large topic payloads are read straight from the publisher's shared-memory
+  ring** (#86), as Fast DDS data sharing does. A KEEP_LAST subscription queues
+  the payload's descriptor instead of copying the payload into a heap buffer,
+  and the take reads the ring record under its seqlock: in place from 512 KiB,
+  through one copy below that, as before. `bench_take_path` (five-topic
+  fan-in, thread CPU per message, median of 5, Zen 3, glibc 2.39):
+  512 KiB 63 -> 53 us, 1 MiB 227 -> 196 us, 2 MiB 728 -> 628 us,
+  4 MiB 1576 -> 1328 us, 8 MiB 3554 -> 2767 us; 64 to 256 KiB unchanged.
+  Read in place, 256 KiB swung from 12 % faster to 22 % slower with the heap's
+  address alignment (glibc's `rep movsb` is slow at some source/destination
+  offsets), which is why payloads under 512 KiB keep the copy.
+  **Behaviour change:** a KEEP_LAST depth-N subscription to large messages
+  (64 KiB and up) now keeps at most what the publisher's ring still holds (at
+  least four records of its largest payload); older queued messages are
+  reported through `message_lost` by the next drain or take, never delivered.
+  KEEP_ALL subscriptions, services and clients still copy large payloads out
+  when they arrive, so nothing changes for them. A take that finds a record
+  overwritten during an in-place read and nothing else to deliver returns
+  `taken = false` with its message partly written.
 
 ### Upgrade notes
 
