@@ -342,8 +342,11 @@ TEST_F(PubSubTest, KeepLastOverflowRecyclesDroppedPayload)
   ASSERT_NE(nullptr, sub);
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
 
-  // Ring and inline sizes mixed; under the 1 MiB ring floor in total, so none laps.
-  const size_t sizes[6] = {200 * 1024, 1024, 100 * 1024, 2048, 150 * 1024, 70 * 1024};
+  // Inline sizes only, all below the 64 KiB ring threshold: since #86 a KEEP_LAST
+  // subscription queues ring payloads as descriptors, which hold no buffer, so a
+  // ring message never reaches this recycle (AKeepLastOverflowReleasesItsPins
+  // covers ring entries dropped by the overflow).
+  const size_t sizes[6] = {1024, 2048, 8 * 1024, 16 * 1024, 32 * 1024, 48 * 1024};
   rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
   ASSERT_NE(nullptr, ws);
   for (uint32_t round = 0; round < 20; ++round) {
