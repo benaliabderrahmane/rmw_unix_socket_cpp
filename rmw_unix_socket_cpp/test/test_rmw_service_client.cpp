@@ -15,6 +15,7 @@
 #include "test_base.hpp"
 
 #include <cstring>
+#include <mutex>
 
 #include "test_msgs/srv/basic_types.hpp"
 
@@ -134,6 +135,60 @@ TEST_F(ServiceClientTest, RequestResponseRoundTrip)
   EXPECT_EQ(84, recv_response.int32_value);
   EXPECT_TRUE(recv_response.bool_value);
   EXPECT_EQ("success", recv_response.string_value);
+}
+
+// Issue #84: the service and the client hand each taken request or response
+// buffer back and the next drain receives into it, so alternating ring-sized
+// and inline calls run on exactly one buffer per endpoint, byte-exact each time.
+TEST_F(ServiceClientTest, TakesRecyclePayloadBuffers)
+{
+  srv = rmw_create_service(node, ts, "/recycle_srv", &qos);
+  cli = rmw_create_client(node, ts, "/recycle_srv", &qos);
+  ASSERT_NE(nullptr, srv);
+  ASSERT_NE(nullptr, cli);
+  auto * srv_data = static_cast<rmw_uds::UdsService *>(srv->data);
+  auto * cli_data = static_cast<rmw_uds::UdsClient *>(cli->data);
+
+  for (int32_t i = 0; i < 40; ++i) {
+    SCOPED_TRACE(i);
+    const size_t size = (i % 2 == 0) ? 300 * 1024 : 100;  // ring, then inline
+    test_msgs::srv::BasicTypes::Request request;
+    request.int32_value = i;
+    request.string_value.assign(size, static_cast<char>('A' + i % 26));
+    int64_t seq_id = 0;
+    ASSERT_EQ(RMW_RET_OK, rmw_send_request(cli, &request, &seq_id));
+
+    test_msgs::srv::BasicTypes::Request recv_request;
+    rmw_service_info_t request_header;
+    std::memset(&request_header, 0, sizeof(request_header));
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take_request(srv, &request_header, &recv_request, &taken));
+    ASSERT_TRUE(taken);
+    EXPECT_EQ(i, recv_request.int32_value);
+    EXPECT_EQ(request.string_value, recv_request.string_value);
+    {
+      std::lock_guard<std::mutex> lock(srv_data->queue_mutex);
+      EXPECT_EQ(1u, srv_data->spare_payloads.size());
+    }
+
+    test_msgs::srv::BasicTypes::Response response;
+    response.int32_value = -i;
+    response.string_value.assign(size, static_cast<char>('a' + i % 26));
+    ASSERT_EQ(RMW_RET_OK, rmw_send_response(srv, &request_header.request_id, &response));
+
+    test_msgs::srv::BasicTypes::Response recv_response;
+    rmw_service_info_t response_header;
+    std::memset(&response_header, 0, sizeof(response_header));
+    taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take_response(cli, &response_header, &recv_response, &taken));
+    ASSERT_TRUE(taken);
+    EXPECT_EQ(-i, recv_response.int32_value);
+    EXPECT_EQ(response.string_value, recv_response.string_value);
+    {
+      std::lock_guard<std::mutex> lock(cli_data->queue_mutex);
+      EXPECT_EQ(1u, cli_data->spare_payloads.size());
+    }
+  }
 }
 
 TEST_F(ServiceClientTest, LargeRequestAndResponseViaShm)
