@@ -347,6 +347,19 @@ static void write_slot_payload(RegistryEntrySlot * slot, const RegistryEntry & e
   slot->seq.fetch_add(1, std::memory_order_acq_rel);
 }
 
+// Mark or unmark slot i as a doorbell in the header bitmap ring_doorbells
+// walks. Relaxed: a set is sequenced before the adder's acq_rel generation
+// bump, and a clear before the remover's release of the slot, which order it.
+static void set_doorbell_bit(RegistryHeader * header, uint32_t i, bool on)
+{
+  const uint64_t bit = uint64_t{1} << (i % 64);
+  if (on) {
+    header->doorbell_bits[i / 64].fetch_or(bit, std::memory_order_relaxed);
+  } else {
+    header->doorbell_bits[i / 64].fetch_and(~bit, std::memory_order_relaxed);
+  }
+}
+
 // One pass: try to claim an empty slot and store the entry. Returns slot
 // index on success, -1 if no empty slot was found.
 static int32_t try_add_once(RegistryHeader * header, const RegistryEntry & entry)
@@ -367,6 +380,11 @@ static int32_t try_add_once(RegistryHeader * header, const RegistryEntry & entry
       // Payload is committed (seq even). Publish the real type with release
       // ordering so any reader that now sees it also sees the payload.
       slots[i].state.store(static_cast<uint8_t>(entry.type), std::memory_order_release);
+      // Before the generation bump, for the same reason as high_water below:
+      // a mutator that sees this bump must also see the doorbell to ring it.
+      if (entry.type == ENTRY_DOORBELL) {
+        set_doorbell_bit(header, i, true);
+      }
       // Widen the high-water bound to max(current, i+1) BEFORE bumping the
       // generation. Readers gate their re-query on a generation acquire-load and
       // then read high_water; if this store were sequenced AFTER the release
@@ -462,6 +480,9 @@ void registry_remove(RegistryHeader * header, int32_t index)
   }
   char path[sizeof(RegistryEntrySlot::socket_path)];
   teardown_slot(slot, path);
+  if (st == ENTRY_DOORBELL) {
+    set_doorbell_bit(header, static_cast<uint32_t>(index), false);  // before a re-add can set it
+  }
   slot->state.store(static_cast<uint8_t>(ENTRY_EMPTY), std::memory_order_release);
   header->generation.fetch_add(1, std::memory_order_acq_rel);
   unlink_torn_down_path(path);
@@ -506,8 +527,9 @@ static const char * entry_type_name(uint8_t t)
 // generation, every mutation either lands in the pre-block generation read or
 // leaves a queued datagram on a level-triggered fd — no lost wakeup. EAGAIN
 // means the peer already has a wakeup queued; other send errors mean a dead
-// peer whose slot will be reclaimed. Scans slots directly (not registry_query,
-// which calls back into cleanup and would recurse).
+// peer whose slot will be reclaimed. Walks the doorbell_bits bitmap, not the
+// slots (nor registry_query, which calls back into cleanup and would recurse):
+// a few contiguous words instead of one strided cache miss per used slot.
 static void ring_doorbells(RegistryHeader * header)
 {
   // One ring socket per mutating thread, closed at thread exit. AF_UNIX
@@ -531,14 +553,16 @@ static void ring_doorbells(RegistryHeader * header)
   auto * slots = registry_slots(header);
   const uint32_t hi = header->high_water_slot.load(std::memory_order_acquire);
   for (uint32_t i = 0; i < hi; ++i) {
-    if (slots[i].state.load(std::memory_order_acquire) !=
-      static_cast<uint8_t>(ENTRY_DOORBELL))
-    {
+    const uint64_t rest =
+      header->doorbell_bits[i / 64].load(std::memory_order_acquire) >> (i % 64);
+    if (rest == 0) {
+      i |= 63;  // no doorbell left in this word
       continue;
     }
+    i += static_cast<uint32_t>(__builtin_ctzll(rest));  // the next doorbell
     // Seqlock snapshot of the socket path, re-validating the type INSIDE the
     // seq window: without it, a remove + re-claim of this slot by a data
-    // endpoint between the fast-skip above and the copy could land the wake
+    // endpoint between the bitmap read above and the copy could land the wake
     // octet on a real data socket. A rewrite after this re-check still bumps
     // seq, so the s1 comparison below rejects the torn copy.
     char path[sizeof(slots[i].socket_path)];
@@ -632,6 +656,9 @@ void registry_cleanup_stale(RegistryHeader * header)
 
     char path[sizeof(RegistryEntrySlot::socket_path)];
     teardown_slot(&slots[i], path);
+    if (expected == static_cast<uint8_t>(ENTRY_DOORBELL)) {
+      set_doorbell_bit(header, i, false);  // before a re-add can set it
+    }
     slots[i].state.store(static_cast<uint8_t>(ENTRY_EMPTY), std::memory_order_release);
     header->generation.fetch_add(1, std::memory_order_acq_rel);
     unlink_torn_down_path(path);

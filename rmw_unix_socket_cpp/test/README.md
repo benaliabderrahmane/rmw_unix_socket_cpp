@@ -29,6 +29,8 @@ Tests the POSIX shared memory discovery registry (`/dev/shm/ros2_uds_<domain_id>
 | `QueryReturnsNamesOfEveryLength` | Names of every length from 0 to 255 round-trip through add and query in all five string fields | A snapshot copies each name only up to the word holding its terminator. A terminator in a field's unaligned head, on a word boundary, in its tail or in its last byte must not truncate or extend the name. |
 | `QueryFiltersByType` | Adding a PUBLISHER and SUBSCRIPTION on the same topic, then querying by type returns only the requested type | Prevents `rmw_count_publishers` from accidentally counting subscribers, or `rmw_publish` from sending to other publishers instead of subscribers. |
 | `MultipleEntriesSameType` | Add 50 node entries, query returns all 50 | Validates the registry scales beyond trivial counts. Catches off-by-one errors in slot scanning and ensures the linear search over 8192 slots works. |
+| `DoorbellBitTracksDoorbellSlots` | The header's `doorbell_bits` bitmap marks a doorbell slot on add and unmarks it on remove and on stale reclaim, and never marks a node slot | `ring_doorbells` finds doorbells through this bitmap (#53). A missing bit is a lost wakeup for a blocked graph waiter; a bit left set after a reclaim is harmless only because of the type re-check the next test pins. |
+| `MutationRingsOnlyDoorbellSlots` | A mutation rings doorbells in the first and in a later bitmap word exactly once each, and a stale bit over a subscription slot sends nothing to its socket | Pins both halves of the bitmap walk: every word below `high_water_slot` is visited, and a bit is a hint that the seqlock type check filters, so a wake octet never lands on a data socket. |
 
 ### test_serialization.cpp
 

@@ -251,6 +251,12 @@ if(BUILD_TESTING)
   target_link_libraries(bench_serialize_into_ring
     ${_unit_test_deps} ${_test_msg_deps})
   target_include_directories(bench_serialize_into_ring PRIVATE src)
+
+  # Benchmark (standalone): cost of one registry mutation on a populated
+  # registry, ring_doorbells included (issue #53).
+  add_executable(bench_registry_ring test/perf/bench_registry_ring.cpp src/registry.cpp)
+  target_link_libraries(bench_registry_ring ${_unit_test_deps})
+  target_include_directories(bench_registry_ring PRIVATE src)
 endif()
 
 ament_package()
