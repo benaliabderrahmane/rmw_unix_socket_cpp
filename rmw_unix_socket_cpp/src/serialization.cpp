@@ -138,6 +138,8 @@ bool serialize(
     // overflow); buffer.resize() can throw std::bad_alloc. Callers are
     // extern "C", so nothing may escape across the C ABI.
     return false;
+  } catch (...) {
+    return false;
   }
   return true;
 }
@@ -207,6 +209,8 @@ bool deserialize(
     // cdr_deserialize() resizes message strings/sequences from attacker-controlled
     // wire lengths and can throw std::bad_alloc/std::length_error. Callers are
     // extern "C", so nothing may escape across the C ABI.
+    return false;
+  } catch (...) {
     return false;
   }
   return true;

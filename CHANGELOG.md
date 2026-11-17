@@ -101,6 +101,25 @@ four copies of the receive loop that hid the gap are one.
   with ten replayed samples handed the executor twenty events. It now flushes
   only when a callback takes over from none.
 
+### Performance
+
+- **Large topic payloads are deserialized straight from the publisher's
+  shared-memory ring** (#86), as Fast DDS data sharing does. A subscription
+  queues the payload's descriptor instead of copying the payload into a heap
+  buffer, and the take reads the ring record in place under its seqlock. That
+  copy was 14-22 % of the receive CPU per large message. `bench_take_path`
+  (five-topic fan-in, thread CPU per message, median of 5): 1 MiB 198 -> 163 us,
+  2 MiB 725 -> 666 us, 4 MiB 1687 -> 1447 us, 8 MiB 3538 -> 2766 us. 256 KiB
+  measured 36 -> 45 us: glibc's `rep movsb` copy from the ring into the
+  benchmark's message is slow at that address alignment on the test CPU (Zen
+  3); with `rep movsb` disabled it is 39 -> 32 us.
+  **Behaviour change:** a KEEP_LAST depth-N subscription to large messages
+  (64 KiB and up) now keeps at most what the publisher's ring still holds (at
+  least four records of its largest payload); older queued messages are
+  reported through `message_lost` when they are taken, never delivered.
+  Services and clients still copy large requests and responses out when they
+  arrive.
+
 ## [0.5.0] - 2026-08-27
 
 The wait/wakeup release. The 200 ms `rmw_wait` poll is gone, replaced by an

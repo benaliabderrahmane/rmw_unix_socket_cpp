@@ -170,6 +170,16 @@ struct ShmReaderCache
     // Segment path, built once when mapped; reused by the liveness-probe sweep
     // so a hit never rebuilds it.
     std::string shm_name;
+    // Queued messages that read their payload from this mapping at take time
+    // (shm_pin_payload). A pinned mapping is never unmapped: a sweep that would
+    // drop it marks it superseded instead, and the last unpin unmaps it.
+    uint32_t pins = 0;
+    // The publisher no longer writes here (it moved to a newer generation, or
+    // its name is gone), so the records left in it can no longer be lapped.
+    bool superseded = false;
+    // Newest record seq pinned from this mapping: how far the publisher is
+    // known to be ahead of a queued record (the take's lap heuristic).
+    uint32_t newest_seq = 0;
   };
   std::mutex mutex;
   std::unordered_map<Key, Mapping, KeyHash> mappings;
@@ -258,6 +268,40 @@ bool shm_fetch_payload(
   ShmReaderCache & cache,
   size_t domain_id,
   std::vector<uint8_t> & payload_io);
+
+// Topic payloads are read straight from the publisher's ring at take time
+// (#86), Fast DDS data-sharing style, instead of being copied out when drained.
+//
+// The drain validates the descriptor (segment mapped, record in bounds and
+// still carrying desc.seq), pins the mapping and queues the descriptor. Returns
+// false, like shm_fetch_payload, when the message is already gone.
+bool shm_pin_payload(
+  ShmReaderCache & cache,
+  size_t domain_id,
+  const std::vector<uint8_t> & descriptor_bytes,
+  ShmPayloadDescriptor & desc_out);
+
+enum class ShmRead
+{
+  ok,      // `read` succeeded on bytes the publisher had not touched
+  lost,    // the publisher overwrote the record: the message is lost
+  failed,  // `read` failed on intact bytes (a genuinely bad payload)
+};
+
+// The take: hands the record's payload to `read` and unpins the mapping. The
+// seqlock is checked before and after, so a lap during `read` is reported as
+// lost and whatever `read` produced must be discarded. Reads in place, holding
+// cache.mutex so the mapping stays put; when the publisher is known to be close
+// to lapping the record, copies it into `scratch` first, checks the seqlock and
+// reads the copy instead.
+ShmRead shm_read_pinned(
+  ShmReaderCache & cache,
+  const ShmPayloadDescriptor & desc,
+  std::vector<uint8_t> & scratch,
+  const std::function<bool(const uint8_t *, size_t)> & read);
+
+// Drop a pin without reading (a queued message dropped on overflow).
+void shm_unpin(ShmReaderCache & cache, const ShmPayloadDescriptor & desc);
 
 // ---------------------------------------------------------------------------
 // TRANSIENT_LOCAL latched cache: a per-publisher shm segment holding the last

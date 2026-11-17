@@ -221,7 +221,15 @@ size_t drain_endpoint(const DrainTarget & t)
         // never maps a segment.
         continue;
       }
-      if (!shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload)) {
+      // A subscription queues a large payload's descriptor and its take reads
+      // the ring record in place (#86). Services and clients have no
+      // message_lost to report a lapped record to, so they copy it out now.
+      ReceivedMessage msg;
+      const bool in_ring = t.lost_sub && (hdr.msg_type & SHM_PAYLOAD_FLAG);
+      if (in_ring ?
+        !shm_pin_payload(*t.shm_cache, t.domain_id, payload, msg.shm_desc) :
+        !shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload))
+      {
         // shm descriptor unresolvable (sender gone / ring lapped): the
         // datagram arrived but the message is gone, so it counts as lost -
         // once, and only as a publish the gap check had not already passed.
@@ -229,9 +237,12 @@ size_t drain_endpoint(const DrainTarget & t)
         continue;
       }
 
-      ReceivedMessage msg;
       msg.header = hdr;
-      msg.payload = std::move(payload);
+      if (in_ring) {
+        msg.header.payload_size = msg.shm_desc.payload_size;
+      } else {
+        msg.payload = std::move(payload);
+      }
       msg.received_timestamp_ns = received_now_ns();
 
       bool overflow = false;
@@ -242,12 +253,17 @@ size_t drain_endpoint(const DrainTarget & t)
         // because the take() side isn't keeping up. This is the rcl-layer
         // equivalent of "slow subscriber".
         while (t.queue->size() > t.max_depth) {
+          if (t.lost_sub && (t.queue->front().header.msg_type & SHM_PAYLOAD_FLAG)) {
+            shm_unpin(*t.shm_cache, t.queue->front().shm_desc);
+          }
           recycle_payload(*t.spares, t.queue->front().payload);
           t.queue->pop_front();
           ++dropped;
           overflow = true;
         }
-        take_spare();  // for the next datagram
+        if (payload.capacity() == 0) {
+          take_spare();  // for the next datagram (a pinned one left it in place)
+        }
       }
 
       if (overflow) {
