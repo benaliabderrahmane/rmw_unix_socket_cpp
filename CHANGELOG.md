@@ -162,7 +162,11 @@ four copies of the receive loop that hid the gap are one.
 - **Registry layout v5.** The header gains the doorbell bitmap, so its size
   changes: each build replaces a registry created by the other, and the
   two builds then see separate registries and do not discover each other.
-  Upgrade every process on a host together.
+  Upgrade every process on a host together, and before the first start stop
+  every process that uses the RMW and remove `/dev/shm/ros2_uds_*` (a reboot
+  does this): processes that start at the same moment and find the old
+  registry can race while replacing it, and one of them can then fail in
+  `rmw_init` ("failed to open shared memory registry") or miss the others.
 
 ## [0.5.0] - 2026-08-27
 
