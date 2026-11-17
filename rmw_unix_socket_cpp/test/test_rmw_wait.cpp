@@ -14,8 +14,12 @@
 
 #include "test_base.hpp"
 
+#include <dlfcn.h>
+#include <sys/epoll.h>
+
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -978,25 +982,28 @@ TEST_F(RmwUdsNodeTest, WaitReadsOnlyGuardConditionsEpollReportsReady)
   rmw_time_t zero{0, 0};
   EXPECT_EQ(RMW_RET_TIMEOUT, wait(&zero));  // arms every eventfd
 
+  // Only the read count needs task io accounting; the trigger checks below run
+  // without it.
   if (thread_read_syscalls() < 0) {
-    GTEST_SKIP() << "/proc/thread-self/io unavailable";
+    std::printf("[  INFO    ] /proc/thread-self/io unavailable: read count not checked\n");
+  } else {
+    constexpr int kWaits = 200;
+    const long before = thread_read_syscalls();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int w = 0; w < kWaits; ++w) {
+      ASSERT_EQ(RMW_RET_TIMEOUT, wait(&zero));
+    }
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+    // Includes the few read()s of the /proc probes themselves.
+    const double reads_per_wait =
+      static_cast<double>(thread_read_syscalls() - before) / kWaits;
+    std::printf(
+      "[  INFO    ] %zu idle guard conditions: %.2f read()/wait, %.2f us/wait\n",
+      kGcs, reads_per_wait, ns / 1000.0 / kWaits);
+    // The delivery_fd drain is one read per wait; the guard conditions add none.
+    EXPECT_LT(reads_per_wait, 1.5) << "rmw_wait polls idle guard-condition eventfds";
   }
-  constexpr int kWaits = 200;
-  const long before = thread_read_syscalls();
-  const auto t0 = std::chrono::steady_clock::now();
-  for (int w = 0; w < kWaits; ++w) {
-    ASSERT_EQ(RMW_RET_TIMEOUT, wait(&zero));
-  }
-  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-    std::chrono::steady_clock::now() - t0).count();
-  // Includes the few read()s of the /proc probes themselves.
-  const double reads_per_wait =
-    static_cast<double>(thread_read_syscalls() - before) / kWaits;
-  std::printf(
-    "[  INFO    ] %zu idle guard conditions: %.2f read()/wait, %.2f us/wait\n",
-    kGcs, reads_per_wait, ns / 1000.0 / kWaits);
-  // The delivery_fd drain is one read per wait; the guard conditions add none.
-  EXPECT_LT(reads_per_wait, 1.5) << "rmw_wait polls idle guard-condition eventfds";
 
   // Triggered before the wait: both reported in this wait, and consumed.
   ASSERT_EQ(RMW_RET_OK, rmw_trigger_guard_condition(gcs[3]));
@@ -1025,4 +1032,140 @@ TEST_F(RmwUdsNodeTest, WaitReadsOnlyGuardConditionsEpollReportsReady)
   for (auto * gc : gcs) {
     EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(gc));
   }
+}
+
+// Waits on gcs[0..count) with `timeout` and returns how many were reported.
+static size_t wait_on_gcs(
+  rmw_wait_set_t * ws, const std::vector<rmw_guard_condition_t *> & gcs, size_t count,
+  rmw_time_t timeout, rmw_ret_t * ret)
+{
+  std::vector<void *> array(count);
+  for (size_t i = 0; i < count; ++i) {
+    array[i] = gcs[i]->data;
+  }
+  rmw_guard_conditions_t set;
+  set.guard_conditions = array.data();
+  set.guard_condition_count = count;
+  *ret = rmw_wait(nullptr, &set, nullptr, nullptr, nullptr, ws, &timeout);
+  return static_cast<size_t>(
+    std::count_if(array.begin(), array.end(), [](void * p) {return p != nullptr;}));
+}
+
+// A guard condition triggered before a zero-timeout wait must be reported even
+// when a full epoll batch of stale fds comes back first: fds this wait set
+// armed for an earlier call, no longer in the caller's arrays, still readable.
+// Those are withdrawn, not progress, and must not end the wait at its
+// (already passed) deadline before the caller's own fd is reached.
+TEST_F(RmwUdsNodeTest, PreTriggeredGcSeenPastFullBatchOfStaleFds)
+{
+  constexpr size_t kStale = 70;  // more than one 64-event epoll batch
+  std::vector<rmw_guard_condition_t *> gcs;
+  for (size_t i = 0; i < kStale + 1; ++i) {
+    gcs.push_back(rmw_create_guard_condition(&context));
+    ASSERT_NE(nullptr, gcs.back());
+  }
+  auto * ws = rmw_create_wait_set(&context, kStale + 1);
+  ASSERT_NE(nullptr, ws);
+
+  rmw_ret_t ret;
+  EXPECT_EQ(0u, wait_on_gcs(ws, gcs, kStale, rmw_time_t{0, 0}, &ret));  // arms all 70
+  EXPECT_EQ(RMW_RET_TIMEOUT, ret);
+  for (size_t i = 0; i < kStale; ++i) {
+    ASSERT_EQ(RMW_RET_OK, rmw_trigger_guard_condition(gcs[i]));
+  }
+  std::vector<rmw_guard_condition_t *> only_g{gcs[kStale]};
+  ASSERT_EQ(RMW_RET_OK, rmw_trigger_guard_condition(only_g[0]));
+
+  EXPECT_EQ(1u, wait_on_gcs(ws, only_g, 1, rmw_time_t{0, 0}, &ret));
+  EXPECT_EQ(RMW_RET_OK, ret) << "a pre-triggered guard condition was missed";
+  EXPECT_EQ(0u, wait_on_gcs(ws, only_g, 1, rmw_time_t{0, 0}, &ret));
+  EXPECT_EQ(RMW_RET_TIMEOUT, ret) << "a trigger was reported twice";
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  for (auto * gc : gcs) {
+    EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(gc));
+  }
+}
+
+// More triggered guard conditions than one epoll batch holds: one blocking
+// wait reports them all, each exactly once.
+TEST_F(RmwUdsNodeTest, HundredTriggeredGcsInOneWait)
+{
+  constexpr size_t kGcs = 100;
+  std::vector<rmw_guard_condition_t *> gcs;
+  for (size_t i = 0; i < kGcs; ++i) {
+    gcs.push_back(rmw_create_guard_condition(&context));
+    ASSERT_NE(nullptr, gcs.back());
+  }
+  auto * ws = rmw_create_wait_set(&context, kGcs);
+  ASSERT_NE(nullptr, ws);
+
+  rmw_ret_t ret;
+  EXPECT_EQ(0u, wait_on_gcs(ws, gcs, kGcs, rmw_time_t{0, 0}, &ret));  // arms all
+  EXPECT_EQ(RMW_RET_TIMEOUT, ret);
+  for (auto * gc : gcs) {
+    ASSERT_EQ(RMW_RET_OK, rmw_trigger_guard_condition(gc));
+  }
+  EXPECT_EQ(kGcs, wait_on_gcs(ws, gcs, kGcs, rmw_time_t{1, 0}, &ret));
+  EXPECT_EQ(RMW_RET_OK, ret);
+  EXPECT_EQ(0u, wait_on_gcs(ws, gcs, kGcs, rmw_time_t{0, 0}, &ret));
+  EXPECT_EQ(RMW_RET_TIMEOUT, ret) << "a trigger was reported twice";
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  for (auto * gc : gcs) {
+    EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(gc));
+  }
+}
+
+// epoll_ctl interposer: fails EPOLL_CTL_ADD with ENOSPC for one fd, as watch
+// exhaustion (fs.epoll.max_user_watches) would. The test executable's
+// definition wins over libc's for the rmw library too.
+static std::atomic<int> g_unwatchable_fd{-1};
+extern "C" int epoll_ctl(int epfd, int op, int fd, struct epoll_event * event)
+{
+  using epoll_ctl_fn = int (*)(int, int, int, struct epoll_event *);
+  static const auto real = reinterpret_cast<epoll_ctl_fn>(dlsym(RTLD_NEXT, "epoll_ctl"));
+  if (op == EPOLL_CTL_ADD && fd >= 0 && fd == g_unwatchable_fd.load()) {
+    errno = ENOSPC;
+    return -1;
+  }
+  return real(epfd, op, fd, event);
+}
+
+// A guard condition epoll cannot watch degrades to polling: read directly
+// before the block and in the output pass, with the block capped at 200 ms.
+TEST_F(RmwUdsNodeTest, UnwatchableGcDegradesToPolling)
+{
+  std::vector<rmw_guard_condition_t *> gcs{rmw_create_guard_condition(&context)};
+  ASSERT_NE(nullptr, gcs[0]);
+  auto * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  g_unwatchable_fd = static_cast<rmw_uds::UdsGuardCondition *>(gcs[0]->data)->eventfd_fd;
+
+  rmw_ret_t ret;
+  EXPECT_EQ(0u, wait_on_gcs(ws, gcs, 1, rmw_time_t{0, 0}, &ret));
+  EXPECT_EQ(RMW_RET_TIMEOUT, ret);
+
+  // Triggered before the wait: seen by the direct read, and consumed.
+  ASSERT_EQ(RMW_RET_OK, rmw_trigger_guard_condition(gcs[0]));
+  EXPECT_EQ(1u, wait_on_gcs(ws, gcs, 1, rmw_time_t{0, 0}, &ret));
+  EXPECT_EQ(RMW_RET_OK, ret);
+  EXPECT_EQ(0u, wait_on_gcs(ws, gcs, 1, rmw_time_t{0, 0}, &ret));
+  EXPECT_EQ(RMW_RET_TIMEOUT, ret) << "a trigger was reported twice";
+
+  // Triggered during a blocking wait: the bounded block ends by 200 ms and
+  // the output pass reads it, well before the 5 s deadline.
+  std::thread trigger([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      auto _r [[maybe_unused]] = rmw_trigger_guard_condition(gcs[0]);
+    });
+  const auto t0 = std::chrono::steady_clock::now();
+  EXPECT_EQ(1u, wait_on_gcs(ws, gcs, 1, rmw_time_t{5, 0}, &ret));
+  EXPECT_EQ(RMW_RET_OK, ret);
+  EXPECT_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(2));
+  trigger.join();
+
+  g_unwatchable_fd = -1;  // before the fd number can be reused
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(gcs[0]));
 }

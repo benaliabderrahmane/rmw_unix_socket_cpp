@@ -84,6 +84,10 @@ four copies of the receive loop that hid the gap are one.
   rclcpp executor passes. epoll already watches those eventfds, so a pending
   trigger is now reported and consumed through it; only a guard condition epoll
   could not watch is still read directly.
+  A full batch of 64 ready fds is now followed by a non-blocking sweep in
+  blocking waits too, not only when work was already queued, so stale fds a
+  wait set armed earlier cannot hide a ready guard condition or socket from a
+  zero-timeout wait, and more than 64 ready fds are reported in one wait.
 
 ### Fixed
 

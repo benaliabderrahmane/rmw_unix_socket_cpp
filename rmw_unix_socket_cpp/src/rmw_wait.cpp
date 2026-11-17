@@ -602,9 +602,15 @@ rmw_ret_t rmw_wait(
   const bool poll_only = something_ready;
   {
     struct epoll_event ready_events[64];
+    // A full batch means more fds may be ready than one epoll_wait reports: a
+    // sweep pass follows, non-blocking, in every mode. Otherwise a batch of
+    // stale fds could hide a ready guard condition or socket behind the
+    // deadline check, and a wait would report only the first 64 ready fds.
+    bool sweep = false;
+    bool progressed_any = false;
     while (true) {
       int64_t block_ns = 0;
-      if (!poll_only) {
+      if (!poll_only && !sweep) {
         block_ns = -1;
         if (!infinite) {
           const int64_t rem_ns = caller_deadline_ns - steady_now_ns();
@@ -628,7 +634,7 @@ rmw_ret_t rmw_wait(
         RMW_SET_ERROR_MSG("epoll_wait failed");
         return RMW_RET_ERROR;
       }
-      if (n == 0) {
+      if (n == 0 && !sweep) {
         break;  // Caller's deadline passed, or the poll-only pass found nothing.
       }
       // Only actual progress ends the wait: an entity the caller waits on now
@@ -743,14 +749,16 @@ rmw_ret_t rmw_wait(
         // match.
         progressed = caller_event_ready();
       }
+      progressed_any = progressed_any || progressed;
+      if (n == 64) {
+        sweep = true;
+        continue;  // Terminates because drained fds stop being ready.
+      }
+      sweep = false;
       if (poll_only) {
-        if (n == 64) {
-          continue;  // A full batch: more fds may be ready than one epoll_wait
-                     // reports. Terminates because drained fds stop being ready.
-        }
         break;  // Non-blocking sweep: a single pass is all it is for.
       }
-      if (progressed) {
+      if (progressed_any) {
         break;  // Something the caller waits on became ready.
       }
       if (!infinite && steady_now_ns() >= caller_deadline_ns) {
