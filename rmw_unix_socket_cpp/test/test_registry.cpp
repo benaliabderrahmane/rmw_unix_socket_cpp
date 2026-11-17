@@ -510,6 +510,34 @@ TEST_F(RegistryTest, DoorbellBitTracksDoorbellSlots)
   }
 }
 
+// A bound, non-blocking datagram socket standing in for a doorbell or a data
+// endpoint; the caller closes socks and unlinks paths.
+static std::string bind_test_socket(
+  const char * tag, std::vector<int> & socks, std::vector<std::string> & paths)
+{
+  const std::string path = "/tmp/test_registry_" + std::to_string(getpid()) + "_" + tag;
+  unlink(path.c_str());
+  const int s = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path.c_str());
+  EXPECT_EQ(0, bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
+  socks.push_back(s);
+  paths.push_back(path);
+  return path;
+}
+
+// Drains s and returns how many wake octets were queued on it.
+static int pending(int s)
+{
+  int n = 0;
+  uint8_t b;
+  while (recv(s, &b, 1, MSG_DONTWAIT) == 1) {
+    ++n;
+  }
+  return n;
+}
+
 // A mutation rings every doorbell the bitmap names, in any word, and nothing
 // else: a stale bit over a slot that is not a doorbell (here forced by hand)
 // must not send the wake octet to that slot's data socket.
@@ -518,26 +546,7 @@ TEST_F(RegistryTest, MutationRingsOnlyDoorbellSlots)
   auto * header = rmw_uds::registry_header(registry_ptr);
   std::vector<int> socks;
   std::vector<std::string> paths;
-  auto bind_socket = [&](const char * tag) {
-      const std::string path = "/tmp/test_registry_" + std::to_string(getpid()) + "_" + tag;
-      unlink(path.c_str());
-      const int s = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-      sockaddr_un addr{};
-      addr.sun_family = AF_UNIX;
-      std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path.c_str());
-      EXPECT_EQ(0, bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
-      socks.push_back(s);
-      paths.push_back(path);
-      return path;
-    };
-  auto pending = [](int s) {
-      int n = 0;
-      uint8_t b;
-      while (recv(s, &b, 1, MSG_DONTWAIT) == 1) {
-        ++n;
-      }
-      return n;
-    };
+  auto bind_socket = [&](const char * tag) {return bind_test_socket(tag, socks, paths);};
   rmw_uds::RegistryEntry e;
   std::memset(&e, 0, sizeof(e));
   e.pid = getpid();
@@ -580,4 +589,93 @@ TEST_F(RegistryTest, MutationRingsOnlyDoorbellSlots)
     close(socks[i]);
     unlink(paths[i].c_str());
   }
+}
+
+// The bitmap walk's word boundary: a doorbell in the last bit of word 0 (slot
+// 63) and one in the first bit of word 1 (slot 64) are each rung exactly once.
+// An off-by-one in the skip-to-next-word step loses or doubles one of them.
+TEST_F(RegistryTest, MutationRingsDoorbellsAtWordBoundary)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  std::vector<int> socks;
+  std::vector<std::string> paths;
+  rmw_uds::RegistryEntry e;
+  std::memset(&e, 0, sizeof(e));
+  e.pid = getpid();
+  e.type = rmw_uds::ENTRY_NODE;
+  std::vector<int32_t> fill;
+  for (int i = 0; i < 63; ++i) {
+    fill.push_back(rmw_uds::registry_add(header, e));
+  }
+  e.type = rmw_uds::ENTRY_DOORBELL;
+  std::strncpy(e.socket_path, bind_test_socket("b63", socks, paths).c_str(),
+    sizeof(e.socket_path) - 1);
+  const int32_t b63 = rmw_uds::registry_add(header, e);
+  std::strncpy(e.socket_path, bind_test_socket("b64", socks, paths).c_str(),
+    sizeof(e.socket_path) - 1);
+  const int32_t b64 = rmw_uds::registry_add(header, e);
+  ASSERT_EQ(63, b63);
+  ASSERT_EQ(64, b64);
+
+  e.type = rmw_uds::ENTRY_NODE;
+  e.socket_path[0] = '\0';
+  const int32_t node = rmw_uds::registry_add(header, e);  // slot 65: one ring
+  ASSERT_EQ(65, node);
+  EXPECT_EQ(1, pending(socks[0])) << "doorbell in slot 63 not rung exactly once";
+  EXPECT_EQ(1, pending(socks[1])) << "doorbell in slot 64 not rung exactly once";
+  rmw_uds::registry_remove(header, node);
+  EXPECT_EQ(1, pending(socks[0]));
+  EXPECT_EQ(1, pending(socks[1]));
+
+  for (int32_t idx : {b63, b64}) {
+    rmw_uds::registry_remove(header, idx);
+  }
+  for (int32_t idx : fill) {
+    rmw_uds::registry_remove(header, idx);
+  }
+  for (size_t i = 0; i < socks.size(); ++i) {
+    close(socks[i]);
+    unlink(paths[i].c_str());
+  }
+}
+
+// The header is shared memory any local process can write (0666). A corrupt
+// high_water_slot or max_entries must not walk the slot array or doorbell_bits
+// past their REGISTRY_MAX_ENTRIES entries: add, ring, query and cleanup clamp.
+// Without the clamp, ring_doorbells reads far past the mapping and crashes.
+TEST_F(RegistryTest, CorruptHeaderBoundsStayInsideTheRegistry)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  std::vector<int> socks;
+  std::vector<std::string> paths;
+  rmw_uds::RegistryEntry e;
+  std::memset(&e, 0, sizeof(e));
+  e.pid = getpid();
+  e.type = rmw_uds::ENTRY_DOORBELL;
+  std::strncpy(e.socket_path, bind_test_socket("corrupt", socks, paths).c_str(),
+    sizeof(e.socket_path) - 1);
+  const int32_t bell = rmw_uds::registry_add(header, e);
+  ASSERT_GE(bell, 0);
+
+  const uint32_t original_max = header->max_entries;
+  const uint32_t original_hw = header->high_water_slot.load();
+  header->max_entries = UINT32_MAX;
+  header->high_water_slot.store(UINT32_MAX);
+
+  e.type = rmw_uds::ENTRY_NODE;
+  e.socket_path[0] = '\0';
+  std::strncpy(e.node_name, "corrupt_bounds", sizeof(e.node_name) - 1);
+  const int32_t node = rmw_uds::registry_add(header, e);
+  ASSERT_GE(node, 0);
+  EXPECT_EQ(1, pending(socks[0])) << "the doorbell was not rung";
+  EXPECT_EQ(1u, rmw_uds::registry_query(
+      header, rmw_uds::ENTRY_NODE, nullptr, "corrupt_bounds", nullptr).size());
+  rmw_uds::registry_cleanup_stale(header);
+
+  header->max_entries = original_max;
+  header->high_water_slot.store(original_hw);
+  rmw_uds::registry_remove(header, node);
+  rmw_uds::registry_remove(header, bell);
+  close(socks[0]);
+  unlink(paths[0].c_str());
 }

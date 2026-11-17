@@ -20,8 +20,13 @@
 // repeats back to back; "cold" first walks 64 MiB so the slot array is out of
 // cache, as it is between mutations during a fleet launch.
 //
+// It DELETES and recreates the registry of <domain> (/dev/shm/ros2_uds_<domain>)
+// when it starts and deletes it again when it exits: never point it at a domain
+// in use. The default, 231, is a domain no test in the suite uses.
+//
 // Build with the test suite, run manually:
 //   ./build/rmw_unix_socket_cpp/bench_registry_ring [slots=7400] [doorbells=4] [iters=2000]
+//     [domain=231]
 
 #include <algorithm>
 #include <chrono>
@@ -77,9 +82,10 @@ int main(int argc, char ** argv)
   const int slots = argc > 1 ? std::atoi(argv[1]) : 7400;
   const int doorbells = argc > 2 ? std::atoi(argv[2]) : 4;
   const int iters = argc > 3 ? std::atoi(argv[3]) : 2000;
-  const size_t domain = 197;
+  const size_t domain = argc > 4 ? std::strtoul(argv[4], nullptr, 10) : 231;
+  const std::string shm_name = "/ros2_uds_" + std::to_string(domain);
 
-  shm_unlink("/ros2_uds_197");
+  shm_unlink(shm_name.c_str());
   void * ptr = nullptr;
   size_t size = 0;
   const int fd = rmw_uds::registry_open(domain, &ptr, &size);
@@ -159,6 +165,6 @@ int main(int argc, char ** argv)
     unlink(bell_paths[d].c_str());
   }
   rmw_uds::registry_close(fd, ptr, size);
-  shm_unlink("/ros2_uds_197");
+  shm_unlink(shm_name.c_str());
   return received == expected ? 0 : 2;
 }

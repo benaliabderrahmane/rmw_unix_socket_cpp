@@ -239,7 +239,7 @@ The shm object is **not** unlinked on a clean context shutdown. `rmw_context_fin
 
 Because multiple processes may start at the same instant, the creation and initialization handshake is what makes concurrent startup safe; it is described in full under Creation and the init handshake below.
 
-The header itself is small: the layout `version`, the `max_entries` count, a 64-bit `generation` counter that is bumped on every add, remove, and reclaim, and a single robust `pthread_mutex_t`. That mutex exists only for the one-time creation handshake. None of the hot paths (add, remove, query, cleanup) ever take it; they are lock-free and rely on per-slot atomics instead, which is why concurrent discovery activity from many processes does not serialize on a shared lock.
+The header itself is small: the layout `version`, the `max_entries` count, a 64-bit `generation` counter that is bumped on every add, remove, and reclaim, a single robust `pthread_mutex_t`, the `high_water_slot` bound on used slots, and the 4 KiB `doorbell_bits` bitmap (one bit per slot). That mutex exists only for the one-time creation handshake. None of the hot paths (add, remove, query, cleanup) ever take it; they are lock-free and rely on per-slot atomics instead, which is why concurrent discovery activity from many processes does not serialize on a shared lock.
 
 ### Registry layout
 
@@ -252,10 +252,12 @@ The registry is one POSIX shared-memory object per ROS domain, mapped `MAP_SHARE
   /dev/shm/ros2_uds_0          (POSIX shm, mmap'd MAP_SHARED into every process)
   ┌──────────────────────────────────────────────────────────────┐
   │ RegistryHeader                                                 │
-  │   version    = 3          (layout tag + init handshake)        │
+  │   version    = 5          (layout tag + init handshake)        │
   │   max_entries = 32768                                          │
   │   generation  = N         (bumped on every add/remove/reclaim) │
   │   init_mutex              (one-time creation handshake only)   │
+  │   high_water_slot         (bound on used slot indices)         │
+  │   doorbell_bits[512]      (4 KiB, 1 bit per slot = doorbell)   │
   ├──────────────────────────────────────────────────────────────┤
   │ slot[0]      RegistryEntrySlot  (1168 bytes)                   │
   │ slot[1]      RegistryEntrySlot                                 │
@@ -270,7 +272,8 @@ The registry is one POSIX shared-memory object per ROS domain, mapped `MAP_SHARE
   │ RegistryEntrySlot                                              │
   │   seq        (seqlock: even = stable, odd = mid-write)         │
   │   state      EMPTY | NODE | PUBLISHER | SUBSCRIPTION |         │
-  │              SERVICE | CLIENT   (RESERVED = claimed, uncommitted)│
+  │              SERVICE | CLIENT | DOORBELL                       │
+  │              (RESERVED = claimed, uncommitted)                 │
   │   pid        owning process (liveness check)                   │
   │   gid[16]    RMW GID                                           │
   │   node_name[256]                                               │
@@ -556,7 +559,7 @@ The correctness argument is one ordering pair. The writer rings strictly **after
 Best-effort has sharp edges, each handled explicitly:
 
 - **A full receiver queue is success.** `EAGAIN` because the destination's queue is full means wakeups are already pending there; dropping the octet loses nothing.
-- **A slow peer must not mute the others.** `AF_UNIX` datagrams stay charged to the *sender's* buffer until the receiver consumes them, so one process that never drains (hung, or not yet waiting) could exhaust the ring socket's budget and make sends fail for every peer. On `EAGAIN` the ring socket is closed, recreated, and the send retried once: on a fresh socket, `EAGAIN` can only mean the benign case above. A test that wedges one participant and asserts a healthy one still gets latched delivery guards this.
+- **A slow peer must not mute the others.** `AF_UNIX` datagrams stay charged to the *sender's* buffer until the receiver consumes them, so one process that never drains (hung, or not yet waiting) could exhaust the ring socket's budget and make sends fail for every peer. On `EAGAIN` the ring socket is closed, recreated, and the send retried once: on a fresh socket, `EAGAIN` can only mean the benign case above. No automated test drives this recreate path yet.
 - **A recycled slot must not receive the octet.** A set bit is only a hint. The ring loop re-validates the slot type inside its seqlock window, so a slot that was a doorbell when its bit was read but has been reused by a data endpoint cannot be sent to.
 - **The ring socket is per mutating thread** (thread-local, closed at thread exit), so ringing takes no lock and leaks nothing.
 

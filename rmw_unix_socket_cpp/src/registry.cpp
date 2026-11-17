@@ -14,6 +14,7 @@
 
 #include "registry.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -365,7 +366,9 @@ static void set_doorbell_bit(RegistryHeader * header, uint32_t i, bool on)
 static int32_t try_add_once(RegistryHeader * header, const RegistryEntry & entry)
 {
   auto * slots = registry_slots(header);
-  uint32_t max = header->max_entries;
+  // Clamped: the header is shared 0666 memory, and slots and doorbell_bits
+  // hold exactly REGISTRY_MAX_ENTRIES entries whatever it says.
+  const uint32_t max = std::min(header->max_entries, REGISTRY_MAX_ENTRIES);
 
   for (uint32_t i = 0; i < max; ++i) {
     uint8_t expected = ENTRY_EMPTY;
@@ -551,7 +554,8 @@ static void ring_doorbells(RegistryHeader * header)
     }
   }
   auto * slots = registry_slots(header);
-  const uint32_t hi = header->high_water_slot.load(std::memory_order_acquire);
+  const uint32_t hi = std::min(
+    header->high_water_slot.load(std::memory_order_acquire), REGISTRY_MAX_ENTRIES);
   for (uint32_t i = 0; i < hi; ++i) {
     const uint64_t rest =
       header->doorbell_bits[i / 64].load(std::memory_order_acquire) >> (i % 64);
@@ -612,7 +616,7 @@ void registry_cleanup_stale(RegistryHeader * header)
   bool reclaimed = false;
   // Scan only [0, high_water): over-scan is safe, under-scan is impossible.
   uint32_t hw = header->high_water_slot.load(std::memory_order_acquire);
-  uint32_t max = header->max_entries;
+  uint32_t max = std::min(header->max_entries, REGISTRY_MAX_ENTRIES);
   if (hw < max) { max = hw; }
 
   for (uint32_t i = 0; i < max; ++i) {
@@ -711,7 +715,7 @@ std::vector<RegistryQueryResult> registry_query(
   auto * slots = registry_slots(header);
   // Scan only [0, high_water): over-scan is safe, under-scan is impossible.
   uint32_t hw = header->high_water_slot.load(std::memory_order_acquire);
-  uint32_t max = header->max_entries;
+  uint32_t max = std::min(header->max_entries, REGISTRY_MAX_ENTRIES);
   if (hw < max) { max = hw; }
 
   for (uint32_t i = 0; i < max; ++i) {
