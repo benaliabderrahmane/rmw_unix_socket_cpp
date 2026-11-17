@@ -24,6 +24,7 @@
 #include "rosidl_typesupport_cpp/message_type_support.hpp"
 
 #include <chrono>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -236,6 +237,53 @@ TEST_F(PubSubTest, LargeMessageViaShmRing)
   EXPECT_EQ(RMW_RET_OK, rmw_take(sub, &recv_msg, &taken, nullptr));
   ASSERT_TRUE(taken);
   EXPECT_EQ(send_msg.uint8_values, recv_msg.uint8_values);
+}
+
+// Issue #84: a take hands its payload buffer back to the subscription and the
+// next drain receives into it, instead of allocating and freeing one per
+// message (glibc trimmed a large freed buffer, and the next message
+// page-faulted it back in). The buffer is reused across the shm ring path and
+// the inline datagram path, and each message must still come out byte-exact
+// at its own size, with nothing left over from the larger one before it.
+TEST_F(PubSubTest, TakeReusesPayloadBufferAcrossMessages)
+{
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto pub_opts = rmw_get_default_publisher_options();
+  pub = rmw_create_publisher(node, seq_ts, "/payload_reuse", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub = rmw_create_subscription(node, seq_ts, "/payload_reuse", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+  auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+
+  const uint8_t * buffer = nullptr;
+  // 300 KB and 100 KB ride the ring, 1 KB an inline datagram.
+  for (size_t size : {300 * 1024, 100 * 1024, 1024, 300 * 1024}) {
+    SCOPED_TRACE(size);
+    test_msgs::msg::UnboundedSequences send_msg;
+    send_msg.uint8_values.resize(size);
+    for (size_t i = 0; i < size; ++i) {
+      send_msg.uint8_values[i] = static_cast<uint8_t>((i * 7 + size) & 0xFF);
+    }
+    ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &send_msg, nullptr));
+
+    test_msgs::msg::UnboundedSequences recv_msg;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv_msg, &taken, nullptr));
+    ASSERT_TRUE(taken);
+    EXPECT_EQ(send_msg.uint8_values, recv_msg.uint8_values);
+
+    // The taken message's buffer is now the one spare, and it is the same
+    // buffer every time.
+    std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
+    ASSERT_EQ(1u, sub_data->spare_payloads.size());
+    EXPECT_GE(sub_data->spare_payloads.back().capacity(), 300u * 1024);
+    if (!buffer) {
+      buffer = sub_data->spare_payloads.back().data();
+    }
+    EXPECT_EQ(buffer, sub_data->spare_payloads.back().data());
+  }
 }
 
 // ignore_local_publications on the shm path. drain_endpoint() tests
