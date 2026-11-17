@@ -453,7 +453,7 @@ rmw_ret_t rmw_wait(
   // Fallback for entities epoll cannot watch: drain their sockets directly so
   // the queue check below still sees their data, and bound the block below so
   // the drain recurs. Guard-condition eventfds need no drain here — step 3
-  // reads every caller GC directly.
+  // reads every caller GC that epoll does not watch.
   for (const auto & ue : unarmed) {
     switch (ue.kind) {
       case rmw_uds::ARMED_SUBSCRIPTION:
@@ -539,10 +539,17 @@ rmw_ret_t rmw_wait(
 
   bool something_ready = caller_queue_has_work() || caller_event_ready();
 
-  // Per-GC readiness from the consuming read below, carried to the output
-  // pass. One read drains the whole eventfd counter, so we never write it back
-  // (a non-atomic read-back would race a concurrent trigger and inflate it).
+  // Per-GC readiness from the consuming reads, carried to the output pass.
+  // One read drains the whole eventfd counter, so we never write it back (a
+  // non-atomic read-back would race a concurrent trigger and inflate it).
   std::vector<bool> gc_triggered;
+  // An armed GC eventfd is level-triggered in epoll, so step 4 reports and
+  // consumes a pending trigger for one syscall per wait, not one read per GC
+  // (#85). Only a GC epoll could not watch is read directly, here and in the
+  // output pass.
+  auto gc_polled = [&](const rmw_uds::UdsGuardCondition * gc) {
+      return armed_this_call.find(gc->eventfd_fd) == armed_this_call.end();
+    };
 
   if (guard_conditions) {
     gc_triggered.assign(guard_conditions->guard_condition_count, false);
@@ -550,6 +557,7 @@ rmw_ret_t rmw_wait(
       if (!guard_conditions->guard_conditions[i]) {continue;}
       auto * gc = static_cast<rmw_uds::UdsGuardCondition *>(
         guard_conditions->guard_conditions[i]);
+      if (!gc_polled(gc)) {continue;}
       uint64_t val;
       ssize_t r = read(gc->eventfd_fd, &val, sizeof(val));
       if (r == static_cast<ssize_t>(sizeof(val))) {
@@ -779,11 +787,13 @@ rmw_ret_t rmw_wait(
       auto * gc = static_cast<rmw_uds::UdsGuardCondition *>(
         guard_conditions->guard_conditions[i]);
       uint64_t val;
-      // Consume a trigger that landed during the epoll block; combine with the
-      // earlier reads so a GC seen ready then stays reported without a
-      // read-back.
-      ssize_t r = read(gc->eventfd_fd, &val, sizeof(val));
-      if (r == static_cast<ssize_t>(sizeof(val)) || gc_triggered[i]) {
+      // A polled GC: consume a trigger that landed during the bounded block.
+      // An armed one that fired after epoll returned stays readable for the
+      // next wait.
+      if (gc_triggered[i] ||
+        (gc_polled(gc) &&
+        read(gc->eventfd_fd, &val, sizeof(val)) == static_cast<ssize_t>(sizeof(val))))
+      {
         any_ready = true;
       } else {
         guard_conditions->guard_conditions[i] = nullptr;

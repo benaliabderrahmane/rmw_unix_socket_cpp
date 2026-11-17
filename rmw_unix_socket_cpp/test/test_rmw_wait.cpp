@@ -17,8 +17,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -924,4 +927,102 @@ TEST_F(RmwUdsNodeTest, WaitDrainFiresOnNewMessageCallback)
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, sub));
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
+}
+
+// read() syscalls made so far by the calling thread (/proc/thread-self/io
+// syscr, which counts failing reads too), or -1 where io accounting is off.
+static long thread_read_syscalls()
+{
+  std::ifstream io("/proc/thread-self/io");
+  std::string key;
+  long value = 0;
+  while (io >> key >> value) {
+    if (key == "syscr:") {
+      return value;
+    }
+  }
+  return -1;
+}
+
+// rclcpp hands every wait ~20 guard conditions, almost never triggered. epoll
+// already watches their eventfds, so a wait must not read() each one before
+// and after it blocks just to find it empty (#85): that was 2 failing reads
+// per guard condition per wait. Triggered ones must still all be reported,
+// exactly once, whether the trigger came before the wait or during it.
+TEST_F(RmwUdsNodeTest, WaitReadsOnlyGuardConditionsEpollReportsReady)
+{
+  constexpr size_t kGcs = 20;
+  std::vector<rmw_guard_condition_t *> gcs;
+  for (size_t i = 0; i < kGcs; ++i) {
+    gcs.push_back(rmw_create_guard_condition(&context));
+    ASSERT_NE(nullptr, gcs.back());
+  }
+  auto * ws = rmw_create_wait_set(&context, kGcs);
+  ASSERT_NE(nullptr, ws);
+
+  std::vector<void *> array(kGcs);
+  rmw_guard_conditions_t set;
+  auto wait = [&](rmw_time_t * timeout) {
+      for (size_t i = 0; i < kGcs; ++i) {
+        array[i] = gcs[i]->data;
+      }
+      set.guard_conditions = array.data();
+      set.guard_condition_count = kGcs;
+      return rmw_wait(nullptr, &set, nullptr, nullptr, nullptr, ws, timeout);
+    };
+  auto reported = [&]() {
+      return static_cast<size_t>(
+        std::count_if(array.begin(), array.end(), [](void * p) {return p != nullptr;}));
+    };
+
+  rmw_time_t zero{0, 0};
+  EXPECT_EQ(RMW_RET_TIMEOUT, wait(&zero));  // arms every eventfd
+
+  if (thread_read_syscalls() < 0) {
+    GTEST_SKIP() << "/proc/thread-self/io unavailable";
+  }
+  constexpr int kWaits = 200;
+  const long before = thread_read_syscalls();
+  const auto t0 = std::chrono::steady_clock::now();
+  for (int w = 0; w < kWaits; ++w) {
+    ASSERT_EQ(RMW_RET_TIMEOUT, wait(&zero));
+  }
+  const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::steady_clock::now() - t0).count();
+  // Includes the few read()s of the /proc probes themselves.
+  const double reads_per_wait =
+    static_cast<double>(thread_read_syscalls() - before) / kWaits;
+  std::printf(
+    "[  INFO    ] %zu idle guard conditions: %.2f read()/wait, %.2f us/wait\n",
+    kGcs, reads_per_wait, ns / 1000.0 / kWaits);
+  // The delivery_fd drain is one read per wait; the guard conditions add none.
+  EXPECT_LT(reads_per_wait, 1.5) << "rmw_wait polls idle guard-condition eventfds";
+
+  // Triggered before the wait: both reported in this wait, and consumed.
+  ASSERT_EQ(RMW_RET_OK, rmw_trigger_guard_condition(gcs[3]));
+  ASSERT_EQ(RMW_RET_OK, rmw_trigger_guard_condition(gcs[17]));
+  ASSERT_EQ(RMW_RET_OK, rmw_trigger_guard_condition(gcs[17]));
+  EXPECT_EQ(RMW_RET_OK, wait(&zero));
+  EXPECT_EQ(2u, reported());
+  EXPECT_NE(nullptr, array[3]);
+  EXPECT_NE(nullptr, array[17]);
+  EXPECT_EQ(RMW_RET_TIMEOUT, wait(&zero)) << "a trigger was reported twice";
+  EXPECT_EQ(0u, reported());
+
+  // Triggered from another thread during a blocking wait.
+  std::thread trigger([&] {
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      auto _r [[maybe_unused]] = rmw_trigger_guard_condition(gcs[11]);
+    });
+  rmw_time_t two_s{2, 0};
+  EXPECT_EQ(RMW_RET_OK, wait(&two_s));
+  trigger.join();
+  EXPECT_EQ(1u, reported());
+  EXPECT_NE(nullptr, array[11]);
+  EXPECT_EQ(RMW_RET_TIMEOUT, wait(&zero));
+
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  for (auto * gc : gcs) {
+    EXPECT_EQ(RMW_RET_OK, rmw_destroy_guard_condition(gc));
+  }
 }

@@ -75,6 +75,16 @@ four copies of the receive loop that hid the gap are one.
 - `DESIGN.md` documents the listener thread and the `delivery_fd` ordering, and
   narrows the no-background-threads claim to what it now guarantees.
 
+### Performance
+
+- **`rmw_wait` no longer reads every guard-condition eventfd** (#85). It read
+  each one before blocking and again after waking, whether or not epoll had
+  reported it: two `read()`s per guard condition per wait, nearly all failing
+  with `EAGAIN` — about 40 syscalls per wait for the ~20 guard conditions an
+  rclcpp executor passes. epoll already watches those eventfds, so a pending
+  trigger is now reported and consumed through it; only a guard condition epoll
+  could not watch is still read directly.
+
 ### Fixed
 
 - **QoS status events are refused honestly.** `rmw_publisher_event_init` /
