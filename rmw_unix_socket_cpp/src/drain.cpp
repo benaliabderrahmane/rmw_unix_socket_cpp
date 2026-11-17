@@ -14,12 +14,14 @@
 
 #include "drain.hpp"
 
+#include "events.hpp"
 #include "logging.hpp"
 #include "shm_transport.hpp"
 #include "transport.hpp"
 
 #include <chrono>
 #include <cstring>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -46,6 +48,8 @@ DrainTarget drain_target(UdsSubscription * sub)
   t.ignore_local = sub->ignore_local_publications;
   t.context_id = sub->context->context_id;
   t.replay_watermarks = &sub->replayed_watermarks;
+  t.last_sequence = &sub->last_sequence;
+  t.lost_sub = sub;
   t.callback_mutex = &sub->callback_mutex;
   t.callback = &sub->on_new_message_cb;
   t.callback_user_data = &sub->on_new_message_user_data;
@@ -93,6 +97,7 @@ size_t drain_endpoint(const DrainTarget & t)
 {
   size_t enqueued = 0;
   size_t dropped = 0;
+  size_t lost = 0;
 
   // Scoped to the receive loop only. It serialises drains of this endpoint:
   // recv_from() runs outside queue_mutex, so without it the listener thread
@@ -106,12 +111,83 @@ size_t drain_endpoint(const DrainTarget & t)
 
     WireHeader hdr;
     std::vector<uint8_t> payload;
+    // The publisher the two lookups below were made for. A drain usually
+    // carries one publisher's datagrams back to back, so each map is searched
+    // once per publisher per drain, not per datagram; std::map entries never
+    // move, so the pointers stay valid.
+    std::array<uint8_t, 16> cached_key{};
+    bool cached = false;
+    int64_t * seen = nullptr;             // message_lost: its high-water mark
+    const int64_t * watermark = nullptr;  // TRANSIENT_LOCAL: its pull watermark
 
     while (recv_from(t.fd, hdr, payload)) {
       if ((hdr.msg_type & ~SHM_PAYLOAD_FLAG) != t.msg_type) {
         continue;
       }
-      if (t.replay_watermarks) {
+      // Checked before the descriptor resolve, for the same reason the dedup
+      // below is: is_same_context() reads only WireHeader::gid, so an ignored
+      // large payload need never be mapped and copied out of the sender's ring.
+      // And before the gap check: what this subscription drops on purpose
+      // cannot be lost to it.
+      if (t.ignore_local && is_same_context(hdr, t.context_id)) {
+        continue;  // ignore_local_publications: drop same-context publications
+      }
+      std::array<uint8_t, 16> key;
+      std::memcpy(key.data(), hdr.gid, key.size());
+      if (!cached || key != cached_key) {
+        cached_key = key;
+        cached = true;
+        seen = nullptr;
+        watermark = nullptr;
+        if (t.replay_watermarks) {
+          std::lock_guard<std::mutex> lock(*t.queue_mutex);
+          auto w = t.replay_watermarks->find(key);
+          if (w != t.replay_watermarks->end()) {
+            watermark = &w->second;
+          }
+        }
+      }
+      bool fresh = false;  // a publish newer than any seen from its publisher
+      if (t.last_sequence && hdr.sequence_number > 0) {
+        // message_lost. A publisher numbers each publish once, for every
+        // subscriber, in send order (UdsPublisher::send_mutex), so a jump in
+        // its sequence is datagrams that never arrived here (the kernel
+        // dropped them, or the sender did on a full socket). Checked before
+        // the dedup below, which drops on purpose. The first datagram from a
+        // publisher only sets the baseline. Publishers number from 1, so a
+        // number below that is not one of their publishes, and keeping it out
+        // keeps the arithmetic below on wire values from overflowing.
+        const int64_t seq = hdr.sequence_number;  // packed: no reference to it
+        if (!seen) {
+          auto it = t.last_sequence->find(key);
+          if (it == t.last_sequence->end()) {
+            // The baseline is the first datagram - or, for a TRANSIENT_LOCAL
+            // late joiner, the creation-time pull's watermark when higher:
+            // sequences up to it came through the pull, not the socket.
+            int64_t base = seq - 1;
+            if (watermark && *watermark > base) {
+              base = *watermark;
+            }
+            try {
+              it = t.last_sequence->emplace(key, base).first;
+            } catch (const std::bad_alloc &) {
+              // Out of memory: skip this datagram's check rather than let the
+              // exception escape a C entry point or the listener thread. The
+              // next datagram from the publisher tries again.
+              it = t.last_sequence->end();
+            }
+          }
+          seen = it == t.last_sequence->end() ? nullptr : &it->second;
+        }
+        if (seen && seq > *seen) {
+          // Unsigned: exact for any seq > seen, whatever the wire carried.
+          lost += static_cast<size_t>(
+            static_cast<uint64_t>(seq) - static_cast<uint64_t>(*seen) - 1);
+          *seen = seq;
+          fresh = true;
+        }
+      }
+      if (watermark && hdr.sequence_number <= *watermark) {
         // TRANSIENT_LOCAL dedup: drop this datagram when its sample was already
         // delivered by the creation-time pull - the sender's GID has a watermark
         // and the sequence number is at or below it. Sequence numbers are
@@ -121,27 +197,14 @@ size_t drain_endpoint(const DrainTarget & t)
         // publisher's ring at pull time - history DDS would not owe a late
         // joiner either. Checked before the descriptor resolve so a duplicate
         // never maps a segment.
-        std::array<uint8_t, 16> key;
-        std::memcpy(key.data(), hdr.gid, key.size());
-        bool dup = false;
-        {
-          std::lock_guard<std::mutex> lock(*t.queue_mutex);
-          auto it = t.replay_watermarks->find(key);
-          dup = it != t.replay_watermarks->end() &&
-            hdr.sequence_number <= it->second;
-        }
-        if (dup) {
-          continue;
-        }
-      }
-      // Checked before the descriptor resolve, for the same reason the dedup
-      // above is: is_same_context() reads only WireHeader::gid, so an ignored
-      // large payload need never be mapped and copied out of the sender's ring.
-      if (t.ignore_local && is_same_context(hdr, t.context_id)) {
-        continue;  // ignore_local_publications: drop same-context publications
+        continue;
       }
       if (!shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload)) {
-        continue;  // shm descriptor unresolvable (sender gone / ring lapped)
+        // shm descriptor unresolvable (sender gone / ring lapped): the
+        // datagram arrived but the message is gone, so it counts as lost -
+        // once, and only as a publish the gap check had not already passed.
+        lost += fresh ? 1 : 0;
+        continue;
       }
 
       ReceivedMessage msg;
@@ -172,6 +235,12 @@ size_t drain_endpoint(const DrainTarget & t)
       }
       ++enqueued;
     }
+  }
+
+  // With drain_mutex released, like the notification below. Signals every
+  // wait set itself, so the return value below counts enqueues only.
+  if (lost > 0 && t.lost_sub) {
+    record_message_lost(t.lost_sub, lost);
   }
 
   // One notification for the whole batch. rmw_event_callback_t takes the

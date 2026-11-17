@@ -222,10 +222,14 @@ if(BUILD_TESTING)
   target_include_directories(test_rmw_qos PRIVATE src)
   target_compile_definitions(test_rmw_qos PRIVATE RMW_TEST_DOMAIN_ID=106)
 
-  # RMW API: publisher/subscription events
-  ament_add_gtest(test_rmw_event test/test_rmw_event.cpp)
+  # RMW API: publisher/subscription events. registry.cpp is compiled in, as in
+  # test_registry, so a test can fill the registry (the library hides it).
+  ament_add_gtest(test_rmw_event test/test_rmw_event.cpp src/registry.cpp)
   target_link_libraries(test_rmw_event ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_event PRIVATE src)
+  # Own domain: a test here clamps and fills the registry, which must not
+  # starve another test binary of slots in a parallel ctest run.
+  target_compile_definitions(test_rmw_event PRIVATE RMW_TEST_DOMAIN_ID=107)
 
   # RMW API: on_new_message / on_new_request / on_new_response listener
   # callbacks, which every drain path must fire.
