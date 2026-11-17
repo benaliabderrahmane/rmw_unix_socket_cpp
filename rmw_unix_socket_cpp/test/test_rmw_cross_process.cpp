@@ -488,6 +488,7 @@ TEST(CrossProcessTest, ATakeNeverDeliversARecordThePublisherIsOverwriting)
   EXPECT_EQ(0, torn) << "a torn message was delivered";
   EXPECT_TRUE(publisher_done);
   EXPECT_GT(delivered, 0);
+  EXPECT_GT(st.total_count, 0u) << "the ring was never lapped: the test checked nothing";
   EXPECT_LE(static_cast<size_t>(delivered) + st.total_count, static_cast<size_t>(kCount));
   std::printf("delivered %d of %d, message_lost %zu\n", delivered, kCount, st.total_count);
 

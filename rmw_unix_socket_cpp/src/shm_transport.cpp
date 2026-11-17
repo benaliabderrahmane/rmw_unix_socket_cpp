@@ -566,9 +566,10 @@ bool shm_pin_payload(
   if (!find_record(cache, domain_id, desc_out, &mapping)) {
     return false;
   }
-  ++mapping->pins;
-  // Wrap-safe "newer than": record seqs come from a 32-bit counter.
-  if (static_cast<int32_t>(desc_out.seq - mapping->newest_seq) > 0) {
+  // Wrap-safe "newer than": record seqs come from a 32-bit counter. With no
+  // pin left nothing reads newest_seq, so the first pin seeds it: a ring first
+  // mapped at seq 2^31 or later would otherwise never move it off 0.
+  if (mapping->pins++ == 0 || static_cast<int32_t>(desc_out.seq - mapping->newest_seq) > 0) {
     mapping->newest_seq = desc_out.seq;
   }
   return true;
@@ -587,6 +588,18 @@ static void unpin_locked(ShmReaderCache & cache, const ShmPayloadDescriptor & de
   }
 }
 
+bool shm_pinned_lapped(ShmReaderCache & cache, const ShmPayloadDescriptor & desc)
+{
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto it = cache.mappings.find({desc.owner_pid, desc.owner_id, desc.segment_id});
+  if (it == cache.mappings.end()) {
+    return true;  // as shm_read_pinned: a take could not read it either
+  }
+  const auto * record = reinterpret_cast<const ShmRecordHeader *>(
+    it->second.base + sizeof(ShmRingHeader) + desc.offset);
+  return record->seq.load(std::memory_order_acquire) != desc.seq;
+}
+
 void shm_unpin(ShmReaderCache & cache, const ShmPayloadDescriptor & desc)
 {
   std::lock_guard<std::mutex> lock(cache.mutex);
@@ -599,6 +612,13 @@ void shm_unpin(ShmReaderCache & cache, const ShmPayloadDescriptor & desc)
 // at least two more publishes after the newest to reach it: from here on a
 // read that takes a few publish periods could be lapped mid-way.
 static constexpr uint32_t SHM_TAKE_COPY_LAG = 2;
+
+// Below this size the take always copies the record first, as the drain did
+// before #86. Measured with bench_take_path (glibc 2.39, Zen 3), the in-place
+// read swung from 12 % faster to 22 % slower at 256 KiB with the heap's address
+// alignment (glibc's `rep movsb` copy is slow at some offsets), and was faster
+// at 512 KiB and up at every alignment tried.
+static constexpr uint32_t SHM_TAKE_IN_PLACE_MIN = 512 * 1024;
 
 ShmRead shm_read_pinned(
   ShmReaderCache & cache,
@@ -618,15 +638,15 @@ ShmRead shm_read_pinned(
   const auto * record = reinterpret_cast<const ShmRecordHeader *>(
     mapping.base + sizeof(ShmRingHeader) + desc.offset);
   const auto * payload = reinterpret_cast<const uint8_t *>(record + 1);
-  const bool near_lap = !mapping.superseded &&
-    (mapping.newest_seq - desc.seq) / 2 >= SHM_TAKE_COPY_LAG;
+  const bool copy_first = desc.payload_size < SHM_TAKE_IN_PLACE_MIN || (!mapping.superseded &&
+    (mapping.newest_seq - desc.seq) / 2 >= SHM_TAKE_COPY_LAG);
 
   ShmRead result;
   if (record->seq.load(std::memory_order_acquire) != desc.seq ||
     record->payload_len != desc.payload_size)
   {
     result = ShmRead::lost;
-  } else if (near_lap) {
+  } else if (copy_first) {
     bool copied = false;
     try {
       scratch.assign(payload, payload + desc.payload_size);

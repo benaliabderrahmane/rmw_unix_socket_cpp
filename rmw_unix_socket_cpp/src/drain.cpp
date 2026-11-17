@@ -221,11 +221,13 @@ size_t drain_endpoint(const DrainTarget & t)
         // never maps a segment.
         continue;
       }
-      // A subscription queues a large payload's descriptor and its take reads
-      // the ring record in place (#86). Services and clients have no
-      // message_lost to report a lapped record to, so they copy it out now.
+      // A KEEP_LAST subscription queues a large payload's descriptor and its
+      // take reads the ring record (#86). Services and clients have no
+      // message_lost to report a lapped record to, and a KEEP_ALL subscription
+      // must not lose what it already received, so they copy it out now.
       ReceivedMessage msg;
-      const bool in_ring = t.lost_sub && (hdr.msg_type & SHM_PAYLOAD_FLAG);
+      const bool in_ring = t.lost_sub && (hdr.msg_type & SHM_PAYLOAD_FLAG) &&
+        t.lost_sub->qos.history != RMW_QOS_POLICY_HISTORY_KEEP_ALL;
       if (in_ring ?
         !shm_pin_payload(*t.shm_cache, t.domain_id, payload, msg.shm_desc) :
         !shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload))
@@ -261,6 +263,21 @@ size_t drain_endpoint(const DrainTarget & t)
           ++dropped;
           overflow = true;
         }
+        // Queued records the publisher has since overwritten can no longer be
+        // delivered: drop them now, so the take credit below counts only what a
+        // take can still return. shortcut: checks the front only, so a lapped
+        // record behind another publisher's live one costs a credit until it
+        // reaches the front.
+        while (t.lost_sub && !t.queue->empty() &&
+          (t.queue->front().header.msg_type & SHM_PAYLOAD_FLAG) &&
+          shm_pinned_lapped(*t.shm_cache, t.queue->front().shm_desc))
+        {
+          shm_unpin(*t.shm_cache, t.queue->front().shm_desc);
+          recycle_payload(*t.spares, t.queue->front().payload);
+          t.queue->pop_front();
+          ++dropped;
+          ++lost;
+        }
         if (payload.capacity() == 0) {
           take_spare();  // for the next datagram (a pinned one left it in place)
         }
@@ -291,9 +308,10 @@ size_t drain_endpoint(const DrainTarget & t)
   // The count is how much the queue GREW, not how many datagrams the socket
   // handed over. number_of_events is a take credit - the executor calls take()
   // once per event - so an overflow that pushed 100 and popped 90 must report
-  // 10, or the executor spends 90 takes finding nothing. At most one pop per
-  // push, so dropped never exceeds enqueued.
-  const size_t gained = enqueued - dropped;
+  // 10, or the executor spends 90 takes finding nothing. Lapped records
+  // dropped here may have been credited by an earlier drain, so dropped can
+  // exceed enqueued.
+  const size_t gained = enqueued > dropped ? enqueued - dropped : 0;
   if (gained == 0 || !t.callback_mutex) {
     return enqueued;
   }

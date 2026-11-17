@@ -300,6 +300,10 @@ ShmRead shm_read_pinned(
   std::vector<uint8_t> & scratch,
   const std::function<bool(const uint8_t *, size_t)> & read);
 
+// True when the publisher has overwritten the pinned record (or its mapping
+// is gone): a take would report it lost. Peeks at the seqlock word only.
+bool shm_pinned_lapped(ShmReaderCache & cache, const ShmPayloadDescriptor & desc);
+
 // Drop a pin without reading (a queued message dropped on overflow).
 void shm_unpin(ShmReaderCache & cache, const ShmPayloadDescriptor & desc);
 

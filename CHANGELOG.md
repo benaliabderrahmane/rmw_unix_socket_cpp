@@ -103,22 +103,25 @@ four copies of the receive loop that hid the gap are one.
 
 ### Performance
 
-- **Large topic payloads are deserialized straight from the publisher's
-  shared-memory ring** (#86), as Fast DDS data sharing does. A subscription
-  queues the payload's descriptor instead of copying the payload into a heap
-  buffer, and the take reads the ring record in place under its seqlock. That
-  copy was 14-22 % of the receive CPU per large message. `bench_take_path`
-  (five-topic fan-in, thread CPU per message, median of 5): 1 MiB 198 -> 163 us,
-  2 MiB 725 -> 666 us, 4 MiB 1687 -> 1447 us, 8 MiB 3538 -> 2766 us. 256 KiB
-  measured 36 -> 45 us: glibc's `rep movsb` copy from the ring into the
-  benchmark's message is slow at that address alignment on the test CPU (Zen
-  3); with `rep movsb` disabled it is 39 -> 32 us.
+- **Large topic payloads are read straight from the publisher's shared-memory
+  ring** (#86), as Fast DDS data sharing does. A KEEP_LAST subscription queues
+  the payload's descriptor instead of copying the payload into a heap buffer,
+  and the take reads the ring record under its seqlock: in place from 512 KiB,
+  through one copy below that, as before. `bench_take_path` (five-topic
+  fan-in, thread CPU per message, median of 5, Zen 3, glibc 2.39):
+  512 KiB 63 -> 53 us, 1 MiB 227 -> 196 us, 2 MiB 728 -> 628 us,
+  4 MiB 1576 -> 1328 us, 8 MiB 3554 -> 2767 us; 64 to 256 KiB unchanged.
+  Read in place, 256 KiB swung from 12 % faster to 22 % slower with the heap's
+  address alignment (glibc's `rep movsb` is slow at some source/destination
+  offsets), which is why payloads under 512 KiB keep the copy.
   **Behaviour change:** a KEEP_LAST depth-N subscription to large messages
   (64 KiB and up) now keeps at most what the publisher's ring still holds (at
   least four records of its largest payload); older queued messages are
-  reported through `message_lost` when they are taken, never delivered.
-  Services and clients still copy large requests and responses out when they
-  arrive.
+  reported through `message_lost` by the next drain or take, never delivered.
+  KEEP_ALL subscriptions, services and clients still copy large payloads out
+  when they arrive, so nothing changes for them. A take that finds a record
+  overwritten during an in-place read and nothing else to deliver returns
+  `taken = false` with its message partly written.
 
 ## [0.5.0] - 2026-08-27
 
