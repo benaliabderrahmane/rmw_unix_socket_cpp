@@ -331,6 +331,7 @@ rmw_ret_t rmw_take(
 
   auto msg = std::move(sub_data->message_queue.front());
   sub_data->message_queue.pop_front();
+  rmw_uds::PayloadRecycler recycle{sub_data->spare_payloads, msg.payload};
 
   if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
     sub_data->callbacks, ros_message))
@@ -387,6 +388,7 @@ rmw_ret_t rmw_take_with_info(
 
   auto msg = std::move(sub_data->message_queue.front());
   sub_data->message_queue.pop_front();
+  rmw_uds::PayloadRecycler recycle{sub_data->spare_payloads, msg.payload};
 
   if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
     sub_data->callbacks, ros_message))
@@ -458,6 +460,7 @@ rmw_ret_t rmw_take_sequence(
   for (size_t i = 0; i < to_take; ++i) {
     auto msg = std::move(sub_data->message_queue.front());
     sub_data->message_queue.pop_front();
+    rmw_uds::PayloadRecycler recycle{sub_data->spare_payloads, msg.payload};
 
     // Write successes contiguously at the *taken cursor (not the loop counter):
     // a skipped failure must not leave an uninitialized hole that the consumer
@@ -521,6 +524,7 @@ rmw_ret_t rmw_take_serialized_message(
 
   auto msg = std::move(sub_data->message_queue.front());
   sub_data->message_queue.pop_front();
+  rmw_uds::PayloadRecycler recycle{sub_data->spare_payloads, msg.payload};
 
   auto ret = rmw_serialized_message_resize(serialized_message, msg.payload.size());
   if (ret != RMW_RET_OK) {return ret;}
@@ -560,6 +564,7 @@ rmw_ret_t rmw_take_serialized_message_with_info(
 
   auto msg = std::move(sub_data->message_queue.front());
   sub_data->message_queue.pop_front();
+  rmw_uds::PayloadRecycler recycle{sub_data->spare_payloads, msg.payload};
 
   auto ret = rmw_serialized_message_resize(serialized_message, msg.payload.size());
   if (ret != RMW_RET_OK) {return ret;}
