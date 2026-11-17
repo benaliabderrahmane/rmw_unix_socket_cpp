@@ -296,6 +296,231 @@ TEST_F(PubSubTest, TakeReusesPayloadBufferAcrossMessages)
   }
 }
 
+namespace
+{
+// A message whose bytes are a function of (tag, size), so a reused buffer that
+// leaked bytes of an earlier message, or a message cut to the wrong size, shows.
+test_msgs::msg::UnboundedSequences patterned(uint32_t tag, size_t size)
+{
+  test_msgs::msg::UnboundedSequences m;
+  m.uint8_values.resize(size);
+  for (size_t i = 0; i < size; ++i) {
+    m.uint8_values[i] = static_cast<uint8_t>((i * 7 + tag * 31) & 0xFF);
+  }
+  if (size >= sizeof(tag)) {
+    std::memcpy(m.uint8_values.data(), &tag, sizeof(tag));
+  }
+  return m;
+}
+
+// Every buffer the subscription owns outside a take: queued, spare, and the
+// drain's receive buffer.
+size_t owned_buffers(rmw_uds::UdsSubscription * s)
+{
+  std::lock_guard<std::mutex> drain_lock(s->drain_mutex);
+  std::lock_guard<std::mutex> queue_lock(s->queue_mutex);
+  return s->message_queue.size() + s->spare_payloads.size() +
+         (s->recv_payload.capacity() > 0 ? 1 : 0);
+}
+}  // namespace
+
+// Issue #84, KEEP_LAST overflow: the drain hands the dropped entry's buffer
+// back and receives the next datagram into it, so a subscription that falls
+// behind cycles through depth + 1 buffers instead of allocating one per
+// message. Six messages are drained at depth 2 by rmw_wait without a take, so
+// four are dropped; the two kept must come out byte-exact at their own sizes.
+TEST_F(PubSubTest, KeepLastOverflowRecyclesDroppedPayload)
+{
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  qos.depth = 2;
+  auto pub_opts = rmw_get_default_publisher_options();
+  pub = rmw_create_publisher(node, seq_ts, "/payload_overflow", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub = rmw_create_subscription(node, seq_ts, "/payload_overflow", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+  auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+
+  // Ring and inline sizes mixed; under the 1 MiB ring floor in total, so none laps.
+  const size_t sizes[6] = {200 * 1024, 1024, 100 * 1024, 2048, 150 * 1024, 70 * 1024};
+  rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
+  ASSERT_NE(nullptr, ws);
+  for (uint32_t round = 0; round < 20; ++round) {
+    SCOPED_TRACE(round);
+    for (uint32_t i = 0; i < 6; ++i) {
+      auto m = patterned(round * 6 + i, sizes[i]);
+      ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
+    }
+    // One rmw_wait drains all six (the socket holds them all) without taking.
+    rmw_subscriptions_t subs;
+    void * sub_array[1] = {sub->data};
+    subs.subscribers = sub_array;
+    subs.subscriber_count = 1;
+    rmw_time_t timeout{5, 0};
+    ASSERT_EQ(RMW_RET_OK, rmw_wait(&subs, nullptr, nullptr, nullptr, nullptr, ws, &timeout));
+    {
+      // The last overflow handed its buffer back and the drain took it for
+      // the next datagram: nothing spare, one buffer ready to receive into.
+      std::lock_guard<std::mutex> drain_lock(sub_data->drain_mutex);
+      std::lock_guard<std::mutex> queue_lock(sub_data->queue_mutex);
+      EXPECT_EQ(2u, sub_data->message_queue.size());
+      EXPECT_TRUE(sub_data->spare_payloads.empty());
+      EXPECT_GT(sub_data->recv_payload.capacity(), 0u);
+    }
+    for (uint32_t i = 4; i < 6; ++i) {
+      test_msgs::msg::UnboundedSequences recv_msg;
+      bool taken = false;
+      ASSERT_EQ(RMW_RET_OK, rmw_take(sub, &recv_msg, &taken, nullptr));
+      ASSERT_TRUE(taken);
+      EXPECT_EQ(patterned(round * 6 + i, sizes[i]).uint8_values, recv_msg.uint8_values);
+    }
+    std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
+    EXPECT_EQ(2u, sub_data->spare_payloads.size());
+  }
+  EXPECT_EQ(3u, owned_buffers(sub_data));
+  EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+}
+
+// A take that fails to deserialize still hands its buffer back: the recycle
+// runs on every return path, not only the successful one.
+TEST_F(PubSubTest, FailedTakeRecyclesPayload)
+{
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub = rmw_create_subscription(node, seq_ts, "/payload_corrupt", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+  auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+
+  int send_fd = ::socket(AF_UNIX, SOCK_DGRAM, 0);
+  ASSERT_GE(send_fd, 0);
+  struct sockaddr_un addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, sub_data->socket_path.c_str(), sizeof(addr.sun_path) - 1);
+  // An inline datagram whose payload is not CDR (bad encapsulation header).
+  std::vector<uint8_t> payload(40 * 1024, 0xFF);
+  rmw_uds::WireHeader hdr;
+  std::memset(&hdr, 0, sizeof(hdr));
+  hdr.payload_size = static_cast<uint32_t>(payload.size());
+  hdr.msg_type = 0;
+  std::vector<uint8_t> dgram(sizeof(hdr) + payload.size());
+  std::memcpy(dgram.data(), &hdr, sizeof(hdr));
+  std::memcpy(dgram.data() + sizeof(hdr), payload.data(), payload.size());
+
+  for (int with_info = 0; with_info < 2; ++with_info) {
+    SCOPED_TRACE(with_info);
+    ASSERT_EQ(
+      static_cast<ssize_t>(dgram.size()),
+      ::sendto(send_fd, dgram.data(), dgram.size(), 0,
+        reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)));
+    test_msgs::msg::UnboundedSequences recv_msg;
+    bool taken = false;
+    rmw_message_info_t info;
+    if (with_info) {
+      EXPECT_NE(RMW_RET_OK, rmw_take_with_info(sub, &recv_msg, &taken, &info, nullptr));
+    } else {
+      EXPECT_NE(RMW_RET_OK, rmw_take(sub, &recv_msg, &taken, nullptr));
+    }
+    EXPECT_FALSE(taken);
+    rcutils_reset_error();
+    std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
+    ASSERT_EQ(1u, sub_data->spare_payloads.size());
+    EXPECT_GE(sub_data->spare_payloads.back().capacity(), payload.size());
+  }
+  ::close(send_fd);
+}
+
+// The listener thread drains while three threads take through three take
+// paths, against a publisher of mixed inline and ring sizes at depth 4. Spares
+// move between the drain (drain_mutex + queue_mutex) and the takes
+// (queue_mutex) on four threads: every message taken must be byte-exact at its
+// own size, and the buffers owned stay within the bound DESIGN.md gives.
+// Run under TSan by the sanitizer job.
+TEST_F(PubSubTest, ConcurrentTakesAndListenerDrainRecycleSafely)
+{
+  auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  qos.depth = 4;
+  auto pub_opts = rmw_get_default_publisher_options();
+  pub = rmw_create_publisher(node, seq_ts, "/payload_stress", &qos, &pub_opts);
+  auto sub_opts = rmw_get_default_subscription_options();
+  sub = rmw_create_subscription(node, seq_ts, "/payload_stress", &qos, &sub_opts);
+  ASSERT_NE(nullptr, pub);
+  ASSERT_NE(nullptr, sub);
+  auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
+  auto no_op = [](const void *, size_t) {};
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_set_on_new_message_callback(sub, no_op, nullptr));
+
+  const size_t sizes[5] = {100, 70 * 1024, 1024, 300 * 1024, 10 * 1024};
+  std::atomic<bool> stop{false};
+  std::atomic<size_t> good{0};
+  std::atomic<size_t> bad{0};
+  auto check = [&](const test_msgs::msg::UnboundedSequences & got) {
+      uint32_t tag = 0;
+      if (got.uint8_values.size() >= sizeof(tag)) {
+        std::memcpy(&tag, got.uint8_values.data(), sizeof(tag));
+      }
+      if (got.uint8_values == patterned(tag, sizes[tag % 5]).uint8_values) {
+        ++good;
+      } else {
+        ++bad;
+      }
+    };
+  std::vector<std::thread> takers;
+  takers.emplace_back([&] {
+      while (!stop) {
+        test_msgs::msg::UnboundedSequences m;
+        bool taken = false;
+        if (rmw_take(sub, &m, &taken, nullptr) == RMW_RET_OK && taken) {check(m);}
+      }
+    });
+  takers.emplace_back([&] {
+      while (!stop) {
+        test_msgs::msg::UnboundedSequences m;
+        rmw_message_info_t info;
+        bool taken = false;
+        if (rmw_take_with_info(sub, &m, &taken, &info, nullptr) == RMW_RET_OK && taken) {
+          check(m);
+        }
+      }
+    });
+  takers.emplace_back([&] {
+      rcutils_allocator_t allocator = rcutils_get_default_allocator();
+      rmw_serialized_message_t ser = rmw_get_zero_initialized_serialized_message();
+      if (rmw_serialized_message_init(&ser, 0, &allocator) != RMW_RET_OK) {
+        ++bad;
+        return;
+      }
+      while (!stop) {
+        bool taken = false;
+        if (rmw_take_serialized_message(sub, &ser, &taken, nullptr) == RMW_RET_OK && taken) {
+          test_msgs::msg::UnboundedSequences m;
+          if (rmw_deserialize(&ser, seq_ts, &m) == RMW_RET_OK) {check(m);} else {++bad;}
+        }
+      }
+      auto r [[maybe_unused]] = rmw_serialized_message_fini(&ser);
+    });
+
+  for (uint32_t tag = 0; tag < 500; ++tag) {
+    auto m = patterned(tag, sizes[tag % 5]);
+    EXPECT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));  // not ASSERT: takers must be joined
+    if (tag % 50 == 49) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  stop = true;
+  for (auto & t : takers) {t.join();}
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_set_on_new_message_callback(sub, nullptr, nullptr));
+
+  EXPECT_EQ(0u, bad.load());
+  EXPECT_GT(good.load(), 0u);
+  // Queue depth, plus one per thread that took at once, plus the drain's own.
+  EXPECT_LE(owned_buffers(sub_data), qos.depth + takers.size() + 1);
+}
+
 // ignore_local_publications on the shm path. drain_endpoint() tests
 // is_same_context() before it resolves the descriptor, because the sender's
 // context id is already in WireHeader::gid and an ignored payload should never

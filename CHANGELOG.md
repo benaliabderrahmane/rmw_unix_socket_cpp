@@ -103,6 +103,18 @@ four copies of the receive loop that hid the gap are one.
 
 ### Performance
 
+- **Received payload buffers are reused instead of freed per message** (#84).
+  Subscriptions, services and clients hand each taken message's buffer back
+  and receive the next one into it. Freeing a large payload let glibc return
+  it to the kernel, and the next message page-faulted it back in, zeroed. In
+  the five-topic fan-in of `test/perf/bench_take_path`, CPU time per message
+  drops by about 55-60 % at 128 KB and 65-75 % at 256 KB to 1 MB, and minor
+  page faults go from about 250 per 1 MB message to none.
+- **Trade-off: endpoints keep that memory.** An endpoint keeps about its queue
+  depth of payload buffers (100 for a service or client), each as large as the
+  largest message it held, until it is destroyed; before, they went back to
+  the heap after each take. A KEEP_LAST depth-10 subscription that once held
+  ten 4 MB messages keeps about 40 MB.
 - **Large topic payloads are read straight from the publisher's shared-memory
   ring** (#86), as Fast DDS data sharing does. A KEEP_LAST subscription queues
   the payload's descriptor instead of copying the payload into a heap buffer,
