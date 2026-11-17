@@ -241,7 +241,7 @@ The shm object is **not** unlinked on a clean context shutdown. `rmw_context_fin
 
 Because multiple processes may start at the same instant, the creation and initialization handshake is what makes concurrent startup safe; it is described in full under Creation and the init handshake below.
 
-The header itself is small: the layout `version`, the `max_entries` count, a 64-bit `generation` counter that is bumped on every add, remove, and reclaim, and a single robust `pthread_mutex_t`. That mutex exists only for the one-time creation handshake. None of the hot paths (add, remove, query, cleanup) ever take it; they are lock-free and rely on per-slot atomics instead, which is why concurrent discovery activity from many processes does not serialize on a shared lock.
+The header itself is small: the layout `version`, the `max_entries` count, a 64-bit `generation` counter that is bumped on every add, remove, and reclaim, a single robust `pthread_mutex_t`, the `high_water_slot` bound on used slots, and the 4 KiB `doorbell_bits` bitmap (one bit per slot). That mutex exists only for the one-time creation handshake. None of the hot paths (add, remove, query, cleanup) ever take it; they are lock-free and rely on per-slot atomics instead, which is why concurrent discovery activity from many processes does not serialize on a shared lock.
 
 ### Registry layout
 
@@ -254,10 +254,12 @@ The registry is one POSIX shared-memory object per ROS domain, mapped `MAP_SHARE
   /dev/shm/ros2_uds_0          (POSIX shm, mmap'd MAP_SHARED into every process)
   ┌──────────────────────────────────────────────────────────────┐
   │ RegistryHeader                                                 │
-  │   version    = 3          (layout tag + init handshake)        │
+  │   version    = 5          (layout tag + init handshake)        │
   │   max_entries = 32768                                          │
   │   generation  = N         (bumped on every add/remove/reclaim) │
   │   init_mutex              (one-time creation handshake only)   │
+  │   high_water_slot         (bound on used slot indices)         │
+  │   doorbell_bits[512]      (4 KiB, 1 bit per slot = doorbell)   │
   ├──────────────────────────────────────────────────────────────┤
   │ slot[0]      RegistryEntrySlot  (1168 bytes)                   │
   │ slot[1]      RegistryEntrySlot                                 │
@@ -272,7 +274,8 @@ The registry is one POSIX shared-memory object per ROS domain, mapped `MAP_SHARE
   │ RegistryEntrySlot                                              │
   │   seq        (seqlock: even = stable, odd = mid-write)         │
   │   state      EMPTY | NODE | PUBLISHER | SUBSCRIPTION |         │
-  │              SERVICE | CLIENT   (RESERVED = claimed, uncommitted)│
+  │              SERVICE | CLIENT | DOORBELL                       │
+  │              (RESERVED = claimed, uncommitted)                 │
   │   pid        owning process (liveness check)                   │
   │   gid[16]    RMW GID                                           │
   │   node_name[256]                                               │
@@ -284,7 +287,7 @@ The registry is one POSIX shared-memory object per ROS domain, mapped `MAP_SHARE
   └──────────────────────────────────────────────────────────────┘
 ```
 
-The header is `RegistryHeader`. It holds four fields: an atomic `version` tag (currently `3`), the slot count `max_entries`, an atomic `generation` counter bumped on every add, remove, and reclaim, and a single `init_mutex`. The first three are integers at fixed offsets (0, 4, 8) guarded by `static_assert`. The `init_mutex` follows at offset 16. Its total size is deliberately not pinned by a `static_assert`, because `sizeof(pthread_mutex_t)` varies by C library and CPU architecture (56 bytes on glibc/x86_64). That mutex is taken only once, during the one-time creation handshake when the shm object is first initialized. None of the hot paths (add, remove, query, cleanup) ever touch it.
+The header is `RegistryHeader`. It holds an atomic `version` tag (currently `5`), the slot count `max_entries`, an atomic `generation` counter bumped on every add, remove, and reclaim, a single `init_mutex`, the `high_water_slot` bound on used slot indices, and `doorbell_bits`, a 4 KiB bitmap with one bit per slot that marks the slots holding a doorbell (see The doorbell under Wait set). The first three are integers at fixed offsets (0, 4, 8) guarded by `static_assert`. The `init_mutex` follows at offset 16. Its total size is deliberately not pinned by a `static_assert`, because `sizeof(pthread_mutex_t)` varies by C library and CPU architecture (56 bytes on glibc/x86_64). That mutex is taken only once, during the one-time creation handshake when the shm object is first initialized. None of the hot paths (add, remove, query, cleanup) ever touch it.
 
 After the header comes the slot array. There are `REGISTRY_MAX_ENTRIES = 32768` slots, each a `RegistryEntrySlot` of exactly `1168` bytes (pinned by `static_assert`, so a layout change forces a `REGISTRY_VERSION` bump). That is roughly 38 MB of slot array. The array starts at `sizeof(RegistryHeader)` bytes past the base pointer, so a slot index maps directly to an address with no indirection. A slot carries the entity type, owning PID, GID, node name and namespace, topic or service name, type string, the Unix socket path used to reach the endpoint, and the QoS fields. Each slot also begins with a per-slot seqlock (`seq`) and an atomic `state`, which is what lets the array be scanned without a lock.
 
@@ -551,15 +554,15 @@ To reach it, the context keeps a mutex-guarded list of every node's graph guard 
 
 A single atomic load can tell a *running* wait that the graph changed, but it cannot wake a *blocked* one: an mmap store is invisible to `epoll`. Something a mutation can touch must be a file descriptor in the sleeping process. The doorbell is that object, chosen over the alternatives (signals, cross-process eventfd passing, inotify, io_uring futex — each fails on hygiene, permissions, coverage, or container seccomp) because it reuses the one primitive this transport is already made of: an `AF_UNIX` datagram socket.
 
-Each context binds one doorbell socket at `rmw_init` (a `ctl_*` file beside the data sockets), but registers it in the registry as `ENTRY_DOORBELL` **lazily and interest-scoped**: on the first `rmw_wait` whose wait set contains one of the context's graph guard conditions or a matched event, or on the first matched event callback — i.e. only in processes that actually consume graph events (`wait_for_service`, rclcpp's GraphListener, rosbag2 discovery, a `matched` handler). With TRANSIENT_LOCAL replay pull-based, those are the only processes a registry mutation needs to wake, so a fleet launch rings approximately as many doorbells as there are graph-event consumers, not mutations x processes — the broadcast storm that motivated this scoping. The lazy registration runs strictly before that wait's generation check (the same register-before-snapshot ordering the eager `rmw_init` recipe used), on an already-bound socket, and a failed registration (registry full) is retried on the next wait rather than latched. Every registry mutation (add, remove, stale-slot reclaim — except mutations of doorbell slots themselves, which have no wake consumers), after bumping the generation counter, sends one octet to every registered doorbell, non-blocking and best-effort.
+Each context binds one doorbell socket at `rmw_init` (a `ctl_*` file beside the data sockets), but registers it in the registry as `ENTRY_DOORBELL` **lazily and interest-scoped**: on the first `rmw_wait` whose wait set contains one of the context's graph guard conditions or a matched event, or on the first matched event callback — i.e. only in processes that actually consume graph events (`wait_for_service`, rclcpp's GraphListener, rosbag2 discovery, a `matched` handler). With TRANSIENT_LOCAL replay pull-based, those are the only processes a registry mutation needs to wake, so a fleet launch rings approximately as many doorbells as there are graph-event consumers, not mutations x processes — the broadcast storm that motivated this scoping. The lazy registration runs strictly before that wait's generation check (the same register-before-snapshot ordering the eager `rmw_init` recipe used), on an already-bound socket, and a failed registration (registry full) is retried on the next wait rather than latched. Every registry mutation (add, remove, stale-slot reclaim — except mutations of doorbell slots themselves, which have no wake consumers), after bumping the generation counter, sends one octet to every registered doorbell, non-blocking and best-effort. It finds them through the header's `doorbell_bits` bitmap, not by walking the slots: a doorbell's bit is set before its add bumps the generation and cleared while its remover (or the stale-slot reaper) still holds the slot `ENTRY_RESERVED`, so a mutator that has bumped the generation sees every doorbell registered before its bump. Ringing therefore reads `high_water_slot / 64` contiguous words plus one seqlock snapshot per doorbell, instead of one strided `state` read (a cache miss, 1168 bytes apart) per used slot, which on a 7400-slot launch cost more per mutation than the datagrams themselves (#53).
 
 The correctness argument is one ordering pair. The writer rings strictly **after** the generation bump; the waiter drains its doorbell strictly **before** reading the generation. Any mutation therefore either lands in the generation value the waiter is about to read, or leaves a datagram queued on a level-triggered fd that makes the next `epoll_wait` return immediately. The datagram queues whether or not the target is currently blocked, so there is no check-then-block race to lose. The proof rests entirely on those two orderings; both call sites carry a comment saying so, and a regression test pins the behavior.
 
 Best-effort has sharp edges, each handled explicitly:
 
 - **A full receiver queue is success.** `EAGAIN` because the destination's queue is full means wakeups are already pending there; dropping the octet loses nothing.
-- **A slow peer must not mute the others.** `AF_UNIX` datagrams stay charged to the *sender's* buffer until the receiver consumes them, so one process that never drains (hung, or not yet waiting) could exhaust the ring socket's budget and make sends fail for every peer. On `EAGAIN` the ring socket is closed, recreated, and the send retried once: on a fresh socket, `EAGAIN` can only mean the benign case above. A test that wedges one participant and asserts a healthy one still gets latched delivery guards this.
-- **A recycled slot must not receive the octet.** The ring loop re-validates the slot type inside its seqlock window, so a slot that was a doorbell at the start of the scan but has been reused by a data endpoint cannot be sent to.
+- **A slow peer must not mute the others.** `AF_UNIX` datagrams stay charged to the *sender's* buffer until the receiver consumes them, so one process that never drains (hung, or not yet waiting) could exhaust the ring socket's budget and make sends fail for every peer. On `EAGAIN` the ring socket is closed, recreated, and the send retried once: on a fresh socket, `EAGAIN` can only mean the benign case above. No automated test drives this recreate path yet.
+- **A recycled slot must not receive the octet.** A set bit is only a hint. The ring loop re-validates the slot type inside its seqlock window, so a slot that was a doorbell when its bit was read but has been reused by a data endpoint cannot be sent to.
 - **The ring socket is per mutating thread** (thread-local, closed at thread exit), so ringing takes no lock and leaks nothing.
 
 Cleanup needs no new machinery: the doorbell is a PID-owned slot holding a socket path, so graceful shutdown removes it like any endpoint, and the existing stale-PID reaper reclaims it after a crash — slot teardown already unlinks the socket file.
