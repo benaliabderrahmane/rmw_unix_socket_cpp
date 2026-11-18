@@ -32,8 +32,8 @@ body:
       label: "ROS 2 distro:"
       options:
         - jazzy
-        - kilted
         - rolling
+        - lyrical
         - other (please state in Additional information)
     validations:
       required: true

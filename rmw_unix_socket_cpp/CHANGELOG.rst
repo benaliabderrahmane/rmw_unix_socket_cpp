@@ -71,6 +71,8 @@ four copies of the receive loop that hid the gap are one.
   drains had none.
 * ``DESIGN.md`` documents the listener thread and the ``delivery_fd`` ordering, and
   narrows the no-background-threads claim to what it now guarantees.
+* CI and the release workflow no longer build Kilted, and it gets no bloom track:
+  it reaches end of life around the end of 2026. Jazzy, Rolling and Lyrical remain.
 
 **Performance**
 

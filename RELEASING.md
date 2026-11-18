@@ -13,14 +13,15 @@ sudo apt install python3-bloom python3-catkin-pkg
 
 ## Supported distros
 
-`jazzy`, `kilted`, `rolling`, `lyrical` — one bloom track each, matching the CI
-and release workflow matrices. Kilted reaches end of life around the end of
-2026, and rosdistro takes no new release into an end-of-life distro: skip its
-track if the first release comes later.
+`jazzy`, `rolling`, `lyrical` — one bloom track each, matching the CI and
+release workflow matrices.
 
 **Not Humble.** `src/serialization.cpp` uses
 `eprosima::fastcdr::CdrVersion::DDS_CDR`, which is Fast CDR 2.x. Humble ships
 Fast CDR 1.0.x, where that enum does not exist.
+
+**Not Kilted.** It reaches end of life around the end of 2026, and rosdistro
+takes no new release into an end-of-life distro.
 
 ## Track answers (asked on each distro's `--new-track`)
 
@@ -36,7 +37,7 @@ bloom does not create the release repository: request it through
 `ros2-gbp/ros2-gbp-github-org` before the first release; empty is fine. Use that
 one repository for every track. Rolling only accepts a release repository in the
 `ros2-gbp` organisation, every ROS 2 distro accepts one there, and one repository
-keeps all four tracks in one `tracks.yaml`.
+keeps all three tracks in one `tracks.yaml`.
 
 The release tag matters: our tags are `v0.5.0` but `catkin_prepare_release`
 writes `0.5.0`, so a bare `:{version}` makes bloom look for a tag that isn't
@@ -53,7 +54,7 @@ exists to avoid. Cut 0.6.0 as below, with `--bump minor`, then open each track:
 bloom-release --new-track --rosdistro jazzy --track jazzy rmw_unix_socket_cpp
 ```
 
-and the same for `kilted`, `rolling` and `lyrical`: each distro's first release
+and the same for `rolling` and `lyrical`: each distro's first release
 needs `--new-track`, and bloom asks the questions above for it. Only this first
 rosdistro PR gets real scrutiny.
 
