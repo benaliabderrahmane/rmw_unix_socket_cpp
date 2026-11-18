@@ -272,6 +272,7 @@ rmw_ret_t rmw_take_response(
   while (!cli_data->response_queue.empty()) {
     auto msg = std::move(cli_data->response_queue.front());
     cli_data->response_queue.pop_front();
+    rmw_uds::PayloadRecycler recycle{cli_data->spare_payloads, msg.payload};
 
     if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
       cli_data->response_callbacks, ros_response))

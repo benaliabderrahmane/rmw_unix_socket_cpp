@@ -15,17 +15,21 @@
 #include "listener.hpp"
 
 #include "drain.hpp"
+#include "events.hpp"
 #include "logging.hpp"
 
 #include "rmw/error_handling.h"
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <new>
 #include <mutex>
 #include <system_error>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 namespace rmw_uds
@@ -50,11 +54,98 @@ static void drain_eventfd(int fd)
   }
 }
 
+static thread_local int t_own_delivery_fd = -1;
+
+OwnDeliveryFd::OwnDeliveryFd(int fd)
+: previous_(t_own_delivery_fd)
+{
+  t_own_delivery_fd = fd;
+}
+
+OwnDeliveryFd::~OwnDeliveryFd()
+{
+  t_own_delivery_fd = previous_;
+}
+
+void signal_delivery_fds(UdsContext * ctx)
+{
+  if (!ctx) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
+  uint64_t val = 1;
+  for (const int delivery_fd : ctx->delivery_fds) {
+    if (delivery_fd == t_own_delivery_fd) {
+      continue;
+    }
+    ssize_t ret = write(delivery_fd, &val, sizeof(val));
+    (void)ret;
+  }
+}
+
+// A matched callback listed while the registry was full has no doorbell to
+// watch (doorbell_watch_wanted). Retried after every listener pass - at most
+// once a second while the registry stays full, since a failed registry_add
+// scans for stale slots, and the loop then wakes on its own within the second
+// (listener_loop) - and immediately once a wait has registered the doorbell,
+// which wakes this thread. The watch is made under listener_mutex only while a
+// matched callback is still listed, so a concurrent clear, which unlists under
+// the same mutex before it unwatches, cannot be undone here; then the matched
+// events are recomputed for whatever the deaf window missed.
+static void retry_doorbell_watch(
+  UdsContext * ctx, std::chrono::steady_clock::time_point & last_try)
+{
+  if (!ctx->doorbell_watch_wanted.load(std::memory_order_acquire) || ctx->doorbell_fd < 0) {
+    return;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  if (!ctx->doorbell_registered.load(std::memory_order_acquire) &&
+    now - last_try < std::chrono::seconds(1))
+  {
+    return;
+  }
+  last_try = now;
+  if (!ensure_doorbell_registered(ctx)) {
+    return;
+  }
+  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  ctx->doorbell_watch_wanted.store(false, std::memory_order_relaxed);
+  if (ctx->graph_events.empty() || ctx->listener_targets.count(ctx->doorbell_fd) != 0) {
+    return;
+  }
+  struct epoll_event ev;
+  std::memset(&ev, 0, sizeof(ev));
+  ev.events = EPOLLIN;
+  ev.data.fd = ctx->doorbell_fd;
+  if (epoll_ctl(ctx->listener_epoll_fd, EPOLL_CTL_ADD, ctx->doorbell_fd, &ev) != 0 &&
+    errno != EEXIST)
+  {
+    ctx->doorbell_watch_wanted.store(true, std::memory_order_relaxed);  // the next pass retries
+    return;
+  }
+  try {
+    ctx->listener_targets[ctx->doorbell_fd] = ArmedEntry{ARMED_DOORBELL, nullptr, 0};
+  } catch (const std::bad_alloc &) {
+    // Not on the listener thread, where it would std::terminate: unwatch and
+    // let the next pass retry.
+    (void)epoll_ctl(ctx->listener_epoll_fd, EPOLL_CTL_DEL, ctx->doorbell_fd, nullptr);
+    ctx->doorbell_watch_wanted.store(true, std::memory_order_relaxed);
+    return;
+  }
+  notify_graph_events(ctx);
+}
+
 static void listener_loop(UdsContext * ctx)
 {
   struct epoll_event ready[16];
+  std::chrono::steady_clock::time_point last_doorbell_try{};
   while (ctx->listener_running.load(std::memory_order_acquire)) {
-    const int n = epoll_wait(ctx->listener_epoll_fd, ready, 16, -1);
+    // Event-driven: no timeout, except while a matched callback waits for a
+    // doorbell the full registry had no slot for. Then the loop also wakes
+    // within the second to retry, as rmw_wait bounds its block while its own
+    // doorbell is unregistered - a degraded state, polled until a slot frees.
+    const int timeout_ms = ctx->doorbell_watch_wanted.load(std::memory_order_acquire) ? 1000 : -1;
+    const int n = epoll_wait(ctx->listener_epoll_fd, ready, 16, timeout_ms);
     if (n < 0) {
       if (errno == EINTR) {
         continue;
@@ -71,14 +162,19 @@ static void listener_loop(UdsContext * ctx)
       const int fd = ready[i].data.fd;
       if (fd == ctx->listener_wake_fd) {
         drain_eventfd(fd);
-        continue;  // Watch-list change or stop; the loop condition re-checks.
+        // Watch-list change or stop - the loop condition re-checks - or a
+        // graph change another thread saw (listener_graph_changed), so
+        // recompute the matched events; one generation compare each if not.
+        if (ctx->listener_running.load(std::memory_order_acquire)) {
+          std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+          notify_graph_events(ctx);
+        }
+        continue;
       }
 
       // Held across the drain: listener_unwatch() takes this mutex, so a
       // thread destroying an endpoint blocks here until the drain - and the
-      // callback it fires - has returned. It also guards delivery_fds, so a
-      // wait set cannot be deregistered and closed between the enqueue and
-      // the signal below.
+      // callback it fires - has returned.
       std::lock_guard<std::mutex> lock(ctx->listener_mutex);
       auto it = ctx->listener_targets.find(fd);
       if (it == ctx->listener_targets.end()) {
@@ -99,6 +195,22 @@ static void listener_loop(UdsContext * ctx)
           enqueued = drain_endpoint(
             drain_target(static_cast<UdsClient *>(entry.entity)));
           break;
+        case ARMED_DOORBELL: {
+            // Watched while matched callbacks exist: a registry mutation
+            // somewhere. The rmw_waits read this socket too, so if this drain
+            // is what sees the generation move it fans the change out to them,
+            // exactly as rmw_wait does: the graph guard conditions, and every
+            // delivery_fd below.
+            uint8_t buf[16];
+            while (recv(fd, buf, sizeof(buf), MSG_DONTWAIT) > 0) {
+            }
+            if (observe_generation(ctx)) {
+              trigger_graph_gcs(ctx);
+              enqueued = 1;
+            }
+            notify_graph_events(ctx);
+            break;
+          }
         default:
           break;
       }
@@ -112,19 +224,21 @@ static void listener_loop(UdsContext * ctx)
       // a read drains the whole counter and would otherwise let the first wait
       // set to wake consume a credit another one needed.
       if (enqueued > 0) {
-        uint64_t val = 1;
-        for (const int delivery_fd : ctx->delivery_fds) {
-          ssize_t ret = write(delivery_fd, &val, sizeof(val));
-          (void)ret;
-        }
+        signal_delivery_fds(ctx);
       }
     }
+    // After the ready fds - so after the wake fd is drained: a retry flag set
+    // and woken for before the drain is seen here, and one set after it
+    // leaves the wake fd readable for the next pass. Checking first and
+    // draining after would consume a wake whose flag the check missed.
+    retry_doorbell_watch(ctx, last_doorbell_try);
   }
 }
 
 static void listener_release_fds(UdsContext * ctx)
 {
   if (ctx->listener_wake_fd >= 0) {
+    std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);  // see listener_graph_changed
     close(ctx->listener_wake_fd);
     ctx->listener_wake_fd = -1;
   }
@@ -145,7 +259,10 @@ static rmw_ret_t listener_start(UdsContext * ctx)
     RMW_SET_ERROR_MSG("failed to create listener epoll");
     return RMW_RET_ERROR;
   }
-  ctx->listener_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  {
+    std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);  // see listener_graph_changed
+    ctx->listener_wake_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+  }
   if (ctx->listener_wake_fd < 0) {
     listener_release_fds(ctx);
     RMW_SET_ERROR_MSG("failed to create listener eventfd");
@@ -222,7 +339,12 @@ rmw_ret_t listener_set_callback(
   // which epoll reports level-triggered, so datagrams that arrived between the
   // two are delivered rather than dropped or double-reported.
   if (!callback) {
-    listener_unwatch(ctx, t.fd);
+    // Another callback on a subscription may still need the socket drained.
+    if (!(kind == ARMED_SUBSCRIPTION &&
+      subscription_needs_listener(static_cast<UdsSubscription *>(entity))))
+    {
+      listener_unwatch(ctx, t.fd);
+    }
     return RMW_RET_OK;
   }
   const rmw_ret_t ret = listener_watch(ctx, t.fd, kind, entity, uid);
@@ -237,12 +359,30 @@ rmw_ret_t listener_set_callback(
   return ret;
 }
 
+void listener_graph_changed(UdsContext * ctx)
+{
+  if (!ctx || ctx->matched_events.load(std::memory_order_acquire) == 0) {
+    return;
+  }
+  signal_delivery_fds(ctx);
+  // Not under listener_mutex, which the listener holds across a whole drain:
+  // an rmw_wait that saw the change must not stall behind one. The wake fd is
+  // replaced and closed under delivery_fds_mutex too, so that is enough here.
+  // A listener with no matched callback recomputes an empty list.
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
+  if (ctx->listener_wake_fd >= 0) {
+    uint64_t val = 1;
+    ssize_t ret = write(ctx->listener_wake_fd, &val, sizeof(val));
+    (void)ret;
+  }
+}
+
 void listener_add_delivery_fd(UdsContext * ctx, int fd)
 {
   if (!ctx || fd < 0) {
     return;
   }
-  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
   ctx->delivery_fds.push_back(fd);
 }
 
@@ -251,7 +391,7 @@ void listener_remove_delivery_fd(UdsContext * ctx, int fd)
   if (!ctx || fd < 0) {
     return;
   }
-  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  std::lock_guard<std::mutex> lock(ctx->delivery_fds_mutex);
   auto & fds = ctx->delivery_fds;
   fds.erase(std::remove(fds.begin(), fds.end(), fd), fds.end());
 }
@@ -304,6 +444,18 @@ rmw_ret_t listener_watch(
   // notice them.
   wake_listener(ctx);
   return RMW_RET_OK;
+}
+
+rmw_ret_t listener_ensure_running(UdsContext * ctx)
+{
+  std::lock_guard<std::mutex> lock(ctx->listener_mutex);
+  // The same shutdown guard as listener_watch.
+  if (ctx->is_shutdown.load(std::memory_order_acquire) || ctx->listener_stopping ||
+    ctx->listener_running.load(std::memory_order_relaxed))
+  {
+    return RMW_RET_OK;
+  }
+  return listener_start(ctx);
 }
 
 void listener_unwatch(UdsContext * ctx, int fd)

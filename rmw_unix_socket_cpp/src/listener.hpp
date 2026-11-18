@@ -37,9 +37,9 @@ namespace rmw_uds
 // A listener callback runs on this thread, and listener_mutex is one per
 // CONTEXT and is held across the drain that fires it. So the restriction is
 // context-wide, not endpoint-local: a callback must not block, and must not
-// destroy, register on, or clear the callback of ANY endpoint in the context,
-// nor create or destroy a wait set - each of those takes listener_mutex and
-// would deadlock against the drain it was called from. Calling rmw_take on its
+// destroy, register on, or clear the callback of ANY endpoint in the context -
+// each of those takes listener_mutex and would deadlock against the drain it
+// was called from. Calling rmw_take on its
 // own endpoint IS allowed: drain_endpoint releases both drain_mutex and
 // queue_mutex before it notifies, so a callback runs holding only
 // callback_mutex. rclcpp's callbacks only push to a queue, which is what the
@@ -52,6 +52,11 @@ namespace rmw_uds
 // rmw_wait.
 rmw_ret_t listener_watch(
   UdsContext * ctx, int fd, uint8_t kind, void * entity, uint64_t uid);
+
+// Start the context's listener thread if it is not running yet, with nothing
+// watched but its wake fd - for a matched callback that has no doorbell yet
+// and needs the thread to retry one (doorbell_watch_wanted).
+rmw_ret_t listener_ensure_running(UdsContext * ctx);
 
 // Stop watching `fd`. Blocks until an in-flight drain has returned - of any
 // endpoint, since listener_mutex is per context - so the caller may destroy
@@ -78,6 +83,35 @@ rmw_ret_t listener_set_callback(
 // listener writes into a recycled fd number.
 void listener_add_delivery_fd(UdsContext * ctx, int fd);
 void listener_remove_delivery_fd(UdsContext * ctx, int fd);
+
+// Wake every live wait set: signal each delivery eventfd, except the one an
+// OwnDeliveryFd on this thread names. Safe from any thread under any lock - it
+// takes only delivery_fds_mutex, a leaf lock.
+void signal_delivery_fds(UdsContext * ctx);
+
+// While alive, signal_delivery_fds() on this thread skips `fd`. rmw_wait holds
+// one for its own wait set: it re-checks its queues and events after every
+// point that signals, so a signal to itself only costs an extra epoll pass, or
+// a spurious wake on its next call. Nests: a wait inside a callback inside a
+// wait restores the outer one's fd on exit.
+class OwnDeliveryFd
+{
+public:
+  explicit OwnDeliveryFd(int fd);
+  ~OwnDeliveryFd();
+  OwnDeliveryFd(const OwnDeliveryFd &) = delete;
+  OwnDeliveryFd & operator=(const OwnDeliveryFd &) = delete;
+
+private:
+  int previous_;
+};
+
+// A graph change was observed (see observe_generation). If the context has
+// matched events, signal every wait set's delivery_fd and wake the listener,
+// so whichever of them holds one recomputes it. Takes only delivery_fds_mutex,
+// never listener_mutex, so an rmw_wait that saw the change never stalls
+// behind a listener drain; a no-op while the context has no matched event.
+void listener_graph_changed(UdsContext * ctx);
 
 // Stop and join the thread and release its fds. Idempotent, and a no-op when
 // the thread was never started.

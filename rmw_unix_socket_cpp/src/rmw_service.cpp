@@ -201,6 +201,7 @@ rmw_ret_t rmw_take_request(
   while (!srv_data->request_queue.empty()) {
     auto msg = std::move(srv_data->request_queue.front());
     srv_data->request_queue.pop_front();
+    rmw_uds::PayloadRecycler recycle{srv_data->spare_payloads, msg.payload};
 
     if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
       srv_data->request_callbacks, ros_request))

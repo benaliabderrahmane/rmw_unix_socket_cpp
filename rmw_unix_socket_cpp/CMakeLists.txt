@@ -222,10 +222,14 @@ if(BUILD_TESTING)
   target_include_directories(test_rmw_qos PRIVATE src)
   target_compile_definitions(test_rmw_qos PRIVATE RMW_TEST_DOMAIN_ID=106)
 
-  # RMW API: publisher/subscription events
-  ament_add_gtest(test_rmw_event test/test_rmw_event.cpp)
+  # RMW API: publisher/subscription events. registry.cpp is compiled in, as in
+  # test_registry, so a test can fill the registry (the library hides it).
+  ament_add_gtest(test_rmw_event test/test_rmw_event.cpp src/registry.cpp)
   target_link_libraries(test_rmw_event ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_event PRIVATE src)
+  # Own domain: a test here clamps and fills the registry, which must not
+  # starve another test binary of slots in a parallel ctest run.
+  target_compile_definitions(test_rmw_event PRIVATE RMW_TEST_DOMAIN_ID=107)
 
   # RMW API: on_new_message / on_new_request / on_new_response listener
   # callbacks, which every drain path must fire.
@@ -239,6 +243,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_rmw_cross_process ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_cross_process PRIVATE src)
 
+  # Benchmark (standalone, not a ctest): cost of one registry mutation on a
+  # populated registry, ring_doorbells included (issue #53). It recreates the
+  # registry of its domain (default 231, unused by the tests).
+  add_executable(bench_registry_ring test/perf/bench_registry_ring.cpp src/registry.cpp)
+  target_link_libraries(bench_registry_ring ${_unit_test_deps})
+  target_include_directories(bench_registry_ring PRIVATE src)
+
   # Benchmark (standalone, not a ctest — run manually; see test/perf/README):
   # publish-side staging cost of serialize-into-ring vs serialize-then-copy.
   add_executable(bench_serialize_into_ring
@@ -247,6 +258,11 @@ if(BUILD_TESTING)
   target_link_libraries(bench_serialize_into_ring
     ${_unit_test_deps} ${_test_msg_deps})
   target_include_directories(bench_serialize_into_ring PRIVATE src)
+
+  # Benchmark (standalone, not a ctest): CPU time and page faults per
+  # publish + take round trip through the public API (#84).
+  add_executable(bench_take_path test/perf/bench_take_path.cpp)
+  target_link_libraries(bench_take_path ${_rmw_test_libs} ${_test_msg_deps})
 endif()
 
 ament_package()

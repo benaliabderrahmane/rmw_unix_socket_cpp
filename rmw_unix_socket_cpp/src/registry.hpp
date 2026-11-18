@@ -34,7 +34,9 @@ static constexpr uint32_t REGISTRY_MAX_ENTRIES = 32768;
 // Layout v3: per-slot seqlock + atomic state. No global mutex on hot paths.
 // Layout v4: adds a monotonic high_water_slot bound to the header so query and
 // cleanup scan only the used slot prefix instead of all REGISTRY_MAX_ENTRIES.
-static constexpr uint32_t REGISTRY_VERSION = 4;
+// Layout v5: adds the doorbell_bits bitmap to the header so ring_doorbells
+// visits only doorbell slots instead of every slot below high_water_slot.
+static constexpr uint32_t REGISTRY_VERSION = 5;
 
 enum RegistryEntryType : uint8_t
 {
@@ -173,6 +175,12 @@ struct RegistryHeader
   // query/cleanup scan only [0, high_water_slot) instead of all max_entries.
   // Only grows; over-scan is always safe, so reads need no strict ordering.
   std::atomic<uint32_t> high_water_slot;
+  // Bit i set = slot i may hold an ENTRY_DOORBELL. Set before the adding
+  // generation bump, cleared while the remover still holds the slot RESERVED,
+  // so a mutation sees every doorbell registered before its own bump. A set
+  // bit is only a hint: ring_doorbells re-checks the slot's type under its
+  // seqlock, as it did when it scanned every slot.
+  std::atomic<uint64_t> doorbell_bits[REGISTRY_MAX_ENTRIES / 64];
 };
 
 // Header layout guard: only the integer prefix is asserted. The total size

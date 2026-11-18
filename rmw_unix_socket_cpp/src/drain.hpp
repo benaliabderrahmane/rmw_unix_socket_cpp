@@ -23,6 +23,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <vector>
 
 namespace rmw_uds
 {
@@ -55,6 +56,10 @@ struct DrainTarget
   std::mutex * drain_mutex = nullptr;
   std::mutex * queue_mutex = nullptr;
   std::deque<ReceivedMessage> * queue = nullptr;
+  // The endpoint's spare buffers (guarded by *queue_mutex) and the buffer
+  // the drain receives into (guarded by *drain_mutex). See SparePayloads.
+  SparePayloads * spares = nullptr;
+  std::vector<uint8_t> * recv_payload = nullptr;
   // Trim the queue to this many entries after each push.
   size_t max_depth = SERVICE_QUEUE_DEPTH;
   // The WireHeader::msg_type this endpoint accepts: 0 topic, 1 request,
@@ -67,9 +72,15 @@ struct DrainTarget
   // Subscriptions only: rmw_subscription_options_t::ignore_local_publications.
   bool ignore_local = false;
   uint64_t context_id = 0;
-  // Subscriptions only: TRANSIENT_LOCAL replay dedup. Read under
-  // *queue_mutex, which is what guards the map itself.
+  // Subscriptions only: TRANSIENT_LOCAL replay dedup. Written only while the
+  // subscription is created, before any drain can run; a drain looks a
+  // publisher up once, under *queue_mutex, and reads the entry it found after.
   std::map<std::array<uint8_t, 16>, int64_t> * replay_watermarks = nullptr;
+  // Subscriptions only: message_lost. The highest sequence number seen per
+  // publisher GID, guarded by *drain_mutex; what a drain finds missing is
+  // handed to record_message_lost(lost_sub) after it releases that mutex.
+  std::map<std::array<uint8_t, 16>, int64_t> * last_sequence = nullptr;
+  UdsSubscription * lost_sub = nullptr;
   // Fired under *callback_mutex once per drain that grew the queue, with the
   // number of entries it gained. Null on endpoints with no listener callback.
   std::recursive_mutex * callback_mutex = nullptr;

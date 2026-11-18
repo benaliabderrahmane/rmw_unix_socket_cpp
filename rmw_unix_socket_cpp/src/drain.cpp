@@ -14,12 +14,14 @@
 
 #include "drain.hpp"
 
+#include "events.hpp"
 #include "logging.hpp"
 #include "shm_transport.hpp"
 #include "transport.hpp"
 
 #include <chrono>
 #include <cstring>
+#include <new>
 #include <utility>
 #include <vector>
 
@@ -39,6 +41,8 @@ DrainTarget drain_target(UdsSubscription * sub)
   t.drain_mutex = &sub->drain_mutex;
   t.queue_mutex = &sub->queue_mutex;
   t.queue = &sub->message_queue;
+  t.spares = &sub->spare_payloads;
+  t.recv_payload = &sub->recv_payload;
   t.max_depth = sub->queue_depth;
   t.msg_type = 0;
   t.shm_cache = &sub->shm_cache;
@@ -46,6 +50,8 @@ DrainTarget drain_target(UdsSubscription * sub)
   t.ignore_local = sub->ignore_local_publications;
   t.context_id = sub->context->context_id;
   t.replay_watermarks = &sub->replayed_watermarks;
+  t.last_sequence = &sub->last_sequence;
+  t.lost_sub = sub;
   t.callback_mutex = &sub->callback_mutex;
   t.callback = &sub->on_new_message_cb;
   t.callback_user_data = &sub->on_new_message_user_data;
@@ -60,6 +66,8 @@ DrainTarget drain_target(UdsService * srv)
   t.drain_mutex = &srv->drain_mutex;
   t.queue_mutex = &srv->queue_mutex;
   t.queue = &srv->request_queue;
+  t.spares = &srv->spare_payloads;
+  t.recv_payload = &srv->recv_payload;
   t.max_depth = SERVICE_QUEUE_DEPTH;
   t.msg_type = 1;
   t.shm_cache = &srv->shm_cache;
@@ -78,6 +86,8 @@ DrainTarget drain_target(UdsClient * cli)
   t.drain_mutex = &cli->drain_mutex;
   t.queue_mutex = &cli->queue_mutex;
   t.queue = &cli->response_queue;
+  t.spares = &cli->spare_payloads;
+  t.recv_payload = &cli->recv_payload;
   t.max_depth = SERVICE_QUEUE_DEPTH;
   t.msg_type = 2;
   t.shm_cache = &cli->shm_cache;
@@ -93,6 +103,7 @@ size_t drain_endpoint(const DrainTarget & t)
 {
   size_t enqueued = 0;
   size_t dropped = 0;
+  size_t lost = 0;
 
   // Scoped to the receive loop only. It serialises drains of this endpoint:
   // recv_from() runs outside queue_mutex, so without it the listener thread
@@ -105,13 +116,100 @@ size_t drain_endpoint(const DrainTarget & t)
     std::lock_guard<std::mutex> drain_lock(*t.drain_mutex);
 
     WireHeader hdr;
-    std::vector<uint8_t> payload;
+    // Received into a spare buffer when there is one: no allocation, and no
+    // page faults on a buffer the heap just gave back. Taken under queue_mutex.
+    std::vector<uint8_t> & payload = *t.recv_payload;
+    auto take_spare = [&]() {
+        if (!t.spares->empty()) {
+          payload = std::move(t.spares->back());
+          t.spares->pop_back();
+        }
+      };
+    if (payload.capacity() == 0) {
+      // try_lock: a take deserializes under queue_mutex, and a drain that
+      // finds the socket empty must not wait on it. Contended, it allocates.
+      std::unique_lock<std::mutex> lock(*t.queue_mutex, std::try_to_lock);
+      if (lock.owns_lock()) {
+        take_spare();
+      }
+    }
+    // The publisher the two lookups below were made for. A drain usually
+    // carries one publisher's datagrams back to back, so each map is searched
+    // once per publisher per drain, not per datagram; std::map entries never
+    // move, so the pointers stay valid.
+    std::array<uint8_t, 16> cached_key{};
+    bool cached = false;
+    int64_t * seen = nullptr;             // message_lost: its high-water mark
+    const int64_t * watermark = nullptr;  // TRANSIENT_LOCAL: its pull watermark
 
     while (recv_from(t.fd, hdr, payload)) {
       if ((hdr.msg_type & ~SHM_PAYLOAD_FLAG) != t.msg_type) {
         continue;
       }
-      if (t.replay_watermarks) {
+      // Checked before the descriptor resolve, for the same reason the dedup
+      // below is: is_same_context() reads only WireHeader::gid, so an ignored
+      // large payload need never be mapped and copied out of the sender's ring.
+      // And before the gap check: what this subscription drops on purpose
+      // cannot be lost to it.
+      if (t.ignore_local && is_same_context(hdr, t.context_id)) {
+        continue;  // ignore_local_publications: drop same-context publications
+      }
+      std::array<uint8_t, 16> key;
+      std::memcpy(key.data(), hdr.gid, key.size());
+      if (!cached || key != cached_key) {
+        cached_key = key;
+        cached = true;
+        seen = nullptr;
+        watermark = nullptr;
+        if (t.replay_watermarks) {
+          std::lock_guard<std::mutex> lock(*t.queue_mutex);
+          auto w = t.replay_watermarks->find(key);
+          if (w != t.replay_watermarks->end()) {
+            watermark = &w->second;
+          }
+        }
+      }
+      bool fresh = false;  // a publish newer than any seen from its publisher
+      if (t.last_sequence && hdr.sequence_number > 0) {
+        // message_lost. A publisher numbers each publish once, for every
+        // subscriber, in send order (UdsPublisher::send_mutex), so a jump in
+        // its sequence is datagrams that never arrived here (the kernel
+        // dropped them, or the sender did on a full socket). Checked before
+        // the dedup below, which drops on purpose. The first datagram from a
+        // publisher only sets the baseline. Publishers number from 1, so a
+        // number below that is not one of their publishes, and keeping it out
+        // keeps the arithmetic below on wire values from overflowing.
+        const int64_t seq = hdr.sequence_number;  // packed: no reference to it
+        if (!seen) {
+          auto it = t.last_sequence->find(key);
+          if (it == t.last_sequence->end()) {
+            // The baseline is the first datagram - or, for a TRANSIENT_LOCAL
+            // late joiner, the creation-time pull's watermark when higher:
+            // sequences up to it came through the pull, not the socket.
+            int64_t base = seq - 1;
+            if (watermark && *watermark > base) {
+              base = *watermark;
+            }
+            try {
+              it = t.last_sequence->emplace(key, base).first;
+            } catch (const std::bad_alloc &) {
+              // Out of memory: skip this datagram's check rather than let the
+              // exception escape a C entry point or the listener thread. The
+              // next datagram from the publisher tries again.
+              it = t.last_sequence->end();
+            }
+          }
+          seen = it == t.last_sequence->end() ? nullptr : &it->second;
+        }
+        if (seen && seq > *seen) {
+          // Unsigned: exact for any seq > seen, whatever the wire carried.
+          lost += static_cast<size_t>(
+            static_cast<uint64_t>(seq) - static_cast<uint64_t>(*seen) - 1);
+          *seen = seq;
+          fresh = true;
+        }
+      }
+      if (watermark && hdr.sequence_number <= *watermark) {
         // TRANSIENT_LOCAL dedup: drop this datagram when its sample was already
         // delivered by the creation-time pull - the sender's GID has a watermark
         // and the sequence number is at or below it. Sequence numbers are
@@ -121,32 +219,32 @@ size_t drain_endpoint(const DrainTarget & t)
         // publisher's ring at pull time - history DDS would not owe a late
         // joiner either. Checked before the descriptor resolve so a duplicate
         // never maps a segment.
-        std::array<uint8_t, 16> key;
-        std::memcpy(key.data(), hdr.gid, key.size());
-        bool dup = false;
-        {
-          std::lock_guard<std::mutex> lock(*t.queue_mutex);
-          auto it = t.replay_watermarks->find(key);
-          dup = it != t.replay_watermarks->end() &&
-            hdr.sequence_number <= it->second;
-        }
-        if (dup) {
-          continue;
-        }
+        continue;
       }
-      // Checked before the descriptor resolve, for the same reason the dedup
-      // above is: is_same_context() reads only WireHeader::gid, so an ignored
-      // large payload need never be mapped and copied out of the sender's ring.
-      if (t.ignore_local && is_same_context(hdr, t.context_id)) {
-        continue;  // ignore_local_publications: drop same-context publications
-      }
-      if (!shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload)) {
-        continue;  // shm descriptor unresolvable (sender gone / ring lapped)
+      // A KEEP_LAST subscription queues a large payload's descriptor and its
+      // take reads the ring record (#86). Services and clients have no
+      // message_lost to report a lapped record to, and a KEEP_ALL subscription
+      // must not lose what it already received, so they copy it out now.
+      ReceivedMessage msg;
+      const bool in_ring = t.lost_sub && (hdr.msg_type & SHM_PAYLOAD_FLAG) &&
+        t.lost_sub->qos.history != RMW_QOS_POLICY_HISTORY_KEEP_ALL;
+      if (in_ring ?
+        !shm_pin_payload(*t.shm_cache, t.domain_id, payload, msg.shm_desc) :
+        !shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload))
+      {
+        // shm descriptor unresolvable (sender gone / ring lapped): the
+        // datagram arrived but the message is gone, so it counts as lost -
+        // once, and only as a publish the gap check had not already passed.
+        lost += fresh ? 1 : 0;
+        continue;
       }
 
-      ReceivedMessage msg;
       msg.header = hdr;
-      msg.payload = std::move(payload);
+      if (in_ring) {
+        msg.header.payload_size = msg.shm_desc.payload_size;
+      } else {
+        msg.payload = std::move(payload);
+      }
       msg.received_timestamp_ns = received_now_ns();
 
       bool overflow = false;
@@ -157,9 +255,31 @@ size_t drain_endpoint(const DrainTarget & t)
         // because the take() side isn't keeping up. This is the rcl-layer
         // equivalent of "slow subscriber".
         while (t.queue->size() > t.max_depth) {
+          if (t.lost_sub && (t.queue->front().header.msg_type & SHM_PAYLOAD_FLAG)) {
+            shm_unpin(*t.shm_cache, t.queue->front().shm_desc);
+          }
+          recycle_payload(*t.spares, t.queue->front().payload);
           t.queue->pop_front();
           ++dropped;
           overflow = true;
+        }
+        // Queued records the publisher has since overwritten can no longer be
+        // delivered: drop them now, so the take credit below counts only what a
+        // take can still return. shortcut: checks the front only, so a lapped
+        // record behind another publisher's live one costs a credit until it
+        // reaches the front.
+        while (t.lost_sub && !t.queue->empty() &&
+          (t.queue->front().header.msg_type & SHM_PAYLOAD_FLAG) &&
+          shm_pinned_lapped(*t.shm_cache, t.queue->front().shm_desc))
+        {
+          shm_unpin(*t.shm_cache, t.queue->front().shm_desc);
+          recycle_payload(*t.spares, t.queue->front().payload);
+          t.queue->pop_front();
+          ++dropped;
+          ++lost;
+        }
+        if (payload.capacity() == 0) {
+          take_spare();  // for the next datagram (a pinned one left it in place)
         }
       }
 
@@ -174,6 +294,12 @@ size_t drain_endpoint(const DrainTarget & t)
     }
   }
 
+  // With drain_mutex released, like the notification below. Signals every
+  // wait set itself, so the return value below counts enqueues only.
+  if (lost > 0 && t.lost_sub) {
+    record_message_lost(t.lost_sub, lost);
+  }
+
   // One notification for the whole batch. rmw_event_callback_t takes the
   // number of events since it was last called and must never be handed zero
   // (rmw/event_callback_type.h), so a drain that gained nothing stays silent
@@ -182,9 +308,10 @@ size_t drain_endpoint(const DrainTarget & t)
   // The count is how much the queue GREW, not how many datagrams the socket
   // handed over. number_of_events is a take credit - the executor calls take()
   // once per event - so an overflow that pushed 100 and popped 90 must report
-  // 10, or the executor spends 90 takes finding nothing. At most one pop per
-  // push, so dropped never exceeds enqueued.
-  const size_t gained = enqueued - dropped;
+  // 10, or the executor spends 90 takes finding nothing. Lapped records
+  // dropped here may have been credited by an earlier drain, so dropped can
+  // exceed enqueued.
+  const size_t gained = enqueued > dropped ? enqueued - dropped : 0;
   if (gained == 0 || !t.callback_mutex) {
     return enqueued;
   }
