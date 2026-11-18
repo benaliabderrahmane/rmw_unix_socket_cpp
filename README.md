@@ -4,8 +4,9 @@ A lightweight, **localhost-only** RMW (ROS Middleware) implementation for ROS 2,
 built on Unix domain sockets and POSIX shared memory instead of DDS.
 
 It targets single-machine deployments with many nodes (150+ in production) and a
-small, deterministic resource footprint — no DDS, no daemon, no background
-threads. Discovery is a shared-memory registry; data moves over `AF_UNIX`
+small, deterministic resource footprint — no DDS, no daemon, and no background
+thread unless your executor asks to be called back. Discovery is a shared-memory
+registry; data moves over `AF_UNIX`
 datagram sockets; the wait set is `epoll` + `eventfd`.
 
 ## When to use it (and when not)
@@ -22,9 +23,9 @@ datagram sockets; the wait set is `epoll` + `eventfd`.
 
 ## Status
 
-- ROS 2 **Jazzy**, **Kilted**, **Rolling**, and **Lyrical** — built and tested in CI.
-- **Linux / x86_64 only** (uses `epoll`, `eventfd`, `/dev/shm`, `AF_UNIX`).
-- Version `0.5.0`, Apache-2.0.
+- ROS 2 **Jazzy**, **Rolling**, and **Lyrical** — built and tested in CI.
+- **Linux** on **x86_64** and **aarch64** (uses `epoll`, `eventfd`, `/dev/shm`, `AF_UNIX`).
+- Version `0.6.0`, Apache-2.0.
 
 ## Quick start
 
@@ -55,9 +56,11 @@ nodes that need to communicate must select the same RMW — there is no DDS brid
 | **Transport** | `SOCK_DGRAM` Unix domain sockets in `/tmp/ros2_uds/<domain_id>/`. Message boundaries are free; no connection management. |
 | **Discovery** | Single shared-memory file `/dev/shm/ros2_uds_<domain_id>`. No daemon, no multicast. |
 | **Locking** | Lock-free registry (per-slot seqlock + atomic state machine); process-local caches use a plain mutex. |
-| **Wait** | `epoll` over socket fds + `eventfd` guard conditions. **No background threads** — all I/O happens inside `rmw_wait`. |
+| **Wait** | `epoll` over socket fds + `eventfd` guard conditions. I/O happens inside `rmw_wait`, so a waiting executor gets **no background threads**. |
+| **Callbacks** | An endpoint that registers a listener callback is drained by one per-context listener thread, started on that first registration — what `EventsExecutor` needs, since it never calls `rmw_wait`. |
 | **Serialization** | CDR via `fastcdr` + `rosidl_typesupport_fastrtps` (the same path as the DDS RMWs). |
 | **Stale cleanup** | Dead processes are detected via `/proc/<pid>`; their registry entries and socket files are reclaimed on init and on every discovery query. |
+| **Tracing** | Emits the standard `tracetools` rmw tracepoints (`rmw_publish`, `rmw_take`, `rmw_publisher_init`, `rmw_subscription_init`), so `ros2 trace`, Trace Compass and CARET follow a message across processes on this RMW exactly as they do on the DDS RMWs. |
 
 Every choice — including the ones that were tried and abandoned — is written up
 with rationale in **[DESIGN.md](rmw_unix_socket_cpp/DESIGN.md)**.
@@ -140,7 +143,16 @@ for the full rationale.
 Localhost only; Linux only; no DDS interoperability. Loaned (zero-copy) messages,
 dynamic message types, network flow endpoints, and content filtering return
 `RMW_RET_UNSUPPORTED`. `deadline`, `lifespan`, and `liveliness` QoS are accepted
-but not enforced. The full list and the reasoning behind each is in
+but not enforced. Of the QoS status events, `message_lost` and both `matched`
+events are reported; deadline, liveliness, incompatible-QoS and
+incompatible-type are refused with `RMW_RET_UNSUPPORTED`. Deadline and liveliness
+need a clock nothing here runs, and this transport delivers to every
+subscription on a topic whatever its QoS or type, so an incompatible-QoS event
+would report a failure that does not happen (#92 plans QoS- and type-aware
+matching). `rclcpp` catches the refusal for
+the handlers it installs by default (with a warning per handler on kilted and
+later); on jazzy, a handler for a refused type that the application registers
+itself throws. The listener callbacks an `EventsExecutor` needs are supported. The full list and the reasoning behind each is in
 [DESIGN.md → Limitations and Unsupported Features](rmw_unix_socket_cpp/DESIGN.md#limitations-and-unsupported-features).
 
 ## Documentation

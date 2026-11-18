@@ -360,7 +360,7 @@ DurableShmSegment::~DurableShmSegment()
 
 // Map (or find the cached mapping of) the segment a descriptor names.
 // Returns nullptr when the segment is gone or fails validation.
-static const ShmReaderCache::Mapping * map_segment(
+static ShmReaderCache::Mapping * map_segment(
   ShmReaderCache & cache, size_t domain_id, const ShmPayloadDescriptor & desc)
 {
   const ShmReaderCache::Key key{desc.owner_pid, desc.owner_id, desc.segment_id};
@@ -376,7 +376,10 @@ static const ShmReaderCache::Mapping * map_segment(
   if (cache.mappings.size() >= 8) {
     for (auto stale = cache.mappings.begin(); stale != cache.mappings.end(); ) {
       int probe = shm_open(stale->second.shm_name.c_str(), O_RDONLY, 0);
-      if (probe < 0 && errno == ENOENT) {
+      if (probe < 0 && errno == ENOENT && stale->second.pins > 0) {
+        stale->second.superseded = true;  // queued messages still read it
+        ++stale;
+      } else if (probe < 0 && errno == ENOENT) {
         munmap(stale->second.base, stale->second.size);
         stale = cache.mappings.erase(stale);
       } else {
@@ -441,6 +444,13 @@ static const ShmReaderCache::Mapping * map_segment(
       stale->first.owner_id == desc.owner_id &&
       stale->first.segment_id != desc.segment_id)
     {
+      if (stale->second.pins > 0) {
+        // Queued messages still read it. The publisher never writes an old
+        // generation again, so their records stay intact; the last unpin unmaps.
+        stale->second.superseded = true;
+        ++stale;
+        continue;
+      }
       munmap(stale->second.base, stale->second.size);
       stale = cache.mappings.erase(stale);
     } else {
@@ -458,25 +468,15 @@ static const ShmReaderCache::Mapping * map_segment(
   return &cache.mappings.emplace(key, std::move(mapping)).first->second;
 }
 
-bool shm_fetch_payload(
-  ShmReaderCache & cache,
-  size_t domain_id,
-  std::vector<uint8_t> & payload_io)
+// The record a descriptor names, mapped, bounds-checked and still carrying
+// desc.seq; nullptr when the message is gone. Caller holds cache.mutex.
+static const ShmRecordHeader * find_record(
+  ShmReaderCache & cache, size_t domain_id, const ShmPayloadDescriptor & desc,
+  ShmReaderCache::Mapping ** mapping_out)
 {
-  if (payload_io.size() != sizeof(ShmPayloadDescriptor)) {
-    RMW_UDS_LOG_WARN_THROTTLE(
-      5000, "shm descriptor datagram has wrong size (%zu) — dropped",
-      payload_io.size());
-    return false;
-  }
-  ShmPayloadDescriptor desc;
-  std::memcpy(&desc, payload_io.data(), sizeof(desc));
-
-  std::lock_guard<std::mutex> lock(cache.mutex);
-
-  const ShmReaderCache::Mapping * mapping = map_segment(cache, domain_id, desc);
+  ShmReaderCache::Mapping * mapping = map_segment(cache, domain_id, desc);
   if (!mapping) {
-    return false;
+    return nullptr;
   }
 
   // Bounds-check the descriptor against the capacity snapshotted at map
@@ -491,30 +491,183 @@ bool shm_fetch_payload(
     RMW_UDS_LOG_WARN_THROTTLE(
       5000, "shm descriptor out of bounds (offset %llu, size %u) — dropped",
       static_cast<unsigned long long>(desc.offset), desc.payload_size);
-    return false;
+    return nullptr;
   }
 
   const auto * record = reinterpret_cast<const ShmRecordHeader *>(
     mapping->base + sizeof(ShmRingHeader) + desc.offset);
 
   // Seqlock read (registry protocol): the record must carry the expected
-  // stable seq before the copy and still carry it after. Anything else means
-  // the publisher lapped the ring and reused the slot — a clean drop.
+  // stable seq before the payload is read and still carry it after. Anything
+  // else means the publisher lapped the ring and reused the slot — a clean drop.
   if (record->seq.load(std::memory_order_acquire) != desc.seq ||
     record->payload_len != desc.payload_size)
   {
+    return nullptr;
+  }
+  *mapping_out = mapping;
+  return record;
+}
+
+// The second half of the seqlock read: true when the record still carries
+// desc.seq after its payload was read.
+static bool record_unchanged(const ShmRecordHeader * record, const ShmPayloadDescriptor & desc)
+{
+  // The fence keeps the payload loads above from sinking below the re-check
+  // on weakly-ordered CPUs; a bare acquire load only pins later accesses.
+  std::atomic_thread_fence(std::memory_order_acquire);
+  return record->seq.load(std::memory_order_relaxed) == desc.seq;
+}
+
+static bool parse_descriptor(const std::vector<uint8_t> & bytes, ShmPayloadDescriptor & desc)
+{
+  if (bytes.size() != sizeof(ShmPayloadDescriptor)) {
+    RMW_UDS_LOG_WARN_THROTTLE(
+      5000, "shm descriptor datagram has wrong size (%zu) — dropped", bytes.size());
+    return false;
+  }
+  std::memcpy(&desc, bytes.data(), sizeof(desc));
+  return true;
+}
+
+bool shm_fetch_payload(
+  ShmReaderCache & cache,
+  size_t domain_id,
+  std::vector<uint8_t> & payload_io)
+{
+  ShmPayloadDescriptor desc;
+  if (!parse_descriptor(payload_io, desc)) {
+    return false;
+  }
+
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  ShmReaderCache::Mapping * mapping = nullptr;
+  const ShmRecordHeader * record = find_record(cache, domain_id, desc, &mapping);
+  if (!record) {
     return false;
   }
   payload_io.assign(
     reinterpret_cast<const uint8_t *>(record + 1),
     reinterpret_cast<const uint8_t *>(record + 1) + desc.payload_size);
-  // The fence keeps the payload loads above from sinking below the re-check
-  // on weakly-ordered CPUs; a bare acquire load only pins later accesses.
-  std::atomic_thread_fence(std::memory_order_acquire);
-  if (record->seq.load(std::memory_order_relaxed) != desc.seq) {
-    return false;  // overwritten mid-copy; payload_io holds torn bytes
+  return record_unchanged(record, desc);  // false: payload_io holds torn bytes
+}
+
+bool shm_pin_payload(
+  ShmReaderCache & cache,
+  size_t domain_id,
+  const std::vector<uint8_t> & descriptor_bytes,
+  ShmPayloadDescriptor & desc_out)
+{
+  if (!parse_descriptor(descriptor_bytes, desc_out)) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  ShmReaderCache::Mapping * mapping = nullptr;
+  if (!find_record(cache, domain_id, desc_out, &mapping)) {
+    return false;
+  }
+  // Wrap-safe "newer than": record seqs come from a 32-bit counter. With no
+  // pin left nothing reads newest_seq, so the first pin seeds it: a ring first
+  // mapped at seq 2^31 or later would otherwise never move it off 0.
+  if (mapping->pins++ == 0 || static_cast<int32_t>(desc_out.seq - mapping->newest_seq) > 0) {
+    mapping->newest_seq = desc_out.seq;
   }
   return true;
+}
+
+// Caller holds cache.mutex. The last pin of a superseded mapping unmaps it.
+static void unpin_locked(ShmReaderCache & cache, const ShmPayloadDescriptor & desc)
+{
+  auto it = cache.mappings.find({desc.owner_pid, desc.owner_id, desc.segment_id});
+  if (it == cache.mappings.end() || it->second.pins == 0) {
+    return;
+  }
+  if (--it->second.pins == 0 && it->second.superseded) {
+    munmap(it->second.base, it->second.size);
+    cache.mappings.erase(it);
+  }
+}
+
+bool shm_pinned_lapped(ShmReaderCache & cache, const ShmPayloadDescriptor & desc)
+{
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto it = cache.mappings.find({desc.owner_pid, desc.owner_id, desc.segment_id});
+  if (it == cache.mappings.end()) {
+    return true;  // as shm_read_pinned: a take could not read it either
+  }
+  const auto * record = reinterpret_cast<const ShmRecordHeader *>(
+    it->second.base + sizeof(ShmRingHeader) + desc.offset);
+  return record->seq.load(std::memory_order_acquire) != desc.seq;
+}
+
+void shm_unpin(ShmReaderCache & cache, const ShmPayloadDescriptor & desc)
+{
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  unpin_locked(cache, desc);
+}
+
+// A record this many publishes behind the newest one the drain has seen is
+// copied before it is read. The ring holds at least four records of its
+// largest payload, and the wrap wastes less than one, so the publisher needs
+// at least two more publishes after the newest to reach it: from here on a
+// read that takes a few publish periods could be lapped mid-way.
+static constexpr uint32_t SHM_TAKE_COPY_LAG = 2;
+
+// Below this size the take always copies the record first, as the drain did
+// before #86. Measured with bench_take_path (glibc 2.39, Zen 3), the in-place
+// read swung from 12 % faster to 22 % slower at 256 KiB with the heap's address
+// alignment (glibc's `rep movsb` copy is slow at some offsets), and was faster
+// at 512 KiB and up at every alignment tried.
+static constexpr uint32_t SHM_TAKE_IN_PLACE_MIN = 512 * 1024;
+
+ShmRead shm_read_pinned(
+  ShmReaderCache & cache,
+  const ShmPayloadDescriptor & desc,
+  std::vector<uint8_t> & scratch,
+  const std::function<bool(const uint8_t *, size_t)> & read)
+{
+  // Held across the read: map_segment's sweeps and shm_reader_close unmap only
+  // under it. The cache is this subscription's own, so no other endpoint waits.
+  std::lock_guard<std::mutex> lock(cache.mutex);
+  auto it = cache.mappings.find({desc.owner_pid, desc.owner_id, desc.segment_id});
+  if (it == cache.mappings.end()) {
+    return ShmRead::lost;  // not reachable while pinned; never read unmapped memory
+  }
+  const ShmReaderCache::Mapping & mapping = it->second;
+  // In bounds: checked against this mapping when the drain pinned it.
+  const auto * record = reinterpret_cast<const ShmRecordHeader *>(
+    mapping.base + sizeof(ShmRingHeader) + desc.offset);
+  const auto * payload = reinterpret_cast<const uint8_t *>(record + 1);
+  const bool copy_first = desc.payload_size < SHM_TAKE_IN_PLACE_MIN || (!mapping.superseded &&
+    (mapping.newest_seq - desc.seq) / 2 >= SHM_TAKE_COPY_LAG);
+
+  ShmRead result;
+  if (record->seq.load(std::memory_order_acquire) != desc.seq ||
+    record->payload_len != desc.payload_size)
+  {
+    result = ShmRead::lost;
+  } else if (copy_first) {
+    bool copied = false;
+    try {
+      scratch.assign(payload, payload + desc.payload_size);
+      copied = record_unchanged(record, desc);
+    } catch (const std::exception &) {
+    }
+    unpin_locked(cache, desc);
+    if (!copied) {
+      return ShmRead::lost;
+    }
+    return read(scratch.data(), scratch.size()) ? ShmRead::ok : ShmRead::failed;
+  } else {
+    const bool ok = read(payload, desc.payload_size);
+    if (!record_unchanged(record, desc)) {
+      result = ShmRead::lost;  // lapped during the read: what it produced is torn
+    } else {
+      result = ok ? ShmRead::ok : ShmRead::failed;
+    }
+  }
+  unpin_locked(cache, desc);
+  return result;
 }
 
 void shm_writer_close(ShmRingWriter & ring)

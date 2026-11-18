@@ -9,12 +9,15 @@ on:
 
 jobs:
   build-and-test:
-    name: build & test (${{ matrix.ros_distro }})
-    runs-on: ubuntu-latest
+    name: build & test (${{ matrix.ros_distro }}, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        ros_distro: [jazzy, kilted, rolling, lyrical]
+        ros_distro: [jazzy, rolling, lyrical]
+        # x86_64 and aarch64, on real arm64 hardware: x86's stronger memory
+        # ordering (QEMU on x86 included) hides a missing fence in the shm code.
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     container:
       image: ros:${{ matrix.ros_distro }}-ros-base
       # Default Docker /dev/shm is 64MB; one domain registry mmap is ~37MB
@@ -36,6 +39,11 @@ jobs:
       - name: Resolve package dependencies
         shell: bash
         run: |
+          # The base image lags the ROS apt sync. Upgrade it first so every
+          # ROS package comes from the same sync; otherwise a fresh test_msgs
+          # lands on stale builtin_interfaces & co. and fails to link.
+          apt-get update
+          apt-get -y upgrade
           rosdep update --rosdistro=${{ matrix.ros_distro }}
           # rosdep's --from-paths defaults exclude test deps, so list types
           # explicitly. Without this, test_msgs/rosidl_typesupport_cpp/etc.
@@ -51,15 +59,10 @@ jobs:
           # Belt & suspenders: on Rolling, rosdep -r silently skips
           # test_msgs when its key drifts between syncs. Install the
           # test-only deps explicitly so find_package(test_msgs REQUIRED)
-          # in the BUILD_TESTING block always has what it needs. Also pull
-          # rosidl-runtime-cpp by name so apt upgrades it: the base image
-          # is months behind the rolling sync, and a stale rosidl-runtime-cpp
-          # is missing buffer__traits.hpp which the latest test_msgs headers
-          # reference.
+          # in the BUILD_TESTING block always has what it needs.
           apt-get install -y --no-install-recommends \
             ros-${{ matrix.ros_distro }}-test-msgs \
-            ros-${{ matrix.ros_distro }}-rosidl-typesupport-cpp \
-            ros-${{ matrix.ros_distro }}-rosidl-runtime-cpp
+            ros-${{ matrix.ros_distro }}-rosidl-typesupport-cpp
           # rosidl_buffer was introduced after Jazzy/Kilted were branched and
           # test_msgs' exported imported targets reference it; Lyrical branched
           # from Rolling after it landed, so both ship it. CMake side:
@@ -98,6 +101,78 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ matrix.ros_distro }}
+          name: test-logs-${{ matrix.ros_distro }}-${{ matrix.runner }}
           path: log/
           retention-days: 7
+
+  release-metadata:
+    name: release metadata
+    # Pinned: Ubuntu's python3-catkin-pkg imports pkg_resources, which newer
+    # setuptools no longer ship, so a moving ubuntu-latest would break this job.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check package.xml and CHANGELOG.rst are bloom-ready
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-catkin-pkg
+          python3 - <<'PY'
+          import io
+          import re
+
+          from catkin_pkg.changelog import get_changelog_from_path
+          from catkin_pkg.package import parse_package
+          from docutils import nodes
+          from docutils.core import publish_doctree
+
+          PKG = 'rmw_unix_socket_cpp'
+          pkg = parse_package(PKG)
+          pkg.validate()
+          required_urls = {'repository', 'bugtracker', 'website'}
+          missing = required_urls - {u.type for u in pkg.urls}
+          assert not missing, f'package.xml is missing <url> types: {sorted(missing)}'
+          assert pkg.maintainers[0].email, 'maintainer has no email'
+
+          # bloom only reads CHANGELOG.rst sitting next to package.xml.
+          changelog = get_changelog_from_path(PKG)
+          assert changelog is not None, f'no CHANGELOG.rst in {PKG}/'
+          versions = [v for v, _, _ in changelog.foreach_version()]
+          assert versions, 'CHANGELOG.rst has no version heading catkin_pkg can parse'
+          assert pkg.version == versions[-1], \
+              f'package.xml {pkg.version} is not the newest changelog entry {versions[-1]}'
+          for version, _, content in changelog.foreach_version():
+              assert content, f'{version} body is empty'
+
+          # The parsed view above cannot see what catkin_pkg drops, and it drops
+          # silently: a heading that is not "X.Y.Z (date)" with everything under
+          # it, a version whose date does not parse, and anything under a version
+          # but paragraphs, lists and transitions (REP-132). So hold the raw rst
+          # to exactly what it keeps. Forthcoming gets the same check, since
+          # catkin_prepare_release turns it into the next version.
+          warnings = io.StringIO()
+          tree = publish_doctree(changelog.rst, settings_overrides={'warning_stream': warnings})
+          assert not warnings.getvalue(), f'docutils: {warnings.getvalue()}'
+          # Link targets and substitution definitions are dropped too, but the
+          # text that uses them is already resolved, so nothing is lost.
+          kept = (nodes.title, nodes.paragraph, nodes.bullet_list,
+                  nodes.enumerated_list, nodes.transition, nodes.comment,
+                  nodes.target, nodes.substitution_definition)
+          for section in tree.findall(nodes.section):
+              title = section.next_node(nodes.title).astext()
+              if title != 'Forthcoming':
+                  version = re.match(r'^(\d+\.\d+\.\d+) \(', title)
+                  assert version, f'"{title}" is not a version heading: catkin_pkg drops it and its content'
+                  assert version.group(1) in versions, f'"{title}" does not parse, so catkin_pkg drops it'
+              dropped = [type(c).__name__ for c in section.children if not isinstance(c, kept)]
+              assert not dropped, f'"{title}" holds {dropped}, which catkin_pkg drops'
+
+          # rst has no nested inline markup, so ``code`` inside **bold** emits
+          # the backticks literally and docutils reports nothing.
+          for strong in tree.findall(nodes.strong):
+              text = strong.astext()
+              assert '``' not in text, f'literal backticks in bold: {text[:60]}'
+
+          print(f'{PKG} {pkg.version}: {len(versions)} changelog entries, metadata OK')
+          PY

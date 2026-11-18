@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include "drain.hpp"
+#include "events.hpp"
 #include "identifier.hpp"
+#include "listener.hpp"
 #include "logging.hpp"
 #include "registry.hpp"
 #include "serialization.hpp"
@@ -23,12 +26,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <functional>
 
 #include "rcutils/strdup.h"
 #include "rmw/allocators.h"
 #include "rmw/check_type_identifiers_match.h"
 #include "rmw/error_handling.h"
 #include "rmw/rmw.h"
+#include "tracetools/tracetools.h"
 
 static rmw_qos_profile_t resolve_qos(const rmw_qos_profile_t * qos)
 {
@@ -58,82 +63,50 @@ static int64_t system_now_ns()
     std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
-// TRANSIENT_LOCAL dedup: true when this datagram's sample was already
-// delivered by the creation-time pull — the sender's GID has a watermark and
-// the sequence number is at or below it. Sequence numbers are assigned inside
-// the publisher's latch critical section and the pull never extends the
-// watermark across a scan-overlap gap, so anything <= the watermark was
-// either pulled or already lapped out of the publisher's ring at pull time —
-// history DDS would not owe a late joiner either.
-static bool is_replayed_duplicate(
-  rmw_uds::UdsSubscription * sub, const rmw_uds::WireHeader & hdr)
+// Messages a take found lapped in the publisher's ring, reported once the take
+// has released queue_mutex (record_message_lost runs user callbacks): declared
+// before the lock, so it is destroyed after it.
+struct LostAtTake
 {
-  std::array<uint8_t, 16> key;
-  std::memcpy(key.data(), hdr.gid, key.size());
-  std::lock_guard<std::mutex> lock(sub->queue_mutex);
-  auto it = sub->replayed_watermarks.find(key);
-  return it != sub->replayed_watermarks.end() &&
-         hdr.sequence_number <= it->second;
-}
-
-// Drain socket into message queue
-static void drain_subscription(rmw_uds::UdsSubscription * sub)
-{
-  rmw_uds::WireHeader hdr;
-  std::vector<uint8_t> payload;
-
-  while (rmw_uds::recv_from(sub->socket_fd, hdr, payload)) {
-    if ((hdr.msg_type & ~rmw_uds::SHM_PAYLOAD_FLAG) != 0) {continue;}  // Not a topic message
-
-    if (is_replayed_duplicate(sub, hdr)) {
-      continue;  // already delivered by the creation-time pull
-    }
-
-    if (!rmw_uds::shm_resolve_incoming(
-        sub->shm_cache, sub->context->domain_id, hdr, payload))
-    {
-      continue;  // shm descriptor unresolvable (publisher gone / ring lapped)
-    }
-
-    if (sub->ignore_local_publications &&
-      rmw_uds::is_same_context(hdr, sub->context->context_id))
-    {
-      continue;  // ignore_local_publications: drop same-context publications
-    }
-
-    rmw_uds::ReceivedMessage msg;
-    msg.header = hdr;
-    msg.payload = std::move(payload);
-    msg.received_timestamp_ns = system_now_ns();
-
-    bool overflow = false;
-    {
-      std::lock_guard<std::mutex> lock(sub->queue_mutex);
-      sub->message_queue.push_back(std::move(msg));
-      // Enforce queue depth — any pops here mean we're dropping messages
-      // the kernel already delivered to us because the take() side isn't
-      // keeping up. This is the rcl-layer equivalent of "slow subscriber".
-      while (sub->message_queue.size() > sub->queue_depth) {
-        sub->message_queue.pop_front();
-        overflow = true;
-      }
-    }
-    if (overflow) {
-      RMW_UDS_LOG_WARN_THROTTLE(
-        1000,
-        "subscription queue overflow on topic '%s' (depth=%zu) — "
-        "dropping oldest. Application is not calling take() fast enough.",
-        sub->topic_name.c_str(), sub->queue_depth);
-    }
-
-    // Trigger callback if set
-    {
-      std::lock_guard<std::mutex> lock(sub->callback_mutex);
-      if (sub->on_new_message_cb) {
-        sub->on_new_message_cb(sub->on_new_message_user_data, 1);
-      }
+  rmw_uds::UdsSubscription * sub;
+  size_t count = 0;
+  ~LostAtTake()
+  {
+    if (count > 0) {
+      rmw_uds::record_message_lost(sub, count);
     }
   }
+};
+
+// Pops the next queued message into msg and hands its CDR bytes to read: from
+// its buffer, or for a large payload from the publisher's ring record (#86).
+// A record the publisher already overwrote is counted in lost and the next
+// message is tried. False when the queue ran out; read_ok tells whether read
+// succeeded. Caller holds queue_mutex, and recycles msg.payload when done.
+static bool take_front(
+  rmw_uds::UdsSubscription * sub, rmw_uds::ReceivedMessage & msg, LostAtTake & lost,
+  const std::function<bool(const uint8_t *, size_t)> & read, bool & read_ok)
+{
+  while (!sub->message_queue.empty()) {
+    rmw_uds::recycle_payload(sub->spare_payloads, msg.payload);  // a lost one's scratch
+    msg = std::move(sub->message_queue.front());
+    sub->message_queue.pop_front();
+    if (!(msg.header.msg_type & rmw_uds::SHM_PAYLOAD_FLAG)) {
+      read_ok = read(msg.payload.data(), msg.payload.size());
+      return true;
+    }
+    if (!sub->spare_payloads.empty()) {  // scratch, if the record must be copied
+      msg.payload = std::move(sub->spare_payloads.back());
+      sub->spare_payloads.pop_back();
+    }
+    const auto r = rmw_uds::shm_read_pinned(sub->shm_cache, msg.shm_desc, msg.payload, read);
+    if (r != rmw_uds::ShmRead::lost) {
+      read_ok = r == rmw_uds::ShmRead::ok;
+      return true;
+    }
+    ++lost.count;
+  }
+  return false;
 }
 
 extern "C"
@@ -338,6 +311,7 @@ rmw_subscription_t * rmw_create_subscription(
     }
     rmw_uds::shm_reader_close(pull_cache);
   }
+  TRACETOOLS_TRACEPOINT(rmw_subscription_init, sub, sub_data->gid.data);
   return sub;
 }
 
@@ -353,6 +327,13 @@ rmw_ret_t rmw_destroy_subscription(
 
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
   if (sub_data) {
+    // Stop the listener watching this socket before anything is torn down.
+    // listener_unwatch blocks until an in-flight drain of this subscription
+    // has returned, so the delete below cannot race it.
+    rmw_uds::listener_unwatch(sub_data->context, sub_data->socket_fd);
+    // Likewise for a listener recompute of its matched event, whose state it
+    // releases.
+    rmw_uds::forget_graph_events(sub_data->context, sub_data, RMW_EVENT_SUBSCRIPTION_MATCHED);
     if (sub_data->context && sub_data->registry_index >= 0) {
       auto * header = rmw_uds::registry_header(sub_data->context->registry_ptr);
       rmw_uds::registry_remove(header, sub_data->registry_index);
@@ -388,19 +369,21 @@ rmw_ret_t rmw_take(
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
 
   // Drain any pending messages
-  drain_subscription(sub_data);
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(sub_data));
 
+  LostAtTake lost{sub_data};
   std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
-  if (sub_data->message_queue.empty()) {
+  rmw_uds::ReceivedMessage msg;
+  rmw_uds::PayloadRecycler recycle{sub_data->spare_payloads, msg.payload};
+  bool ok = false;
+  if (!take_front(sub_data, msg, lost, [&](const uint8_t * data, size_t size) {
+      return rmw_uds::deserialize(data, size, sub_data->callbacks, ros_message);
+    }, ok))
+  {
     return RMW_RET_OK;
   }
 
-  auto msg = std::move(sub_data->message_queue.front());
-  sub_data->message_queue.pop_front();
-
-  if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
-    sub_data->callbacks, ros_message))
-  {
+  if (!ok) {
     // Surface to the log too: rcl only prints the SET_ERROR_MSG string if
     // the caller checks the return code, but a corrupted/truncated payload
     // (e.g. silently truncated by the kernel on send) is something the
@@ -409,17 +392,19 @@ rmw_ret_t rmw_take(
       1000,
       "rmw_take: CDR deserialization failed on topic '%s' (payload=%zu bytes) "
       "— likely truncated or type mismatch with publisher",
-      sub_data->topic_name.c_str(), msg.payload.size());
+      sub_data->topic_name.c_str(), size_t{msg.header.payload_size});
     char err_buf[512];
     std::snprintf(err_buf, sizeof(err_buf),
       "failed to deserialize message on topic '%s' (payload=%zu bytes)",
       sub_data->topic_name.c_str(),
-      msg.payload.size());
+      size_t{msg.header.payload_size});
     RMW_SET_ERROR_MSG(err_buf);
     return RMW_RET_ERROR;
   }
 
   *taken = true;
+  TRACETOOLS_TRACEPOINT(
+    rmw_take, subscription, ros_message, msg.header.source_timestamp_ns, *taken);
   return RMW_RET_OK;
 }
 
@@ -442,19 +427,21 @@ rmw_ret_t rmw_take_with_info(
   *taken = false;
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
 
-  drain_subscription(sub_data);
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(sub_data));
 
+  LostAtTake lost{sub_data};
   std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
-  if (sub_data->message_queue.empty()) {
+  rmw_uds::ReceivedMessage msg;
+  rmw_uds::PayloadRecycler recycle{sub_data->spare_payloads, msg.payload};
+  bool ok = false;
+  if (!take_front(sub_data, msg, lost, [&](const uint8_t * data, size_t size) {
+      return rmw_uds::deserialize(data, size, sub_data->callbacks, ros_message);
+    }, ok))
+  {
     return RMW_RET_OK;
   }
 
-  auto msg = std::move(sub_data->message_queue.front());
-  sub_data->message_queue.pop_front();
-
-  if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
-    sub_data->callbacks, ros_message))
-  {
+  if (!ok) {
     // Surface to the log too: rcl only prints the SET_ERROR_MSG string if
     // the caller checks the return code, but a corrupted/truncated payload
     // (e.g. silently truncated by the kernel on send) is something the
@@ -463,12 +450,12 @@ rmw_ret_t rmw_take_with_info(
       1000,
       "rmw_take: CDR deserialization failed on topic '%s' (payload=%zu bytes) "
       "— likely truncated or type mismatch with publisher",
-      sub_data->topic_name.c_str(), msg.payload.size());
+      sub_data->topic_name.c_str(), size_t{msg.header.payload_size});
     char err_buf[512];
     std::snprintf(err_buf, sizeof(err_buf),
       "failed to deserialize message on topic '%s' (payload=%zu bytes)",
       sub_data->topic_name.c_str(),
-      msg.payload.size());
+      size_t{msg.header.payload_size});
     RMW_SET_ERROR_MSG(err_buf);
     return RMW_RET_ERROR;
   }
@@ -485,6 +472,8 @@ rmw_ret_t rmw_take_with_info(
   message_info->from_intra_process = false;
 
   *taken = true;
+  TRACETOOLS_TRACEPOINT(
+    rmw_take, subscription, ros_message, msg.header.source_timestamp_ns, *taken);
   return RMW_RET_OK;
 }
 
@@ -508,8 +497,9 @@ rmw_ret_t rmw_take_sequence(
   *taken = 0;
 
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
-  drain_subscription(sub_data);
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(sub_data));
 
+  LostAtTake lost{sub_data};
   std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
 
   size_t to_take = count;
@@ -518,22 +508,28 @@ rmw_ret_t rmw_take_sequence(
   if (sub_data->message_queue.size() < to_take) {to_take = sub_data->message_queue.size();}
 
   for (size_t i = 0; i < to_take; ++i) {
-    auto msg = std::move(sub_data->message_queue.front());
-    sub_data->message_queue.pop_front();
+    rmw_uds::ReceivedMessage msg;
+    rmw_uds::PayloadRecycler recycle{sub_data->spare_payloads, msg.payload};
 
     // Write successes contiguously at the *taken cursor (not the loop counter):
     // a skipped failure must not leave an uninitialized hole that the consumer
     // would read as a valid message, nor push a later success past size==*taken.
-    if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
-      sub_data->callbacks, message_sequence->data[*taken]))
+    bool ok = false;
+    if (!take_front(sub_data, msg, lost, [&](const uint8_t * data, size_t size) {
+        return rmw_uds::deserialize(
+          data, size, sub_data->callbacks, message_sequence->data[*taken]);
+      }, ok))
     {
+      break;  // the rest of the queue was lapped in the publisher's ring
+    }
+    if (!ok) {
       // Dropped datagram already popped from the queue — log like the other
       // take paths so the operator sees a truncated/mismatched payload. Throttle.
       RMW_UDS_LOG_ERROR_THROTTLE(
         1000,
         "rmw_take_sequence: CDR deserialization failed on topic '%s' (payload=%zu bytes) "
         "— likely truncated or type mismatch with publisher",
-        sub_data->topic_name.c_str(), msg.payload.size());
+        sub_data->topic_name.c_str(), size_t{msg.header.payload_size});
       continue;
     }
 
@@ -547,6 +543,9 @@ rmw_ret_t rmw_take_sequence(
     info.publisher_gid.implementation_identifier = rmw_uds::identifier;
     info.from_intra_process = false;
 
+    TRACETOOLS_TRACEPOINT(
+      rmw_take, subscription, message_sequence->data[*taken],
+      msg.header.source_timestamp_ns, true);
     (*taken)++;
   }
 
@@ -571,22 +570,30 @@ rmw_ret_t rmw_take_serialized_message(
 
   *taken = false;
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
-  drain_subscription(sub_data);
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(sub_data));
 
+  LostAtTake lost{sub_data};
   std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
-  if (sub_data->message_queue.empty()) {
+  rmw_uds::ReceivedMessage msg;
+  rmw_uds::PayloadRecycler recycle{sub_data->spare_payloads, msg.payload};
+  rmw_ret_t ret = RMW_RET_OK;
+  bool ok = false;
+  // The bytes are copied out here, under the same seqlock checks as a deserialize.
+  if (!take_front(sub_data, msg, lost, [&](const uint8_t * data, size_t size) {
+      ret = rmw_serialized_message_resize(serialized_message, size);
+      if (ret != RMW_RET_OK) {return false;}
+      std::memcpy(serialized_message->buffer, data, size);
+      serialized_message->buffer_length = size;
+      return true;
+    }, ok))
+  {
     return RMW_RET_OK;
   }
-
-  auto msg = std::move(sub_data->message_queue.front());
-  sub_data->message_queue.pop_front();
-
-  auto ret = rmw_serialized_message_resize(serialized_message, msg.payload.size());
-  if (ret != RMW_RET_OK) {return ret;}
-  std::memcpy(serialized_message->buffer, msg.payload.data(), msg.payload.size());
-  serialized_message->buffer_length = msg.payload.size();
+  if (!ok) {return ret;}
 
   *taken = true;
+  TRACETOOLS_TRACEPOINT(
+    rmw_take, subscription, serialized_message, msg.header.source_timestamp_ns, *taken);
   return RMW_RET_OK;
 }
 
@@ -608,20 +615,26 @@ rmw_ret_t rmw_take_serialized_message_with_info(
 
   *taken = false;
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
-  drain_subscription(sub_data);
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(sub_data));
 
+  LostAtTake lost{sub_data};
   std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
-  if (sub_data->message_queue.empty()) {
+  rmw_uds::ReceivedMessage msg;
+  rmw_uds::PayloadRecycler recycle{sub_data->spare_payloads, msg.payload};
+  rmw_ret_t ret = RMW_RET_OK;
+  bool ok = false;
+  // The bytes are copied out here, under the same seqlock checks as a deserialize.
+  if (!take_front(sub_data, msg, lost, [&](const uint8_t * data, size_t size) {
+      ret = rmw_serialized_message_resize(serialized_message, size);
+      if (ret != RMW_RET_OK) {return false;}
+      std::memcpy(serialized_message->buffer, data, size);
+      serialized_message->buffer_length = size;
+      return true;
+    }, ok))
+  {
     return RMW_RET_OK;
   }
-
-  auto msg = std::move(sub_data->message_queue.front());
-  sub_data->message_queue.pop_front();
-
-  auto ret = rmw_serialized_message_resize(serialized_message, msg.payload.size());
-  if (ret != RMW_RET_OK) {return ret;}
-  std::memcpy(serialized_message->buffer, msg.payload.data(), msg.payload.size());
-  serialized_message->buffer_length = msg.payload.size();
+  if (!ok) {return ret;}
 
   message_info->source_timestamp = msg.header.source_timestamp_ns;
   message_info->received_timestamp = msg.received_timestamp_ns;
@@ -634,6 +647,8 @@ rmw_ret_t rmw_take_serialized_message_with_info(
   message_info->from_intra_process = false;
 
   *taken = true;
+  TRACETOOLS_TRACEPOINT(
+    rmw_take, subscription, serialized_message, msg.header.source_timestamp_ns, *taken);
   return RMW_RET_OK;
 }
 
@@ -700,20 +715,14 @@ rmw_ret_t rmw_subscription_set_on_new_message_callback(
   const void * user_data)
 {
   RMW_CHECK_ARGUMENT_FOR_NULL(subscription, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    subscription, subscription->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
 
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(subscription->data);
-  std::lock_guard<std::mutex> lock(sub_data->callback_mutex);
-  sub_data->on_new_message_cb = callback;
-  sub_data->on_new_message_user_data = user_data;
-
-  // If there are already messages queued, notify
-  if (callback) {
-    std::lock_guard<std::mutex> qlock(sub_data->queue_mutex);
-    if (!sub_data->message_queue.empty()) {
-      callback(user_data, sub_data->message_queue.size());
-    }
-  }
-  return RMW_RET_OK;
+  return rmw_uds::listener_set_callback(
+    sub_data->context, rmw_uds::drain_target(sub_data),
+    rmw_uds::ARMED_SUBSCRIPTION, sub_data, sub_data->uid, callback, user_data);
 }
 
 }  // extern "C"
