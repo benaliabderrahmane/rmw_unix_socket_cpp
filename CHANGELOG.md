@@ -75,6 +75,59 @@ four copies of the receive loop that hid the gap are one.
 - `DESIGN.md` documents the listener thread and the `delivery_fd` ordering, and
   narrows the no-background-threads claim to what it now guarantees.
 
+### Performance
+
+- **`rmw_wait` no longer reads every guard-condition eventfd** (#85). It read
+  each one before blocking and again after waking, whether or not epoll had
+  reported it: two `read()`s per guard condition per wait, nearly all failing
+  with `EAGAIN` — about 40 syscalls per wait for the ~20 guard conditions an
+  rclcpp executor passes. epoll already watches those eventfds, so a pending
+  trigger is now reported and consumed through it; only a guard condition epoll
+  could not watch is still read directly.
+  A full batch of 64 ready fds is now followed by a non-blocking sweep in
+  blocking waits too, not only when work was already queued, so stale fds a
+  wait set armed earlier cannot hide a ready guard condition or socket from a
+  zero-timeout wait, and more than 64 ready fds are reported in one wait.
+- **Received payload buffers are reused instead of freed per message** (#84).
+  Subscriptions, services and clients hand each taken message's buffer back
+  and receive the next one into it. Freeing a large payload let glibc return
+  it to the kernel, and the next message page-faulted it back in, zeroed. In
+  the five-topic fan-in of `test/perf/bench_take_path`, CPU time per message
+  drops by about 55-60 % at 128 KB and 65-75 % at 256 KB to 1 MB, and minor
+  page faults go from about 250 per 1 MB message to none.
+- **Trade-off: endpoints keep that memory.** An endpoint keeps about its queue
+  depth of payload buffers (100 for a service or client), each as large as the
+  largest message it held, until it is destroyed; before, they went back to
+  the heap after each take. A KEEP_LAST depth-10 subscription that once held
+  ten 4 MB messages keeps about 40 MB.
+- **Ringing the doorbells no longer walks the registry** (#53). Every registry
+  mutation read the `state` byte of every slot below `high_water_slot` to find
+  the few doorbell slots - one strided cache miss per used slot, about 7400 per
+  mutation on a 200-node launch. Doorbell slots are now marked in a 4 KiB bitmap
+  in the registry header, so ringing reads `high_water_slot / 64` contiguous
+  words. `bench_registry_ring` (7400 used slots, 4 doorbells, cold cache):
+  ~63 us to ~28 us per mutation, and with no doorbell registered ~40 us to
+  ~4 us; the cost no longer grows with the number of slots.
+- **Large topic payloads are read straight from the publisher's shared-memory
+  ring** (#86), as Fast DDS data sharing does. A KEEP_LAST subscription queues
+  the payload's descriptor instead of copying the payload into a heap buffer,
+  and the take reads the ring record under its seqlock: in place from 512 KiB,
+  through one copy below that, as before. `bench_take_path` (five-topic
+  fan-in, thread CPU per message, median of 5, Zen 3, glibc 2.39):
+  512 KiB 63 -> 53 us, 1 MiB 227 -> 196 us, 2 MiB 728 -> 628 us,
+  4 MiB 1576 -> 1328 us, 8 MiB 3554 -> 2767 us; 64 to 256 KiB unchanged.
+  Read in place, 256 KiB swung from 12 % faster to 22 % slower with the heap's
+  address alignment (glibc's `rep movsb` is slow at some source/destination
+  offsets), which is why payloads under 512 KiB keep the copy.
+  **Behaviour change:** a KEEP_LAST depth-N subscription to large messages
+  (64 KiB and up) now keeps at most what the publisher's ring still holds (at
+  least four records of its largest payload); older queued messages are
+  reported through `message_lost` by the next drain or take, never delivered.
+  KEEP_ALL subscriptions, services and clients still copy large payloads out
+  when they arrive, so nothing changes for them. A take that finds a record
+  overwritten during an in-place read and nothing else to deliver returns
+  `taken = false` with its message partly written.
+
 ### Fixed
 
 - **QoS status events are refused honestly.** `rmw_publisher_event_init` /
@@ -101,39 +154,16 @@ four copies of the receive loop that hid the gap are one.
   with ten replayed samples handed the executor twenty events. It now flushes
   only when a callback takes over from none.
 
-### Performance
+### Upgrade notes
 
-- **Received payload buffers are reused instead of freed per message** (#84).
-  Subscriptions, services and clients hand each taken message's buffer back
-  and receive the next one into it. Freeing a large payload let glibc return
-  it to the kernel, and the next message page-faulted it back in, zeroed. In
-  the five-topic fan-in of `test/perf/bench_take_path`, CPU time per message
-  drops by about 55-60 % at 128 KB and 65-75 % at 256 KB to 1 MB, and minor
-  page faults go from about 250 per 1 MB message to none.
-- **Trade-off: endpoints keep that memory.** An endpoint keeps about its queue
-  depth of payload buffers (100 for a service or client), each as large as the
-  largest message it held, until it is destroyed; before, they went back to
-  the heap after each take. A KEEP_LAST depth-10 subscription that once held
-  ten 4 MB messages keeps about 40 MB.
-- **Large topic payloads are read straight from the publisher's shared-memory
-  ring** (#86), as Fast DDS data sharing does. A KEEP_LAST subscription queues
-  the payload's descriptor instead of copying the payload into a heap buffer,
-  and the take reads the ring record under its seqlock: in place from 512 KiB,
-  through one copy below that, as before. `bench_take_path` (five-topic
-  fan-in, thread CPU per message, median of 5, Zen 3, glibc 2.39):
-  512 KiB 63 -> 53 us, 1 MiB 227 -> 196 us, 2 MiB 728 -> 628 us,
-  4 MiB 1576 -> 1328 us, 8 MiB 3554 -> 2767 us; 64 to 256 KiB unchanged.
-  Read in place, 256 KiB swung from 12 % faster to 22 % slower with the heap's
-  address alignment (glibc's `rep movsb` is slow at some source/destination
-  offsets), which is why payloads under 512 KiB keep the copy.
-  **Behaviour change:** a KEEP_LAST depth-N subscription to large messages
-  (64 KiB and up) now keeps at most what the publisher's ring still holds (at
-  least four records of its largest payload); older queued messages are
-  reported through `message_lost` by the next drain or take, never delivered.
-  KEEP_ALL subscriptions, services and clients still copy large payloads out
-  when they arrive, so nothing changes for them. A take that finds a record
-  overwritten during an in-place read and nothing else to deliver returns
-  `taken = false` with its message partly written.
+- **Registry layout v5.** The header gains the doorbell bitmap, so its size
+  changes: each build replaces a registry created by the other, and the
+  two builds then see separate registries and do not discover each other.
+  Upgrade every process on a host together, and before the first start stop
+  every process that uses the RMW and remove `/dev/shm/ros2_uds_*` (a reboot
+  does this): processes that start at the same moment and find the old
+  registry can race while replacing it, and one of them can then fail in
+  `rmw_init` ("failed to open shared memory registry") or miss the others.
 
 ## [0.5.0] - 2026-08-27
 

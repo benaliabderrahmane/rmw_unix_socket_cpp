@@ -243,6 +243,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_rmw_cross_process ${_rmw_test_libs} ${_test_msg_deps})
   target_include_directories(test_rmw_cross_process PRIVATE src)
 
+  # Benchmark (standalone, not a ctest): cost of one registry mutation on a
+  # populated registry, ring_doorbells included (issue #53). It recreates the
+  # registry of its domain (default 231, unused by the tests).
+  add_executable(bench_registry_ring test/perf/bench_registry_ring.cpp src/registry.cpp)
+  target_link_libraries(bench_registry_ring ${_unit_test_deps})
+  target_include_directories(bench_registry_ring PRIVATE src)
+
   # Benchmark (standalone, not a ctest — run manually; see test/perf/README):
   # publish-side staging cost of serialize-into-ring vs serialize-then-copy.
   add_executable(bench_serialize_into_ring
