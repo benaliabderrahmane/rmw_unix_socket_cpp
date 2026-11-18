@@ -88,6 +88,26 @@ four copies of the receive loop that hid the gap are one.
   blocking waits too, not only when work was already queued, so stale fds a
   wait set armed earlier cannot hide a ready guard condition or socket from a
   zero-timeout wait, and more than 64 ready fds are reported in one wait.
+- **Received payload buffers are reused instead of freed per message** (#84).
+  Subscriptions, services and clients hand each taken message's buffer back
+  and receive the next one into it. Freeing a large payload let glibc return
+  it to the kernel, and the next message page-faulted it back in, zeroed. In
+  the five-topic fan-in of `test/perf/bench_take_path`, CPU time per message
+  drops by about 55-60 % at 128 KB and 65-75 % at 256 KB to 1 MB, and minor
+  page faults go from about 250 per 1 MB message to none.
+- **Trade-off: endpoints keep that memory.** An endpoint keeps about its queue
+  depth of payload buffers (100 for a service or client), each as large as the
+  largest message it held, until it is destroyed; before, they went back to
+  the heap after each take. A KEEP_LAST depth-10 subscription that once held
+  ten 4 MB messages keeps about 40 MB.
+- **Ringing the doorbells no longer walks the registry** (#53). Every registry
+  mutation read the `state` byte of every slot below `high_water_slot` to find
+  the few doorbell slots - one strided cache miss per used slot, about 7400 per
+  mutation on a 200-node launch. Doorbell slots are now marked in a 4 KiB bitmap
+  in the registry header, so ringing reads `high_water_slot / 64` contiguous
+  words. `bench_registry_ring` (7400 used slots, 4 doorbells, cold cache):
+  ~63 us to ~28 us per mutation, and with no doorbell registered ~40 us to
+  ~4 us; the cost no longer grows with the number of slots.
 
 ### Fixed
 
@@ -115,20 +135,16 @@ four copies of the receive loop that hid the gap are one.
   with ten replayed samples handed the executor twenty events. It now flushes
   only when a callback takes over from none.
 
-### Performance
+### Upgrade notes
 
-- **Received payload buffers are reused instead of freed per message** (#84).
-  Subscriptions, services and clients hand each taken message's buffer back
-  and receive the next one into it. Freeing a large payload let glibc return
-  it to the kernel, and the next message page-faulted it back in, zeroed. In
-  the five-topic fan-in of `test/perf/bench_take_path`, CPU time per message
-  drops by about 55-60 % at 128 KB and 65-75 % at 256 KB to 1 MB, and minor
-  page faults go from about 250 per 1 MB message to none.
-- **Trade-off: endpoints keep that memory.** An endpoint keeps about its queue
-  depth of payload buffers (100 for a service or client), each as large as the
-  largest message it held, until it is destroyed; before, they went back to
-  the heap after each take. A KEEP_LAST depth-10 subscription that once held
-  ten 4 MB messages keeps about 40 MB.
+- **Registry layout v5.** The header gains the doorbell bitmap, so its size
+  changes: each build replaces a registry created by the other, and the
+  two builds then see separate registries and do not discover each other.
+  Upgrade every process on a host together, and before the first start stop
+  every process that uses the RMW and remove `/dev/shm/ros2_uds_*` (a reboot
+  does this): processes that start at the same moment and find the old
+  registry can race while replacing it, and one of them can then fail in
+  `rmw_init` ("failed to open shared memory registry") or miss the others.
 
 ## [0.5.0] - 2026-08-27
 
