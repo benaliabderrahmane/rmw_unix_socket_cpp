@@ -20,15 +20,17 @@
 // is where a payload buffer allocated and freed per message shows up.
 //
 // Build with the test suite, run manually:
-//   ./build/rmw_unix_socket_cpp/bench_take_path
+//   ./build/rmw_unix_socket_cpp/bench_take_path [KiB ...]
 // Syscall counts: strace -c -f ./build/rmw_unix_socket_cpp/bench_take_path
 
 #include <sys/resource.h>
 #include <time.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
+#include <vector>
 
 #include "rmw/rmw.h"
 #include "rmw/init.h"
@@ -55,8 +57,13 @@ long thread_minflt()
 }
 }  // namespace
 
-int main()
+int main(int argc, char ** argv)
 {
+  std::vector<size_t> sizes_kib{16, 32, 128, 256, 1024};
+  if (argc > 1) {
+    sizes_kib.clear();
+    for (int i = 1; i < argc; ++i) {sizes_kib.push_back(std::strtoul(argv[i], nullptr, 10));}
+  }
   rmw_init_options_t options = rmw_get_zero_initialized_init_options();
   rmw_context_t context = rmw_get_zero_initialized_context();
   if (rmw_init_options_init(&options, rcutils_get_default_allocator()) != RMW_RET_OK) {return 1;}
@@ -76,7 +83,7 @@ int main()
   rmw_wait_set_t * ws = rmw_create_wait_set(&context, kTopics);
   if (!ws) {return 1;}
   std::thread worker([&]() {
-      for (size_t kib : {16, 32, 128, 256, 1024}) {
+      for (size_t kib : sizes_kib) {
         rmw_publisher_t * pubs[kTopics];
         rmw_subscription_t * subs[kTopics];
         for (int t = 0; t < kTopics; ++t) {

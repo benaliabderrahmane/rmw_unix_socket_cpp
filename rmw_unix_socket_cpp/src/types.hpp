@@ -143,6 +143,10 @@ struct ReceivedMessage
   WireHeader header;
   std::vector<uint8_t> payload;
   int64_t received_timestamp_ns;
+  // A subscription's large payload stays in the publisher's ring until the
+  // take reads it (#86): header.msg_type keeps SHM_PAYLOAD_FLAG, payload is
+  // empty, and this names the record, its mapping pinned (shm_pin_payload).
+  ShmPayloadDescriptor shm_desc;
 };
 
 // Payload buffers a receiving endpoint keeps for reuse (#84). A take hands its

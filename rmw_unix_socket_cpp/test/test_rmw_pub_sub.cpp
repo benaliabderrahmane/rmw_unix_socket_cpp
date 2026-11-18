@@ -20,7 +20,10 @@
 #include "test_msgs/msg/strings.hpp"
 #include "test_msgs/msg/unbounded_sequences.hpp"
 
+#include "rmw/event.h"
+#include "rmw/events_statuses/events_statuses.h"
 #include "rmw/qos_profiles.h"
+#include "rmw/serialized_message.h"
 #include "rosidl_typesupport_cpp/message_type_support.hpp"
 
 #include <atomic>
@@ -243,9 +246,11 @@ TEST_F(PubSubTest, LargeMessageViaShmRing)
 // Issue #84: a take hands its payload buffer back to the subscription and the
 // next drain receives into it, instead of allocating and freeing one per
 // message (glibc trimmed a large freed buffer, and the next message
-// page-faulted it back in). The buffer is reused across the shm ring path and
-// the inline datagram path, and each message must still come out byte-exact
-// at its own size, with nothing left over from the larger one before it.
+// page-faulted it back in). Each message must still come out byte-exact at its
+// own size, with nothing left over from the larger one before it. A ring
+// payload of 512 KiB or more is read in place (#86): its descriptor lands in
+// the drain's buffer, which then stays with the drain, so one buffer still
+// cycles. (A smaller ring payload is copied into a second, reused buffer.)
 TEST_F(PubSubTest, TakeReusesPayloadBufferAcrossMessages)
 {
   auto seq_ts = rosidl_typesupport_cpp::get_message_type_support_handle<
@@ -259,8 +264,8 @@ TEST_F(PubSubTest, TakeReusesPayloadBufferAcrossMessages)
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
 
   const uint8_t * buffer = nullptr;
-  // 300 KB and 100 KB ride the ring, 1 KB an inline datagram.
-  for (size_t size : {300 * 1024, 100 * 1024, 1024, 300 * 1024}) {
+  // 60 KB and 1 KB ride inline datagrams, 600 KB the ring.
+  for (size_t size : {60 * 1024, 1024, 600 * 1024, 60 * 1024}) {
     SCOPED_TRACE(size);
     test_msgs::msg::UnboundedSequences send_msg;
     send_msg.uint8_values.resize(size);
@@ -275,15 +280,19 @@ TEST_F(PubSubTest, TakeReusesPayloadBufferAcrossMessages)
     ASSERT_TRUE(taken);
     EXPECT_EQ(send_msg.uint8_values, recv_msg.uint8_values);
 
-    // The taken message's buffer is now the one spare, and it is the same
-    // buffer every time.
+    // The endpoint owns one buffer, the same every time: the taken message's,
+    // now the one spare, or the drain's own after a ring message.
+    std::lock_guard<std::mutex> drain_lock(sub_data->drain_mutex);
     std::lock_guard<std::mutex> lock(sub_data->queue_mutex);
-    ASSERT_EQ(1u, sub_data->spare_payloads.size());
-    EXPECT_GE(sub_data->spare_payloads.back().capacity(), 300u * 1024);
+    ASSERT_EQ(
+      1u, sub_data->spare_payloads.size() + (sub_data->recv_payload.capacity() > 0 ? 1 : 0));
+    const auto & held = sub_data->spare_payloads.empty() ?
+      sub_data->recv_payload : sub_data->spare_payloads.back();
+    EXPECT_GE(held.capacity(), 60u * 1024);
     if (!buffer) {
-      buffer = sub_data->spare_payloads.back().data();
+      buffer = held.data();
     }
-    EXPECT_EQ(buffer, sub_data->spare_payloads.back().data());
+    EXPECT_EQ(buffer, held.data());
   }
 }
 
@@ -333,8 +342,11 @@ TEST_F(PubSubTest, KeepLastOverflowRecyclesDroppedPayload)
   ASSERT_NE(nullptr, sub);
   auto * sub_data = static_cast<rmw_uds::UdsSubscription *>(sub->data);
 
-  // Ring and inline sizes mixed; under the 1 MiB ring floor in total, so none laps.
-  const size_t sizes[6] = {200 * 1024, 1024, 100 * 1024, 2048, 150 * 1024, 70 * 1024};
+  // Inline sizes only, all below the 64 KiB ring threshold: since #86 a KEEP_LAST
+  // subscription queues ring payloads as descriptors, which hold no buffer, so a
+  // ring message never reaches this recycle (AKeepLastOverflowReleasesItsPins
+  // covers ring entries dropped by the overflow).
+  const size_t sizes[6] = {1024, 2048, 8 * 1024, 16 * 1024, 32 * 1024, 48 * 1024};
   rmw_wait_set_t * ws = rmw_create_wait_set(&context, 1);
   ASSERT_NE(nullptr, ws);
   for (uint32_t round = 0; round < 20; ++round) {
@@ -690,4 +702,475 @@ TEST_F(PubSubTest, IgnoreLocalPublicationsDropsSameProcessMessage)
                           "published from within the same process/context";
 
   EXPECT_EQ(RMW_RET_OK, rmw_destroy_subscription(node, baseline_sub));
+}
+
+// Issue #86: a subscription queues a large payload's descriptor and its take
+// deserializes straight from the publisher's ring record. A record the
+// publisher overwrote before the take is reported as message_lost, never
+// delivered.
+class RingTakeTest : public PubSubTest
+{
+protected:
+  const rosidl_message_type_support_t * seq_ts =
+    rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  std::vector<rmw_subscription_t *> extra_subs;
+  std::vector<rmw_event_t> events;
+
+  void TearDown() override
+  {
+    for (auto & ev : events) {(void)rmw_event_fini(&ev);}
+    for (auto * s : extra_subs) {(void)rmw_destroy_subscription(node, s);}
+    PubSubTest::TearDown();
+  }
+
+  void make_pub(const char * topic)
+  {
+    auto pub_opts = rmw_get_default_publisher_options();
+    pub = rmw_create_publisher(node, seq_ts, topic, &qos, &pub_opts);
+    ASSERT_NE(nullptr, pub);
+  }
+
+  // A subscription with its message_lost event, which owns both.
+  rmw_subscription_t * make_sub(const char * topic)
+  {
+    auto sub_opts = rmw_get_default_subscription_options();
+    rmw_subscription_t * s = rmw_create_subscription(node, seq_ts, topic, &qos, &sub_opts);
+    if (s) {
+      extra_subs.push_back(s);
+      events.reserve(8);  // the handles must not move once initialised
+      events.push_back(rmw_get_zero_initialized_event());
+      if (rmw_subscription_event_init(&events.back(), s, RMW_EVENT_MESSAGE_LOST) != RMW_RET_OK) {
+        return nullptr;
+      }
+    }
+    return s;
+  }
+
+  size_t lost(size_t index)
+  {
+    rmw_message_lost_status_t st{};
+    bool taken = false;
+    EXPECT_EQ(RMW_RET_OK, rmw_take_event(&events[index], &st, &taken));
+    return st.total_count;
+  }
+
+  // Drain the subscriptions into their queues, as an executor's rmw_wait does.
+  void drain_all()
+  {
+    std::vector<void *> arr;
+    for (auto * s : extra_subs) {arr.push_back(s->data);}
+    rmw_wait_set_t * ws = rmw_create_wait_set(&context, arr.size());
+    ASSERT_NE(nullptr, ws);
+    rmw_subscriptions_t subs{arr.size(), arr.data()};
+    rmw_time_t timeout{1, 0};
+    EXPECT_EQ(RMW_RET_OK, rmw_wait(&subs, nullptr, nullptr, nullptr, nullptr, ws, &timeout));
+    EXPECT_EQ(RMW_RET_OK, rmw_destroy_wait_set(ws));
+  }
+
+  static test_msgs::msg::UnboundedSequences make_msg(size_t size, uint8_t seed)
+  {
+    test_msgs::msg::UnboundedSequences m;
+    m.uint8_values.resize(size);
+    for (size_t i = 0; i < size; ++i) {
+      m.uint8_values[i] = static_cast<uint8_t>((i * 31 + seed) & 0xFF);
+    }
+    return m;
+  }
+
+  void publish(const test_msgs::msg::UnboundedSequences & m)
+  {
+    ASSERT_EQ(RMW_RET_OK, rmw_publish(pub, &m, nullptr));
+  }
+
+  static bool queued_in_ring(rmw_subscription_t * s)
+  {
+    auto * data = static_cast<rmw_uds::UdsSubscription *>(s->data);
+    std::lock_guard<std::mutex> lock(data->queue_mutex);
+    return !data->message_queue.empty() &&
+           (data->message_queue.back().header.msg_type & rmw_uds::SHM_PAYLOAD_FLAG) &&
+           data->message_queue.back().payload.capacity() == 0;
+  }
+
+  bool take_serialized(rmw_subscription_t * s, test_msgs::msg::UnboundedSequences & out)
+  {
+    rmw_serialized_message_t ser = rmw_get_zero_initialized_serialized_message();
+    rcutils_allocator_t alloc = rcutils_get_default_allocator();
+    EXPECT_EQ(RMW_RET_OK, rmw_serialized_message_init(&ser, 0, &alloc));
+    bool taken = false;
+    EXPECT_EQ(RMW_RET_OK, rmw_take_serialized_message(s, &ser, &taken, nullptr));
+    if (taken) {
+      EXPECT_EQ(RMW_RET_OK, rmw_deserialize(&ser, seq_ts, &out));
+    }
+    EXPECT_EQ(RMW_RET_OK, rmw_serialized_message_fini(&ser));
+    return taken;
+  }
+};
+
+TEST_F(RingTakeTest, LargePayloadsAreByteExactFrom64KiBTo8MiB)
+{
+  make_pub("/ring_take_sizes");
+  rmw_subscription_t * deser = make_sub("/ring_take_sizes");
+  rmw_subscription_t * ser = make_sub("/ring_take_sizes");
+  ASSERT_NE(nullptr, deser);
+  ASSERT_NE(nullptr, ser);
+
+  uint8_t seed = 1;
+  for (size_t size : {64 * 1024, 256 * 1024, 1024 * 1024, 3 * 1024 * 1024 + 17,
+      8 * 1024 * 1024})
+  {
+    SCOPED_TRACE(size);
+    const auto sent = make_msg(size, seed++);
+    publish(sent);
+    drain_all();
+    // Queued as a descriptor, the bytes still in the publisher's ring.
+    EXPECT_TRUE(queued_in_ring(deser));
+    EXPECT_TRUE(queued_in_ring(ser));
+
+    test_msgs::msg::UnboundedSequences got;
+    rmw_message_info_t info = rmw_get_zero_initialized_message_info();
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take_with_info(deser, &got, &taken, &info, nullptr));
+    ASSERT_TRUE(taken);
+    EXPECT_TRUE(sent.uint8_values == got.uint8_values);
+
+    test_msgs::msg::UnboundedSequences got_ser;
+    ASSERT_TRUE(take_serialized(ser, got_ser));
+    EXPECT_TRUE(sent.uint8_values == got_ser.uint8_values);
+  }
+  EXPECT_EQ(0u, lost(0));
+  EXPECT_EQ(0u, lost(1));
+}
+
+// The publisher laps its ring (four records of 1 MiB) while ten messages sit
+// queued. Every take path delivers only the records still intact, newest
+// last and byte-exact, and reports the rest through message_lost.
+TEST_F(RingTakeTest, ALapWhileQueuedIsReportedLostNeverDelivered)
+{
+  make_pub("/ring_take_lap");
+  rmw_subscription_t * one = make_sub("/ring_take_lap");
+  rmw_subscription_t * seq = make_sub("/ring_take_lap");
+  rmw_subscription_t * ser = make_sub("/ring_take_lap");
+  ASSERT_NE(nullptr, one);
+  ASSERT_NE(nullptr, seq);
+  ASSERT_NE(nullptr, ser);
+
+  constexpr size_t kSize = 1024 * 1024;
+  constexpr int kCount = 10;
+  for (int i = 1; i <= kCount; ++i) {
+    publish(make_msg(kSize, static_cast<uint8_t>(i)));
+    drain_all();  // each descriptor is queued while its record is intact
+  }
+
+  auto check_tail = [&](const std::vector<test_msgs::msg::UnboundedSequences> & got,
+      size_t lost_count) {
+      EXPECT_GE(got.size(), 4u) << "the ring keeps at least four records";
+      EXPECT_LT(got.size(), static_cast<size_t>(kCount)) << "the publisher lapped the ring";
+      EXPECT_EQ(static_cast<size_t>(kCount) - got.size(), lost_count);
+      for (size_t k = 0; k < got.size(); ++k) {
+        const int i = kCount - static_cast<int>(got.size()) + 1 + static_cast<int>(k);
+        EXPECT_TRUE(make_msg(kSize, static_cast<uint8_t>(i)).uint8_values == got[k].uint8_values)
+          << "message " << i;
+      }
+    };
+
+  std::vector<test_msgs::msg::UnboundedSequences> got;
+  for (;;) {
+    test_msgs::msg::UnboundedSequences m;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(one, &m, &taken, nullptr));
+    if (!taken) {break;}
+    got.push_back(std::move(m));
+  }
+  check_tail(got, lost(0));
+
+  {
+    test_msgs::msg::UnboundedSequences msgs[kCount];
+    void * ptrs[kCount];
+    for (int k = 0; k < kCount; ++k) {ptrs[k] = &msgs[k];}
+    rmw_message_sequence_t mseq{ptrs, 0, kCount};
+    rmw_message_info_t infos[kCount];
+    rmw_message_info_sequence_t iseq{infos, 0, kCount};
+    size_t taken = 0;
+    ASSERT_EQ(RMW_RET_OK, rmw_take_sequence(seq, kCount, &mseq, &iseq, &taken, nullptr));
+    EXPECT_EQ(taken, mseq.size);
+    for (size_t k = 1; k < taken; ++k) {
+      EXPECT_EQ(infos[k - 1].publication_sequence_number + 1, infos[k].publication_sequence_number);
+    }
+    check_tail(std::vector<test_msgs::msg::UnboundedSequences>(msgs, msgs + taken), lost(1));
+  }
+
+  got.clear();
+  for (;;) {
+    test_msgs::msg::UnboundedSequences m;
+    if (!take_serialized(ser, m)) {break;}
+    got.push_back(std::move(m));
+  }
+  check_tail(got, lost(2));
+
+  // Nothing is left pinned: every mapping is still the publisher's live ring.
+  for (auto * s : extra_subs) {
+    auto * data = static_cast<rmw_uds::UdsSubscription *>(s->data);
+    std::lock_guard<std::mutex> lock(data->shm_cache.mutex);
+    for (auto & entry : data->shm_cache.mappings) {
+      EXPECT_EQ(0u, entry.second.pins);
+    }
+  }
+}
+
+// The ring grows (new segment, old one unlinked) while descriptors into the
+// old segment are queued. The publisher never writes the old segment again,
+// so the subscription keeps it mapped until they are taken, delivers them,
+// and then unmaps it.
+TEST_F(RingTakeTest, QueuedMessagesSurviveARingRegrowth)
+{
+  make_pub("/ring_take_regrow");
+  rmw_subscription_t * s = make_sub("/ring_take_regrow");
+  ASSERT_NE(nullptr, s);
+  auto * data = static_cast<rmw_uds::UdsSubscription *>(s->data);
+  auto * pub_data = static_cast<rmw_uds::UdsPublisher *>(pub->data);
+
+  const auto a = make_msg(256 * 1024, 11);
+  const auto b = make_msg(256 * 1024, 12);
+  const auto c = make_msg(2 * 1024 * 1024, 13);  // outgrows the 1 MiB ring
+  publish(a);
+  drain_all();
+  publish(b);
+  drain_all();
+  const uint64_t first_segment = pub_data->shm_ring.segment_id;
+  publish(c);
+  ASSERT_NE(first_segment, pub_data->shm_ring.segment_id) << "the ring did not grow";
+  drain_all();
+  {
+    std::lock_guard<std::mutex> lock(data->shm_cache.mutex);
+    EXPECT_EQ(2u, data->shm_cache.mappings.size()) << "the old segment is still held";
+  }
+
+  for (const auto * sent : {&a, &b, &c}) {
+    test_msgs::msg::UnboundedSequences got;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(s, &got, &taken, nullptr));
+    ASSERT_TRUE(taken);
+    EXPECT_TRUE(sent->uint8_values == got.uint8_values);
+  }
+  EXPECT_EQ(0u, lost(0));
+  std::lock_guard<std::mutex> lock(data->shm_cache.mutex);
+  ASSERT_EQ(1u, data->shm_cache.mappings.size()) << "the old segment is released";
+  EXPECT_EQ(pub_data->shm_ring.segment_id, data->shm_cache.mappings.begin()->first.segment_id);
+}
+
+// Nested types deserialized in place: a sequence of structs and of strings.
+TEST_F(RingTakeTest, ASequenceOfStructsDeserializesFromTheRing)
+{
+  make_pub("/ring_take_structs");
+  rmw_subscription_t * s = make_sub("/ring_take_structs");
+  ASSERT_NE(nullptr, s);
+
+  test_msgs::msg::UnboundedSequences sent;
+  for (int i = 0; i < 3000; ++i) {
+    test_msgs::msg::BasicTypes b;
+    b.bool_value = (i % 2) == 0;
+    b.char_value = static_cast<uint8_t>(i);
+    b.float64_value = i * 0.5;
+    b.int16_value = static_cast<int16_t>(-i);
+    b.uint32_value = static_cast<uint32_t>(i) * 7u;
+    b.int64_value = -static_cast<int64_t>(i) * 1000003;
+    sent.basic_types_values.push_back(b);
+    sent.string_values.push_back(std::string(static_cast<size_t>(i % 37), 'a' + (i % 26)));
+  }
+  publish(sent);
+  drain_all();
+  EXPECT_TRUE(queued_in_ring(s));
+
+  test_msgs::msg::UnboundedSequences got;
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take(s, &got, &taken, nullptr));
+  ASSERT_TRUE(taken);
+  EXPECT_TRUE(sent == got);
+}
+
+// KEEP_ALL is outside the ring-bounded semantics: such a subscription copies
+// a large payload out when it drains it, so a record the publisher overwrites
+// later is still delivered.
+TEST_F(RingTakeTest, AKeepAllSubscriptionLosesNothingItDrained)
+{
+  qos.history = RMW_QOS_POLICY_HISTORY_KEEP_ALL;
+  qos.depth = 0;  // as rclcpp's KeepAll; resolves to 10
+  make_pub("/ring_take_keep_all");
+  rmw_subscription_t * s = make_sub("/ring_take_keep_all");
+  ASSERT_NE(nullptr, s);
+
+  constexpr size_t kSize = 1024 * 1024;
+  constexpr int kCount = 10;
+  for (int i = 1; i <= kCount; ++i) {
+    publish(make_msg(kSize, static_cast<uint8_t>(i)));
+    drain_all();
+    EXPECT_FALSE(queued_in_ring(s)) << "copied out at the drain";
+  }
+  for (int i = 1; i <= kCount; ++i) {
+    test_msgs::msg::UnboundedSequences got;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(s, &got, &taken, nullptr));
+    ASSERT_TRUE(taken) << "message " << i;
+    EXPECT_TRUE(make_msg(kSize, static_cast<uint8_t>(i)).uint8_values == got.uint8_values);
+  }
+  EXPECT_EQ(0u, lost(0));
+}
+
+// The on_new_message count is a take credit (the EventsExecutor takes once per
+// event). Records the publisher laps while queued are dropped at the drain, so
+// a lapping stream never credits more takes than can deliver a message.
+TEST_F(RingTakeTest, NewMessageEventsNeverOutnumberDeliverableTakes)
+{
+  make_pub("/ring_take_credits");
+  rmw_subscription_t * s = make_sub("/ring_take_credits");
+  ASSERT_NE(nullptr, s);
+  std::atomic<size_t> credits{0};
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_set_on_new_message_callback(
+      s, [](const void * user, size_t n) {
+        *static_cast<std::atomic<size_t> *>(const_cast<void *>(user)) += n;
+      }, &credits));
+
+  constexpr size_t kSize = 1024 * 1024;
+  constexpr int kCount = 10;
+  for (int i = 1; i <= kCount; ++i) {
+    publish(make_msg(kSize, static_cast<uint8_t>(i)));
+    drain_all();
+  }
+  size_t delivered = 0;
+  for (;;) {
+    test_msgs::msg::UnboundedSequences got;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(s, &got, &taken, nullptr));
+    if (!taken) {break;}
+    ++delivered;
+  }
+  EXPECT_GE(delivered, 4u) << "the ring keeps at least four records";
+  EXPECT_LT(delivered, static_cast<size_t>(kCount)) << "the publisher lapped the ring";
+  EXPECT_LE(credits.load(), delivered);
+  EXPECT_EQ(static_cast<size_t>(kCount) - delivered, lost(0));
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_set_on_new_message_callback(s, nullptr, nullptr));
+}
+
+// A KEEP_LAST overflow drops queued descriptors: their pins go with them.
+TEST_F(RingTakeTest, AKeepLastOverflowReleasesItsPins)
+{
+  qos.depth = 2;
+  make_pub("/ring_take_overflow");
+  rmw_subscription_t * s = make_sub("/ring_take_overflow");
+  ASSERT_NE(nullptr, s);
+  for (int i = 1; i <= 6; ++i) {
+    publish(make_msg(256 * 1024, static_cast<uint8_t>(i)));
+    drain_all();
+  }
+  for (int i = 5; i <= 6; ++i) {
+    test_msgs::msg::UnboundedSequences got;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(s, &got, &taken, nullptr));
+    ASSERT_TRUE(taken);
+    EXPECT_TRUE(make_msg(256 * 1024, static_cast<uint8_t>(i)).uint8_values == got.uint8_values);
+  }
+  EXPECT_EQ(0u, lost(0)) << "a KEEP_LAST overflow is not a lost message";
+  auto * data = static_cast<rmw_uds::UdsSubscription *>(s->data);
+  std::lock_guard<std::mutex> lock(data->shm_cache.mutex);
+  for (auto & entry : data->shm_cache.mappings) {
+    EXPECT_EQ(0u, entry.second.pins);
+  }
+}
+
+// A publisher destroyed while its descriptors are queued unlinks its ring. The
+// sweep that eight more mappings trigger must keep the pinned mapping (marked
+// superseded), so the queued messages are still delivered.
+TEST_F(RingTakeTest, QueuedMessagesSurviveTheSweepOfADestroyedPublisher)
+{
+  make_pub("/ring_take_sweep");
+  rmw_subscription_t * s = make_sub("/ring_take_sweep");
+  ASSERT_NE(nullptr, s);
+  auto * data = static_cast<rmw_uds::UdsSubscription *>(s->data);
+  const auto a = make_msg(512 * 1024, 21);
+  const auto b = make_msg(512 * 1024, 22);
+  publish(a);
+  publish(b);
+  drain_all();
+  const uint32_t gone_owner = static_cast<rmw_uds::UdsPublisher *>(pub->data)->shm_ring.owner_id;
+  ASSERT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, pub));
+  pub = nullptr;
+
+  std::vector<rmw_publisher_t *> others;
+  auto pub_opts = rmw_get_default_publisher_options();
+  for (int i = 0; i < 8; ++i) {
+    others.push_back(rmw_create_publisher(node, seq_ts, "/ring_take_sweep", &qos, &pub_opts));
+    ASSERT_NE(nullptr, others.back());
+    const auto m = make_msg(64 * 1024, static_cast<uint8_t>(i));
+    ASSERT_EQ(RMW_RET_OK, rmw_publish(others.back(), &m, nullptr));
+  }
+  drain_all();  // the queue keeps the depth-10 newest: a, b and the eight
+
+  for (const auto * sent : {&a, &b}) {
+    test_msgs::msg::UnboundedSequences got;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(s, &got, &taken, nullptr));
+    ASSERT_TRUE(taken);
+    EXPECT_TRUE(sent->uint8_values == got.uint8_values);
+  }
+  {
+    std::lock_guard<std::mutex> lock(data->shm_cache.mutex);
+    for (auto & entry : data->shm_cache.mappings) {
+      EXPECT_NE(gone_owner, entry.first.owner_id) << "unmapped by its last take";
+    }
+  }
+  for (auto * p : others) {EXPECT_EQ(RMW_RET_OK, rmw_destroy_publisher(node, p));}
+  EXPECT_EQ(0u, lost(0));
+}
+
+// A ring first mapped once its record seq has passed 2^31 still tracks the
+// newest seq (the take's lap heuristic), instead of staying at 0.
+TEST_F(RingTakeTest, TheNewestSeqIsSeededPastHalfTheCounter)
+{
+  make_pub("/ring_take_seq_seed");
+  rmw_subscription_t * s = make_sub("/ring_take_seq_seed");
+  ASSERT_NE(nullptr, s);
+  static_cast<rmw_uds::UdsPublisher *>(pub->data)->shm_ring.next_index = 0x40000001u;
+  const auto sent = make_msg(1024 * 1024, 31);
+  publish(sent);
+  drain_all();
+  auto * data = static_cast<rmw_uds::UdsSubscription *>(s->data);
+  {
+    std::lock_guard<std::mutex> lock(data->shm_cache.mutex);
+    ASSERT_EQ(1u, data->shm_cache.mappings.size());
+    EXPECT_EQ(0x80000002u, data->shm_cache.mappings.begin()->second.newest_seq);
+  }
+  test_msgs::msg::UnboundedSequences got;
+  bool taken = false;
+  ASSERT_EQ(RMW_RET_OK, rmw_take(s, &got, &taken, nullptr));
+  ASSERT_TRUE(taken);
+  EXPECT_TRUE(sent.uint8_values == got.uint8_values);
+}
+
+// Below 512 KiB the take copies the record into a reused buffer before it
+// deserializes (in place was slower there); from 512 KiB it reads in place.
+TEST_F(RingTakeTest, OnlyPayloadsOf512KiBAndUpAreReadInPlace)
+{
+  make_pub("/ring_take_threshold");
+  rmw_subscription_t * s = make_sub("/ring_take_threshold");
+  ASSERT_NE(nullptr, s);
+  auto * data = static_cast<rmw_uds::UdsSubscription *>(s->data);
+  for (size_t size : {256 * 1024, 1024 * 1024}) {
+    SCOPED_TRACE(size);
+    {
+      std::lock_guard<std::mutex> lock(data->queue_mutex);
+      data->spare_payloads.clear();
+    }
+    const auto sent = make_msg(size, 41);
+    publish(sent);
+    drain_all();
+    EXPECT_TRUE(queued_in_ring(s));
+    test_msgs::msg::UnboundedSequences got;
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take(s, &got, &taken, nullptr));
+    ASSERT_TRUE(taken);
+    EXPECT_TRUE(sent.uint8_values == got.uint8_values);
+    std::lock_guard<std::mutex> lock(data->queue_mutex);
+    EXPECT_EQ(size < 512 * 1024 ? 1u : 0u, data->spare_payloads.size()) << "the copy's buffer";
+  }
 }
