@@ -12,6 +12,7 @@ end-to-end latency under realistic loads. They are not run by `colcon test`.
 | `scale_100_nodes.py` | Cross-process pub/sub with N **separate processes** | 100 talkers × 10s @ 50 Hz |
 | `bench_registry_ring` (C++, built with the test suite) | One registry add or remove on a populated registry, `ring_doorbells` included, warm and with the cache evicted (#53) | 7400 slots, 4 doorbells, 2000 add/remove pairs, domain 231 (its registry is recreated) |
 | `bench_serialize_into_ring` (C++, built with the test suite) | Publish-side staging: serialize-into-ring vs serialize-then-copy, real fastCDR | 64 KiB–4 MiB × 300–1500 msgs |
+| `bench_take_path` (C++, built with the test suite) | CPU time and page faults per message for a five-topic fan-in: publish, one `rmw_wait`, take, each with a fresh message | 16 KiB–1 MiB × 2000–10000 msgs |
 
 ## Why two flavors
 
@@ -49,6 +50,7 @@ RMW_IMPLEMENTATION=rmw_unix_socket_cpp python3 scale_100_nodes.py
 # C++ staging benchmark: built by colcon with BUILD_TESTING=ON; links the
 # sources directly, so no RMW_IMPLEMENTATION is needed
 ./build/rmw_unix_socket_cpp/bench_serialize_into_ring
+./build/rmw_unix_socket_cpp/bench_take_path
 ```
 
 Each script accepts CLI overrides — see the docstring at the top of each file.

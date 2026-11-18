@@ -41,6 +41,8 @@ DrainTarget drain_target(UdsSubscription * sub)
   t.drain_mutex = &sub->drain_mutex;
   t.queue_mutex = &sub->queue_mutex;
   t.queue = &sub->message_queue;
+  t.spares = &sub->spare_payloads;
+  t.recv_payload = &sub->recv_payload;
   t.max_depth = sub->queue_depth;
   t.msg_type = 0;
   t.shm_cache = &sub->shm_cache;
@@ -64,6 +66,8 @@ DrainTarget drain_target(UdsService * srv)
   t.drain_mutex = &srv->drain_mutex;
   t.queue_mutex = &srv->queue_mutex;
   t.queue = &srv->request_queue;
+  t.spares = &srv->spare_payloads;
+  t.recv_payload = &srv->recv_payload;
   t.max_depth = SERVICE_QUEUE_DEPTH;
   t.msg_type = 1;
   t.shm_cache = &srv->shm_cache;
@@ -82,6 +86,8 @@ DrainTarget drain_target(UdsClient * cli)
   t.drain_mutex = &cli->drain_mutex;
   t.queue_mutex = &cli->queue_mutex;
   t.queue = &cli->response_queue;
+  t.spares = &cli->spare_payloads;
+  t.recv_payload = &cli->recv_payload;
   t.max_depth = SERVICE_QUEUE_DEPTH;
   t.msg_type = 2;
   t.shm_cache = &cli->shm_cache;
@@ -110,7 +116,23 @@ size_t drain_endpoint(const DrainTarget & t)
     std::lock_guard<std::mutex> drain_lock(*t.drain_mutex);
 
     WireHeader hdr;
-    std::vector<uint8_t> payload;
+    // Received into a spare buffer when there is one: no allocation, and no
+    // page faults on a buffer the heap just gave back. Taken under queue_mutex.
+    std::vector<uint8_t> & payload = *t.recv_payload;
+    auto take_spare = [&]() {
+        if (!t.spares->empty()) {
+          payload = std::move(t.spares->back());
+          t.spares->pop_back();
+        }
+      };
+    if (payload.capacity() == 0) {
+      // try_lock: a take deserializes under queue_mutex, and a drain that
+      // finds the socket empty must not wait on it. Contended, it allocates.
+      std::unique_lock<std::mutex> lock(*t.queue_mutex, std::try_to_lock);
+      if (lock.owns_lock()) {
+        take_spare();
+      }
+    }
     // The publisher the two lookups below were made for. A drain usually
     // carries one publisher's datagrams back to back, so each map is searched
     // once per publisher per drain, not per datagram; std::map entries never
@@ -220,10 +242,12 @@ size_t drain_endpoint(const DrainTarget & t)
         // because the take() side isn't keeping up. This is the rcl-layer
         // equivalent of "slow subscriber".
         while (t.queue->size() > t.max_depth) {
+          recycle_payload(*t.spares, t.queue->front().payload);
           t.queue->pop_front();
           ++dropped;
           overflow = true;
         }
+        take_spare();  // for the next datagram
       }
 
       if (overflow) {

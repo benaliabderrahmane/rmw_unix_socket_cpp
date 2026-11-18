@@ -258,6 +258,11 @@ if(BUILD_TESTING)
   target_link_libraries(bench_serialize_into_ring
     ${_unit_test_deps} ${_test_msg_deps})
   target_include_directories(bench_serialize_into_ring PRIVATE src)
+
+  # Benchmark (standalone, not a ctest): CPU time and page faults per
+  # publish + take round trip through the public API (#84).
+  add_executable(bench_take_path test/perf/bench_take_path.cpp)
+  target_link_libraries(bench_take_path ${_rmw_test_libs} ${_test_msg_deps})
 endif()
 
 ament_package()
