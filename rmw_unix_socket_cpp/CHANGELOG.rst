@@ -4,7 +4,8 @@ Changelog for package rmw_unix_socket_cpp
 
 Forthcoming
 -----------
-The EventsExecutor release. ``rclcpp``'s ``EventsExecutor`` — the default in
+The EventsExecutor release, with the message_lost and matched QoS events,
+ros2_tracing tracepoints, aarch64 support and a faster receive path. ``rclcpp``'s ``EventsExecutor`` — the default in
 ``performance_test`` and ``ros2-benchmark-container`` — crashed on every pub/sub
 topology, and fixing the crash only turned it into a silent hang: that executor
 never calls ``rmw_wait``, and delivery happened exclusively inside ``rmw_wait``, so
@@ -52,6 +53,12 @@ four copies of the receive loop that hid the gap are one.
   listener and an ``rmw_wait``/``rmw_take`` drain the same socket; and
   ``listener_registration_mutex`` serialises concurrent set and clear calls on
   one endpoint so its callback and its socket watch always agree.
+* **ros2_tracing tracepoints** (#74). ``rmw_publisher_init``,
+  ``rmw_subscription_init``, ``rmw_publish`` and ``rmw_take`` are emitted as in
+  ``rmw_cyclonedds`` and ``rmw_fastrtps``, so ``ros2 trace``, ``tracetools_analysis``
+  and CARET follow a message across processes on this RMW. Both sides pass the
+  timestamp already on the wire, so the wire format is unchanged; with no tracing
+  session, each call site costs one branch.
 * **aarch64 (arm64) support.** CI builds and tests every distro on GitHub's
   arm64 runners as well as x86_64. No source change was needed: there is no
   arch-specific code, and the shared-memory atomics are asserted lock-free on
@@ -135,14 +142,16 @@ four copies of the receive loop that hid the gap are one.
 
 * **QoS status events are refused honestly.** ``rmw_publisher_event_init`` /
   ``rmw_subscription_event_init`` return ``RMW_RET_UNSUPPORTED`` for every event
-  type they do not report (#61) - the refusal ``rclcpp`` swallows - where
+  type they do not report (#61) - a refusal ``rclcpp``'s default event handlers
+  accept - where
   reporting success made ``EventsExecutor`` crash. ``rmw_event_set_callback`` returned
   a failure with no error message behind it — the ``": error not set"`` half of
   the original ``EventsExecutor`` crash report. ``rmw_take_event``,
   ``rmw_event_set_callback``, both ``*_event_init`` functions and
   ``rmw_subscription_set_on_new_message_callback`` were also missing the
   ``RMW_CHECK_TYPE_IDENTIFIERS_MATCH`` (the service and client callback setters
-  already had it).
+  already had it). On jazzy, a handler that an application registers itself for a
+  refused event type still throws.
 * **Services and clients were callback-dead after registration** (#61
   follow-up). ``on_new_request_cb`` and ``on_new_response_cb`` were stored and
   flushed once against an existing backlog, then never fired again by any drain.
@@ -156,6 +165,20 @@ four copies of the receive loop that hid the gap are one.
   same queued messages out for both calls, and a TRANSIENT_LOCAL subscription
   with ten replayed samples handed the executor twenty events. It now flushes
   only when a callback takes over from none.
+* **A registry slot could be freed before its teardown finished** (#81).
+  ``registry_remove`` and the stale-entry reaper marked a slot empty before tearing
+  it down, so another process could claim it in between and have its new entry
+  wiped: the endpoint vanished from the graph, and a nameless ghost entry stayed
+  behind that made ``rmw_get_service_names_and_types`` return an empty name
+  (``foxglove_bridge`` aborts on it). A slot now stays reserved until its teardown
+  is done; the shared-memory layout is unchanged.
+* **rmw_wait keeps the timeout's sub-millisecond resolution** (#83). The timeout
+  was rounded to whole milliseconds, so a 1 kHz timer woke late and ``rclcpp``
+  skipped about 6 % of its periods, and a 1.7 ms wait timed out after 1 ms. Waits
+  now block with ``epoll_pwait2()`` on a nanosecond deadline, falling back to
+  ``epoll_wait()`` where it is unavailable (glibc older than 2.35, kernel older
+  than 5.11, or a seccomp profile that blocks it). A 1 kHz ``create_wall_timer``
+  now runs 29 999 of 30 000 periods in 30 s instead of 28 174.
 
 **Upgrade notes**
 
