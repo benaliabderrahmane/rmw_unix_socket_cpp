@@ -52,6 +52,10 @@ four copies of the receive loop that hid the gap are one.
   listener and an ``rmw_wait``/``rmw_take`` drain the same socket; and
   ``listener_registration_mutex`` serialises concurrent set and clear calls on
   one endpoint so its callback and its socket watch always agree.
+* **aarch64 (arm64) support.** CI builds and tests every distro on GitHub's
+  arm64 runners as well as x86_64. No source change was needed: there is no
+  arch-specific code, and the shared-memory atomics are asserted lock-free on
+  both.
 
 **Changed**
 
