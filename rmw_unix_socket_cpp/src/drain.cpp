@@ -41,6 +41,8 @@ DrainTarget drain_target(UdsSubscription * sub)
   t.drain_mutex = &sub->drain_mutex;
   t.queue_mutex = &sub->queue_mutex;
   t.queue = &sub->message_queue;
+  t.spares = &sub->spare_payloads;
+  t.recv_payload = &sub->recv_payload;
   t.max_depth = sub->queue_depth;
   t.msg_type = 0;
   t.shm_cache = &sub->shm_cache;
@@ -64,6 +66,8 @@ DrainTarget drain_target(UdsService * srv)
   t.drain_mutex = &srv->drain_mutex;
   t.queue_mutex = &srv->queue_mutex;
   t.queue = &srv->request_queue;
+  t.spares = &srv->spare_payloads;
+  t.recv_payload = &srv->recv_payload;
   t.max_depth = SERVICE_QUEUE_DEPTH;
   t.msg_type = 1;
   t.shm_cache = &srv->shm_cache;
@@ -82,6 +86,8 @@ DrainTarget drain_target(UdsClient * cli)
   t.drain_mutex = &cli->drain_mutex;
   t.queue_mutex = &cli->queue_mutex;
   t.queue = &cli->response_queue;
+  t.spares = &cli->spare_payloads;
+  t.recv_payload = &cli->recv_payload;
   t.max_depth = SERVICE_QUEUE_DEPTH;
   t.msg_type = 2;
   t.shm_cache = &cli->shm_cache;
@@ -110,7 +116,23 @@ size_t drain_endpoint(const DrainTarget & t)
     std::lock_guard<std::mutex> drain_lock(*t.drain_mutex);
 
     WireHeader hdr;
-    std::vector<uint8_t> payload;
+    // Received into a spare buffer when there is one: no allocation, and no
+    // page faults on a buffer the heap just gave back. Taken under queue_mutex.
+    std::vector<uint8_t> & payload = *t.recv_payload;
+    auto take_spare = [&]() {
+        if (!t.spares->empty()) {
+          payload = std::move(t.spares->back());
+          t.spares->pop_back();
+        }
+      };
+    if (payload.capacity() == 0) {
+      // try_lock: a take deserializes under queue_mutex, and a drain that
+      // finds the socket empty must not wait on it. Contended, it allocates.
+      std::unique_lock<std::mutex> lock(*t.queue_mutex, std::try_to_lock);
+      if (lock.owns_lock()) {
+        take_spare();
+      }
+    }
     // The publisher the two lookups below were made for. A drain usually
     // carries one publisher's datagrams back to back, so each map is searched
     // once per publisher per drain, not per datagram; std::map entries never
@@ -199,7 +221,17 @@ size_t drain_endpoint(const DrainTarget & t)
         // never maps a segment.
         continue;
       }
-      if (!shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload)) {
+      // A KEEP_LAST subscription queues a large payload's descriptor and its
+      // take reads the ring record (#86). Services and clients have no
+      // message_lost to report a lapped record to, and a KEEP_ALL subscription
+      // must not lose what it already received, so they copy it out now.
+      ReceivedMessage msg;
+      const bool in_ring = t.lost_sub && (hdr.msg_type & SHM_PAYLOAD_FLAG) &&
+        t.lost_sub->qos.history != RMW_QOS_POLICY_HISTORY_KEEP_ALL;
+      if (in_ring ?
+        !shm_pin_payload(*t.shm_cache, t.domain_id, payload, msg.shm_desc) :
+        !shm_resolve_incoming(*t.shm_cache, t.domain_id, hdr, payload))
+      {
         // shm descriptor unresolvable (sender gone / ring lapped): the
         // datagram arrived but the message is gone, so it counts as lost -
         // once, and only as a publish the gap check had not already passed.
@@ -207,9 +239,12 @@ size_t drain_endpoint(const DrainTarget & t)
         continue;
       }
 
-      ReceivedMessage msg;
       msg.header = hdr;
-      msg.payload = std::move(payload);
+      if (in_ring) {
+        msg.header.payload_size = msg.shm_desc.payload_size;
+      } else {
+        msg.payload = std::move(payload);
+      }
       msg.received_timestamp_ns = received_now_ns();
 
       bool overflow = false;
@@ -220,9 +255,31 @@ size_t drain_endpoint(const DrainTarget & t)
         // because the take() side isn't keeping up. This is the rcl-layer
         // equivalent of "slow subscriber".
         while (t.queue->size() > t.max_depth) {
+          if (t.lost_sub && (t.queue->front().header.msg_type & SHM_PAYLOAD_FLAG)) {
+            shm_unpin(*t.shm_cache, t.queue->front().shm_desc);
+          }
+          recycle_payload(*t.spares, t.queue->front().payload);
           t.queue->pop_front();
           ++dropped;
           overflow = true;
+        }
+        // Queued records the publisher has since overwritten can no longer be
+        // delivered: drop them now, so the take credit below counts only what a
+        // take can still return. shortcut: checks the front only, so a lapped
+        // record behind another publisher's live one costs a credit until it
+        // reaches the front.
+        while (t.lost_sub && !t.queue->empty() &&
+          (t.queue->front().header.msg_type & SHM_PAYLOAD_FLAG) &&
+          shm_pinned_lapped(*t.shm_cache, t.queue->front().shm_desc))
+        {
+          shm_unpin(*t.shm_cache, t.queue->front().shm_desc);
+          recycle_payload(*t.spares, t.queue->front().payload);
+          t.queue->pop_front();
+          ++dropped;
+          ++lost;
+        }
+        if (payload.capacity() == 0) {
+          take_spare();  // for the next datagram (a pinned one left it in place)
         }
       }
 
@@ -251,9 +308,10 @@ size_t drain_endpoint(const DrainTarget & t)
   // The count is how much the queue GREW, not how many datagrams the socket
   // handed over. number_of_events is a take credit - the executor calls take()
   // once per event - so an overflow that pushed 100 and popped 90 must report
-  // 10, or the executor spends 90 takes finding nothing. At most one pop per
-  // push, so dropped never exceeds enqueued.
-  const size_t gained = enqueued - dropped;
+  // 10, or the executor spends 90 takes finding nothing. Lapped records
+  // dropped here may have been credited by an earlier drain, so dropped can
+  // exceed enqueued.
+  const size_t gained = enqueued > dropped ? enqueued - dropped : 0;
   if (gained == 0 || !t.callback_mutex) {
     return enqueued;
   }

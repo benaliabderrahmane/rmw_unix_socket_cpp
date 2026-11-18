@@ -23,6 +23,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <vector>
 
 namespace rmw_uds
 {
@@ -55,6 +56,10 @@ struct DrainTarget
   std::mutex * drain_mutex = nullptr;
   std::mutex * queue_mutex = nullptr;
   std::deque<ReceivedMessage> * queue = nullptr;
+  // The endpoint's spare buffers (guarded by *queue_mutex) and the buffer
+  // the drain receives into (guarded by *drain_mutex). See SparePayloads.
+  SparePayloads * spares = nullptr;
+  std::vector<uint8_t> * recv_payload = nullptr;
   // Trim the queue to this many entries after each push.
   size_t max_depth = SERVICE_QUEUE_DEPTH;
   // The WireHeader::msg_type this endpoint accepts: 0 topic, 1 request,

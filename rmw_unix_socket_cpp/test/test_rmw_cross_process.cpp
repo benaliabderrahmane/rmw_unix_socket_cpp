@@ -38,12 +38,16 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <csignal>
+#include <cstdio>
 #include <cstring>
 #include <string>
 
 #include "rmw/rmw.h"
 #include "rmw/init.h"
+#include "rmw/event.h"
+#include "rmw/events_statuses/events_statuses.h"
 #include "rmw/init_options.h"
 #include "rmw/qos_profiles.h"
 
@@ -375,4 +379,128 @@ TEST(CrossProcessTest, LargeServiceRoundTrip)
   auto _s [[maybe_unused]] = rmw_destroy_service(ctx.node, srv);
   ctx.fini();
   close(ready[1]);
+}
+
+TEST(CrossProcessTest, ATakeNeverDeliversARecordThePublisherIsOverwriting)
+{
+  // Issue #86: a subscription deserializes large payloads straight from the
+  // publisher's ring at take time. A child process publishes 1 MiB messages
+  // flat out, each filled with one byte value derived from its sequence
+  // number, while this process takes them, now and then too slowly, so the
+  // ring is lapped both while messages sit queued and while one is being
+  // deserialized. Every message delivered must be whole: one byte value, the
+  // one its sequence number names. The rest are lost (message_lost) or
+  // dropped by the KEEP_LAST queue. A separate process, so the overwrites are
+  // real concurrency that no sanitizer models as a race.
+  // Domain 90: private to this test.
+  constexpr size_t kDomain = 90;
+  constexpr size_t kSize = 1024 * 1024;
+  constexpr int kCount = 600;
+  signal(SIGPIPE, SIG_IGN);
+  int ready[2], done[2], ack[2];
+  ASSERT_EQ(0, pipe(ready));
+  ASSERT_EQ(0, pipe(done));
+  ASSERT_EQ(0, pipe(ack));
+
+  pid_t pid = fork();
+  ASSERT_GE(pid, 0);
+
+  if (pid == 0) {
+    // ---- child: the publisher ----
+    alarm(60);
+    close(ready[1]);
+    close(done[0]);
+    close(ack[1]);
+    if (!wait_byte(ready[0], 15000)) {_exit(kChildPipeTimeout);}
+    ProcContext ctx;
+    if (!ctx.init(kDomain, "xproc_lap_pub")) {_exit(kChildInitFailed);}
+    auto ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+      test_msgs::msg::UnboundedSequences>();
+    auto qos = make_qos(RMW_QOS_POLICY_DURABILITY_VOLATILE);
+    auto pub_opts = rmw_get_default_publisher_options();
+    auto * pub = rmw_create_publisher(ctx.node, ts, "/xproc_lap", &qos, &pub_opts);
+    if (!pub) {_exit(kChildEntityFailed);}
+    test_msgs::msg::UnboundedSequences msg;
+    for (int i = 1; i <= kCount; ++i) {
+      msg.uint8_values.assign(kSize, static_cast<uint8_t>(i));  // sequence number i
+      if (rmw_publish(pub, &msg, nullptr) != RMW_RET_OK) {_exit(kChildEntityFailed);}
+      usleep(400);  // about the parent's pace, so it laps the ring now and then
+    }
+    send_byte(done[1]);
+    // Keep the ring until the parent has taken what it will take.
+    (void)wait_byte(ack[0], 30000);
+    auto _r [[maybe_unused]] = rmw_destroy_publisher(ctx.node, pub);
+    ctx.fini();
+    _exit(kChildOk);
+  }
+
+  // ---- parent: the subscription ----
+  ChildGuard guard(pid);
+  close(ready[0]);
+  close(done[1]);
+  close(ack[0]);
+
+  ProcContext ctx;
+  ASSERT_TRUE(ctx.init(kDomain, "xproc_lap_sub"));
+  auto ts = rosidl_typesupport_cpp::get_message_type_support_handle<
+    test_msgs::msg::UnboundedSequences>();
+  auto qos = make_qos(RMW_QOS_POLICY_DURABILITY_VOLATILE);
+  qos.depth = 10;
+  auto sub_opts = rmw_get_default_subscription_options();
+  auto * sub = rmw_create_subscription(ctx.node, ts, "/xproc_lap", &qos, &sub_opts);
+  ASSERT_NE(nullptr, sub);
+  rmw_event_t lost_event = rmw_get_zero_initialized_event();
+  ASSERT_EQ(RMW_RET_OK, rmw_subscription_event_init(&lost_event, sub, RMW_EVENT_MESSAGE_LOST));
+  send_byte(ready[1]);
+
+  int delivered = 0;
+  int torn = 0;
+  bool publisher_done = false;
+  for (int spin = 0; spin < 60 * 1000; ++spin) {  // <= about 60 s
+    test_msgs::msg::UnboundedSequences got;
+    rmw_message_info_t info = rmw_get_zero_initialized_message_info();
+    bool taken = false;
+    ASSERT_EQ(RMW_RET_OK, rmw_take_with_info(sub, &got, &taken, &info, nullptr));
+    if (taken) {
+      ++delivered;
+      const auto expected = static_cast<uint8_t>(info.publication_sequence_number);
+      if (got.uint8_values.size() != kSize ||
+        std::count(got.uint8_values.begin(), got.uint8_values.end(), expected) !=
+        static_cast<std::ptrdiff_t>(kSize))
+      {
+        ++torn;
+      }
+      if (delivered % 7 == 0) {
+        usleep(3000);  // fall behind: the ring laps queued messages
+      }
+      continue;
+    }
+    if (publisher_done) {
+      break;  // the publisher has finished and the queue is empty
+    }
+    publisher_done = wait_byte(done[0], 1);
+  }
+  send_byte(ack[1]);
+
+  rmw_message_lost_status_t st{};
+  bool taken = false;
+  EXPECT_EQ(RMW_RET_OK, rmw_take_event(&lost_event, &st, &taken));
+  EXPECT_EQ(0, torn) << "a torn message was delivered";
+  EXPECT_TRUE(publisher_done);
+  EXPECT_GT(delivered, 0);
+  EXPECT_GT(st.total_count, 0u) << "the ring was never lapped: the test checked nothing";
+  EXPECT_LE(static_cast<size_t>(delivered) + st.total_count, static_cast<size_t>(kCount));
+  std::printf("delivered %d of %d, message_lost %zu\n", delivered, kCount, st.total_count);
+
+  int code = reap_child(pid, 30);
+  guard.disarm();
+  EXPECT_EQ(kChildOk, code)
+    << "child exit " << code << " (2=pipe timeout, 3=init, 4=entity, -1=killed/signalled)";
+
+  EXPECT_EQ(RMW_RET_OK, rmw_event_fini(&lost_event));
+  auto _s [[maybe_unused]] = rmw_destroy_subscription(ctx.node, sub);
+  ctx.fini();
+  close(ready[1]);
+  close(done[0]);
+  close(ack[1]);
 }
