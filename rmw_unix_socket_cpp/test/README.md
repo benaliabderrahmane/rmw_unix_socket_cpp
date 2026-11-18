@@ -1,4 +1,4 @@
-# rmw_unix_socket_cpp — Test Suite
+# rmw_unix_socket_cpp test suite
 
 This document describes every test in the suite, what it validates, and why each test exists.
 
@@ -28,7 +28,7 @@ Tests the POSIX shared memory discovery registry (`/dev/shm/ros2_uds_<domain_id>
 | `GenerationIncrementsOnChange` | Generation counter increases on add and again on remove | The generation counter drives graph guard condition triggers. If it doesn't increment, `ros2 node list` and `ros2 topic list` never update. |
 | `QueryReturnsNamesOfEveryLength` | Names of every length from 0 to 255 round-trip through add and query in all five string fields | A snapshot copies each name only up to the word holding its terminator. A terminator in a field's unaligned head, on a word boundary, in its tail or in its last byte must not truncate or extend the name. |
 | `QueryFiltersByType` | Adding a PUBLISHER and SUBSCRIPTION on the same topic, then querying by type returns only the requested type | Prevents `rmw_count_publishers` from accidentally counting subscribers, or `rmw_publish` from sending to other publishers instead of subscribers. |
-| `MultipleEntriesSameType` | Add 50 node entries, query returns all 50 | Validates the registry scales beyond trivial counts. Catches off-by-one errors in slot scanning and ensures the linear search over 8192 slots works. |
+| `MultipleEntriesSameType` | Add 50 node entries, query returns all 50 | Validates the registry scales beyond trivial counts. Catches off-by-one errors in slot scanning and ensures the linear search over the slot array works. |
 | `DoorbellBitTracksDoorbellSlots` | The header's `doorbell_bits` bitmap marks a doorbell slot on add and unmarks it on remove and on stale reclaim, and never marks a node slot | `ring_doorbells` finds doorbells through this bitmap (#53). A missing bit is a lost wakeup for a blocked graph waiter; a bit left set after a reclaim is harmless only because of the type re-check the next test pins. |
 | `MutationRingsOnlyDoorbellSlots` | A mutation rings doorbells in the first and in a later bitmap word exactly once each, and a stale bit over a subscription slot sends nothing to its socket | Pins both halves of the bitmap walk: every word below `high_water_slot` is visited, and a bit is a hint that the seqlock type check filters, so a wake octet never lands on a data socket. |
 | `MutationRingsDoorbellsAtWordBoundary` | Doorbells in slots 63 and 64 (the last bit of bitmap word 0 and the first of word 1) are each rung exactly once per mutation | The walk skips to the next word when the rest of a word is empty; an off-by-one there loses or doubles the doorbell on either side of the boundary. |
@@ -62,6 +62,46 @@ Tests the Unix domain socket send/receive layer.
 | `MultipleMessages` | Send 10 messages, receive all 10 in order with correct sequence numbers | Validates FIFO ordering (guaranteed by Unix DGRAM sockets) and that no messages are lost or reordered in rapid succession. |
 
 ---
+
+### test_shm_transport.cpp
+
+Tests the shared-memory path for large payloads (`shm_transport.cpp`): the per-publisher ring, its two-phase reserve and commit writes, and the TRANSIENT_LOCAL latched ring.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `StageAndFetchRoundTrip` | A staged payload is fetched back byte-equal through its descriptor | The basic path every large message takes. |
+| `ManyMessagesEachFetchable` | Staging and fetching interleaved the way a drain loop sees them all round-trip | Catches cursor and wrap mistakes that a single round trip hides. |
+| `LappedRecordIsCleanDrop` | With 3 MB records the ring holds four; the fifth stage laps the first, whose descriptor then fails cleanly | A slow reader must lose the message, never read a torn one. |
+| `RingGrowthInvalidatesOldSegmentName` | A payload too big for the ring creates a new, larger segment under a new name | Readers must not resolve new descriptors against the old generation. |
+| `MappedSegmentSurvivesWriterClose` | A reader that already mapped the segment keeps reading it after the publisher is destroyed | Unlink removes the name, not the mapping, so messages in flight stay readable. |
+| `HostileDescriptorRejected` | A descriptor whose offset is beyond the ring is rejected by the bounds check | Any local process can send a datagram; a forged descriptor must never read outside the mapping. |
+| `StaleSeqIsCleanDrop` | A descriptor whose expected sequence no longer matches the record is dropped | The seqlock check is what turns an overwrite into a clean drop. |
+| `CleanupRemovesDeadPidSegments` | Cleanup removes a segment named after a dead PID and keeps one owned by a live process | A crashed publisher must not leak `/dev/shm`, and a live one must never lose its ring. |
+| `ReserveCommitRoundTrip` | A record written through reserve and commit round-trips | The serializer writes large messages in place through this two-phase write. |
+| `CommitSmallerThanReservedPacksTight` | Committing less than was reserved advances the cursor by the actual size | The size walk can overestimate; the ring must not waste the difference. |
+| `AbortLeavesSlotReusableAndUnobservable` | An aborted reservation is reused by the next publish and never seen by readers | A failed serialization must leave no half-written record behind. |
+| `ReservedUncommittedSlotFailsStaleDescriptor` | A descriptor for a record that an in-flight writer has reserved fails cleanly | The seqlock stays odd for the whole reserve-to-commit window. |
+| `CommitOverReservationIsRejected` | Committing more than was reserved is rejected and behaves like an abort | Nothing may be written past the reserved area. |
+| `TlRingLatchAndPullRoundTrip` | Latched samples are pulled back in order, and a pull that expects another publisher's GID is refused | Late joiners pull TRANSIENT_LOCAL history themselves; a stale segment must not be replayed. |
+| `TlRingPullSkipsPoisonedSlotAndReturnsPromptly` | A slot left odd by a publisher killed mid-latch is skipped after bounded retries | The pull must never spin forever or throw away the rest of the history. |
+| `TlRingPullFlagsOverlapWhenASkippedSlotIsFilled` | A sequence gap in the pulled history is flagged as an overlap | The subscriber then keeps only the contiguous prefix, so its dedup watermark never skips a sample still in flight. |
+| `TlRingDepthClampAndNewestSuffix` | A depth beyond the byte cap clamps to the slot count, and a fully lapped ring replays the newest samples | The stock `rosout` depth of 1000 must fit unclamped. |
+| `TlRingEmbedCapBoundary` | A sample of exactly `TL_EMBED_CAP` bytes is embedded; one byte more must be staged durably by the caller | An off-by-one would make the pull treat the record as torn and drop the latched sample. |
+
+### test_registry_concurrent.cpp
+
+Stress tests for the registry's lock-free protocol: many threads adding, removing and reading slots at once.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `ConcurrentAddRemoveLeavesRegistryEmpty` | Threads add and remove unique entries; afterwards the registry is empty and the generation moved exactly once per add and once per remove | Lost or doubled updates would leave ghost entries or missed graph changes. |
+| `ReadersNeverSeeTornEntries` | Readers querying while a writer cycles entries only ever see entries the writer wrote in full | The seqlock's no-torn-read guarantee. |
+| `ConcurrentWritersNeverCorruptEachOthersSlots` | With many writers recycling slots, no remover's teardown overlaps another thread's fresh add | The multi-writer version of the torn-read test. |
+| `OwnedSlotIsNotWrittenByOtherThreads` | A slot a thread won is written by nobody else until that thread removes it | The invariant behind the empty-node-name graph corruption. |
+| `ConcurrentAllocateDistinctSlots` | Threads racing on `registry_add` each get a distinct slot | Two endpoints sharing a slot would overwrite each other. |
+| `ConcurrentRemoveOfSameSlotIsIdempotent` | Two threads remove the same slot: exactly one succeeds and the generation moves once | A double removal must not free a slot someone else just claimed. |
+| `GenerationCounterMonotonicUnderChaos` | No observer sees the generation counter go backwards under concurrent mutation | Publishers and waiters compare generations to decide when to rescan. |
+| `StaleReapNeverClobbersConcurrentAdd` | A stale-PID reap never tears down an entry a live process wrote into the same slot | The bug fixed in #81: the reaper freed a slot before zeroing it. |
 
 ## RMW API Tests
 
@@ -240,15 +280,24 @@ Tests QoS policies, TRANSIENT_LOCAL (latched), and multi-endpoint scenarios.
 
 ---
 
+### test_rmw_cross_process.cpp
+
+Runs a second process to exercise the large-message paths across the PID boundary, each test on its own ROS domain.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `LargeTransientLocalLateJoiner` | A 5 MB latched message reaches a subscriber that joins late from another process, byte-equal | The late joiner maps the publisher's durable segment across processes. |
+| `LargeServiceRoundTrip` | A 5 MB request and a 5 MB response cross between two processes | Each side maps the other's ring. |
+| `ATakeNeverDeliversARecordThePublisherIsOverwriting` | A child process publishes 1 MiB messages flat out while this process takes them; every delivered message is intact and the laps show up in `message_lost` | Pins the in-place read from the ring (#86): a torn record is never delivered. |
+
 ## What is NOT tested (and why)
 
 | Feature | Reason |
 |---------|--------|
-| Loaned messages | Not implemented — Unix sockets copy through kernel, zero-copy requires shared memory. Returns `RMW_RET_UNSUPPORTED`. |
+| Loaned messages | Not implemented: the large-message ring is written by the serializer, not lent to the application. Returns `RMW_RET_UNSUPPORTED`. |
 | Dynamic messages | Not implemented — requires middleware type discovery. Returns `RMW_RET_UNSUPPORTED`. |
 | Network flow endpoints | Not applicable — AF_UNIX has no IP endpoints. Returns `RMW_RET_UNSUPPORTED`. |
 | Content filtering | Not implemented. Returns `RMW_RET_UNSUPPORTED`. |
-| Cross-process tests | All tests run in a single process. Cross-process communication works via the same shared-memory registry and socket paths, but testing it requires launching separate processes (integration test territory). |
 | Deadline / lifespan QoS | Not enforced — these are timer-based policies that require background monitoring. The listener thread is event-driven, not timer-driven (socket readiness, never a clock), so it does not make them enforceable. Accepted as a known limitation for this lightweight implementation. |
 | Deadline, liveliness, incompatible-QoS and incompatible-type events | Not generated. `test_rmw_event.cpp` tests the refusal instead: `rmw_event_type_is_supported` returns `false` for them and both `*_event_init` functions reject with `RMW_RET_UNSUPPORTED`, which `rclcpp` catches for the handlers it installs by default. |
 | `message_lost` from a real kernel drop | `test_rmw_event.cpp` injects the sequence gap a drop leaves instead of making the kernel drop datagrams, which a test cannot do on demand. |

@@ -171,8 +171,8 @@ Each inline message travels as exactly one `SOCK_DGRAM` datagram. A datagram is 
 `create_bound_socket()` and `create_send_socket()` both request a 48 MiB buffer:
 
 ```c
-static constexpr int RECV_BUF_SIZE = 48 * 1024 * 1024;  // source comment loosely labels this 48 MB; the value is 48 MiB
-static constexpr int SEND_BUF_SIZE = 48 * 1024 * 1024;
+static constexpr int RECV_BUF_SIZE = 48 * 1024 * 1024;  // 48 MB
+static constexpr int SEND_BUF_SIZE = 48 * 1024 * 1024;  // 48 MB
 ```
 
 That request is not honored as written. When `setsockopt(SO_SNDBUF)` or `setsockopt(SO_RCVBUF)` is called, the kernel clamps the value to the system-wide limits `net.core.wmem_max` (send) and `net.core.rmem_max` (receive). `setsockopt` still returns 0 on a clamp, so the clamp is silent: there is no error to catch, the buffer is just smaller than asked for. Neither call site reads the effective size back with `getsockopt`; the warning at `transport.cpp:66-68` / `86-88` fires only on an outright `setsockopt` failure and logs the requested constant, not the effective size. So a clamp is invisible to the process.
@@ -768,15 +768,16 @@ Required system tuning for a production deployment. Without these, you will hit 
 
 | Knob | Default | Recommended | Why |
 |---|--:|--:|---|
-| `net.core.rmem_max` | ~212 KB | 48 MB+ | Caps `SO_RCVBUF`. We request 48 MB; without this we get ~212 KB and large messages drop. |
-| `net.core.wmem_max` | ~212 KB | 48 MB+ | Same for `SO_SNDBUF`. Especially relevant for `EMSGSIZE` on point clouds. |
-| `net.unix.max_dgram_qlen` | 512 | 4096 | Per-Unix-dgram-socket pending-datagram cap. Bursty fan-out (e.g. a new node appearing on a 150-node fleet) overflows 512 with small messages. |
+| `net.core.rmem_max` | ~212 KB | 48 MB+ | Caps `SO_RCVBUF`. We request 48 MiB; without this the kernel silently gives ~212 KB, which leaves little room for a burst. Large messages ride shared memory and depend on it only when staging fails. |
+| `net.core.wmem_max` | ~212 KB | 48 MB+ | Same for `SO_SNDBUF`. Unix datagrams stay charged to the sender until read, so a small send buffer drops sooner when subscribers lag. `EMSGSIZE` only appears when a large message falls back to a datagram. |
+| `net.unix.max_dgram_qlen` | 512 (10 in a new network namespace) | 4096 | Per-Unix-dgram-socket pending-datagram cap. Bursty fan-out (e.g. a new node appearing on a 150-node fleet) overflows 512 with small messages. It is set per network namespace: a container with its own starts at the kernel default of 10 whatever the host says, so pass `--sysctl net.unix.max_dgram_qlen=4096` (not needed with `--network=host`). |
 | `ulimit -n` (`nofile`) | 1024 | 65536 | Each pub/sub/service/client takes 1–2 fds. A 150-node fleet exceeds 1024 quickly. |
 
 Docker requirements:
-- `--ipc=host` — for `/dev/shm` sharing
-- `--pid=host` — for cross-container stale-PID cleanup correctness
-- `-v /tmp/ros2_uds:/tmp/ros2_uds` — for socket file sharing
+- `--ipc=host`: for `/dev/shm` sharing
+- `--pid=host`: for cross-container stale-PID cleanup correctness
+- `-v /tmp/ros2_uds:/tmp/ros2_uds`: for socket file sharing
+- `--sysctl net.unix.max_dgram_qlen=4096`: the queue limit is per network namespace (not needed with `--network=host`)
 
 Files under `/tmp/ros2_uds/<domain>/` must not be removed while their owning processes are alive: they are live sockets (data and doorbell), not temp files, and an external cleaner deleting one silently severs delivery or wakeups to that process. Exempt the directory from tmpfile sweepers, e.g. a `tmpfiles.d` drop-in containing `x /tmp/ros2_uds`. (Ubuntu's default configuration cleans `/tmp` only at boot, and Docker containers run no cleaner, so this bites mainly on hosts with a cron-driven `tmpwatch`/`tmpreaper`.)
 
@@ -811,19 +812,19 @@ The per-endpoint cost is what scales with the system. Each node, publisher, subs
 
 This RMW communicates only between processes on a single host. `AF_UNIX` sockets are local to the machine by definition, and the shared-memory registry is a single host-local file. There is no network transport, no multi-host discovery, and no DDS interoperability: every node on the machine must use `rmw_unix_socket_cpp`, and it cannot exchange messages with CycloneDDS, FastDDS, Connext, or Zenoh endpoints. There is also no DDS-Security: no authentication, encryption, or access control. Anything on the host that can read `/dev/shm` and `/tmp/ros2_uds/` can observe and inject traffic. For networked communication or secured deployments, a DDS-based RMW is the right choice. The implementation is also Linux-specific, because it relies on `epoll`, `eventfd`, `/dev/shm`, and `AF_UNIX`.
 
-#### The single-datagram size cap (~400 KB)
+#### The datagram size cap (fallback only)
 
-Each message must fit in a single datagram; the usable cap is roughly 400 KB on a stock kernel. See The per-message size cap (~400 KB) under Transport for the full derivation and the sysctl remedy.
+Messages under 64 KiB travel as one datagram, well below the cap, and larger ones go through shared memory. Only when staging fails (`/dev/shm` unavailable or full) does a large message fall back to a single datagram, which is then limited to roughly 400 KB on a stock kernel. See The per-message size cap (~400 KB) under Transport for the derivation and the sysctl remedy.
 
-#### Notification requires a thread inside rmw_wait
+#### Graph changes need a waiting thread or the listener
 
-Graph events are serviced from inside `rmw_wait` (woken by the doorbell). A process none of whose threads ever enters `rmw_wait` — an executor wedged in a user callback — cannot observe graph changes until it next waits. `TRANSIENT_LOCAL` late-joiner replay no longer has this limit at all: the joining subscriber pulls the latched cache itself, so an idle, wedged, or never-waiting publisher process still replays.
+Graph changes are noticed inside `rmw_wait` (woken by the doorbell), or by the listener thread while a matched-event callback is registered. A process with neither, such as an executor stuck in a user callback, sees graph changes only when it next waits. `TRANSIENT_LOCAL` late-joiner replay does not have this limit: the joining subscriber pulls the latched cache itself, so an idle, stuck, or never-waiting publisher process still replays.
 
 #### Functions that return `RMW_RET_UNSUPPORTED`
 
 These functions are part of the RMW API but cannot be backed by a copy-based Unix-socket transport. Returning `RMW_RET_UNSUPPORTED` is the contract that tells rcl/rclcpp to skip the feature gracefully rather than fail.
 
-- **Loaned (zero-copy) messages**: `rmw_borrow_loaned_message`, `rmw_publish_loaned_message`, `rmw_take_loaned_message`, `rmw_take_loaned_message_with_info`, `rmw_return_loaned_message_from_publisher`, `rmw_return_loaned_message_from_subscription`. Loaned messages require publisher and subscriber to share the same memory region. This transport copies payloads through kernel socket buffers, so there is no shared region to lend.
+- **Loaned (zero-copy) messages**: `rmw_borrow_loaned_message`, `rmw_publish_loaned_message`, `rmw_take_loaned_message`, `rmw_take_loaned_message_with_info`, `rmw_return_loaned_message_from_publisher`, `rmw_return_loaned_message_from_subscription`. Loaned messages need the RMW to lend the application a buffer that the subscriber then reads without a copy. Small messages travel through kernel socket buffers, and the shared-memory ring used for large ones is written by the serializer, not lent to the application, so there is nothing to lend yet.
 - **Dynamic message types**: `rmw_take_dynamic_message`, `rmw_take_dynamic_message_with_info`, `rmw_serialization_support_init`. Dynamic typing needs a runtime type-discovery protocol (such as DDS Type Object) to learn remote message layouts. The registry carries only a type name string, not a type description.
 - **Network flow endpoints**: `rmw_publisher_get_network_flow_endpoints`, `rmw_subscription_get_network_flow_endpoints`. These report IP addresses and ports for QoS tracing. `AF_UNIX` sockets are addressed by filesystem path, so there is no IP flow to report.
 - **Content filtering**: `rmw_subscription_set_content_filter`, `rmw_subscription_get_content_filter`. Filtering requires a per-message expression engine. Every subscriber receives every message on its topic.
@@ -855,7 +856,7 @@ colcon test-result --verbose
 
 ### Build and file structure
 
-The package builds with `ament_cmake`, using `configure_rmw_library()` and `register_rmw_implementation()` to register itself as a selectable RMW. Its only dependencies are standard ROS 2 packages and Linux kernel APIs: `rmw` (the abstract interface), `rcutils` and `rcpputils` (utilities), `fastcdr` with `rosidl_typesupport_fastrtps_c` / `rosidl_typesupport_fastrtps_cpp` (CDR serialization), and `pthread` / `rt` (POSIX threading and shared memory). No DDS or other external middleware is pulled in; everything else is implemented directly on kernel primitives that are always present.
+The package builds with `ament_cmake`, using `configure_rmw_library()` and `register_rmw_implementation()` to register itself as a selectable RMW. Its only dependencies are standard ROS 2 packages and Linux kernel APIs: `rmw` (the abstract interface), `rcutils` and `rcpputils` (utilities), `rosidl_runtime_c` and `fastcdr` with `rosidl_typesupport_fastrtps_c` / `rosidl_typesupport_fastrtps_cpp` (CDR serialization), `tracetools` (the rmw tracepoints), and `pthread` / `rt` (POSIX threading and shared memory). No DDS or other external middleware is pulled in; everything else is implemented directly on kernel primitives that are always present.
 
 To build and select it:
 
@@ -876,6 +877,7 @@ The source under `src/` is organized so each concern sits in one place:
 | `registry.hpp` / `registry.cpp` | Shared-memory discovery registry |
 | `serialization.hpp` / `serialization.cpp` | CDR serialization via `fastcdr` |
 | `transport.hpp` / `transport.cpp` | Unix socket send/receive helpers |
+| `shm_transport.hpp` / `shm_transport.cpp` | Shared-memory rings and durable segments for large payloads |
 | `rmw_init.cpp` | Context init and shutdown |
 | `rmw_node.cpp` | Node create/destroy |
 | `rmw_publisher.cpp` | Publisher create/destroy/publish |
@@ -884,9 +886,10 @@ The source under `src/` is organized so each concern sits in one place:
 | `rmw_client.cpp` | Service client |
 | `rmw_guard_condition.cpp` | Guard conditions (`eventfd`) |
 | `rmw_wait.cpp` | Wait set (`epoll`) |
-| `drain.cpp` | The one socket-receive loop, shared by every caller |
-| `listener.cpp` | Listener thread for callback-driven delivery |
+| `drain.hpp` / `drain.cpp` | The one socket-receive loop, shared by every caller |
+| `listener.hpp` / `listener.cpp` | Listener thread for callback-driven delivery |
 | `rmw_graph.cpp` | Graph introspection queries |
+| `events.hpp` | QoS status event internals used by the wait set, the drain and the listener |
 | `rmw_event.cpp` | QoS status events: message_lost and matched; the rest refused |
 | `rmw_serialize.cpp` | Public serialize/deserialize API |
 | `rmw_features.cpp` | Feature queries, identifier, QoS |

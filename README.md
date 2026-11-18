@@ -1,87 +1,87 @@
 # rmw_unix_socket_cpp
 
-A lightweight, **localhost-only** RMW (ROS Middleware) implementation for ROS 2,
-built on Unix domain sockets and POSIX shared memory instead of DDS.
+A ROS 2 middleware (RMW) implementation for systems that run on one Linux machine.
+It uses Unix domain sockets and POSIX shared memory instead of DDS.
 
-It targets single-machine deployments with many nodes (150+ in production) and a
-small, deterministic resource footprint — no DDS, no daemon, and no background
-thread unless your executor asks to be called back. Discovery is a shared-memory
-registry; data moves over `AF_UNIX`
-datagram sockets; the wait set is `epoll` + `eventfd`.
+It was written for a robot with many nodes on one computer (150+ in production).
+There is no DDS, no daemon, and no background thread unless your executor asks
+for callbacks. Discovery is a table in shared memory, messages travel over
+`AF_UNIX` datagram sockets, large messages go through shared memory, and waiting
+is `epoll` plus `eventfd`.
 
-## When to use it (and when not)
+## When to use it
 
-**Use it when:**
-- Everything runs on **one Linux host** (bare metal or co-located containers).
-- You want lower overhead and more predictable resource usage than DDS.
-- You don't need network communication, security, or DDS interoperability.
+Use it when:
+- everything runs on one Linux host (bare metal, or containers on the same host);
+- you want less overhead and steadier resource use than DDS;
+- you don't need networking, security or DDS interoperability.
 
-**Don't use it when:**
-- Nodes span **multiple machines** — `AF_UNIX` is local-only. Use CycloneDDS or Zenoh.
-- You need DDS interop, content filtering, zero-copy loaned messages, or
-  deadline/lifespan/liveliness QoS. See [Limitations](#limitations).
+Don't use it when:
+- your nodes run on several machines: `AF_UNIX` is local only, so use Cyclone DDS,
+  Fast DDS or Zenoh;
+- you need DDS interoperability, content filtering, loaned messages, or deadline,
+  lifespan and liveliness QoS (see [Limitations](#limitations)).
 
 ## Status
 
-- ROS 2 **Jazzy**, **Rolling**, and **Lyrical** — built and tested in CI.
-- **Linux** on **x86_64** and **aarch64** (uses `epoll`, `eventfd`, `/dev/shm`, `AF_UNIX`).
-- Version `0.6.0`, Apache-2.0.
+- Built and tested in CI on ROS 2 Jazzy, Rolling and Lyrical.
+- Linux on x86_64 and aarch64 (it uses `epoll`, `eventfd`, `/dev/shm` and `AF_UNIX`).
+- Version 0.6.0, Apache-2.0.
 
 ## Quick start
 
 ```bash
-# Build (from your workspace root, alongside your other packages)
-source /opt/ros/jazzy/setup.bash
+mkdir -p ~/ws/src && cd ~/ws
+git clone https://github.com/benaliabderrahmane/rmw_unix_socket_cpp.git src/rmw_unix_socket_cpp
+source /opt/ros/jazzy/setup.bash        # or rolling, lyrical
+rosdep install --from-paths src --ignore-src -y
 colcon build --packages-select rmw_unix_socket_cpp
 
-# Select it at runtime — every process that should talk must set this
-source install/setup.bash
+# In every terminal that should use it:
+source ~/ws/install/setup.bash
 export RMW_IMPLEMENTATION=rmw_unix_socket_cpp
 
-# Verify
 ros2 run demo_nodes_cpp talker
-# ...in another terminal (with the same two env exports):
-ros2 run demo_nodes_cpp listener
-ros2 doctor --report   # confirms the active middleware
+ros2 run demo_nodes_cpp listener       # in a second terminal
+ros2 doctor --report                   # shows the active middleware
 ```
 
-Without `RMW_IMPLEMENTATION=rmw_unix_socket_cpp`, rcl loads whatever RMW is the
-system default (usually FastDDS) and this implementation is never used. **All**
-nodes that need to communicate must select the same RMW — there is no DDS bridge.
+Every process that should talk to the others needs
+`RMW_IMPLEMENTATION=rmw_unix_socket_cpp`. Without it, rcl loads the system default
+(usually Fast DDS), and there is no bridge between the two.
 
 ## Design at a glance
 
-| Concern | Choice |
+| Part | How it works |
 |---|---|
-| **Transport** | `SOCK_DGRAM` Unix domain sockets in `/tmp/ros2_uds/<domain_id>/`. Message boundaries are free; no connection management. |
-| **Discovery** | Single shared-memory file `/dev/shm/ros2_uds_<domain_id>`. No daemon, no multicast. |
-| **Locking** | Lock-free registry (per-slot seqlock + atomic state machine); process-local caches use a plain mutex. |
-| **Wait** | `epoll` over socket fds + `eventfd` guard conditions. I/O happens inside `rmw_wait`, so a waiting executor gets **no background threads**. |
-| **Callbacks** | An endpoint that registers a listener callback is drained by one per-context listener thread, started on that first registration — what `EventsExecutor` needs, since it never calls `rmw_wait`. |
-| **Serialization** | CDR via `fastcdr` + `rosidl_typesupport_fastrtps` (the same path as the DDS RMWs). |
-| **Stale cleanup** | Dead processes are detected via `/proc/<pid>`; their registry entries and socket files are reclaimed on init and on every discovery query. |
-| **Tracing** | Emits the standard `tracetools` rmw tracepoints (`rmw_publish`, `rmw_take`, `rmw_publisher_init`, `rmw_subscription_init`), so `ros2 trace`, Trace Compass and CARET follow a message across processes on this RMW exactly as they do on the DDS RMWs. |
+| Transport | `SOCK_DGRAM` Unix domain sockets in `/tmp/ros2_uds/<domain_id>/`. Datagrams keep message boundaries, and there are no connections to manage. |
+| Large messages | Messages of 64 KiB and up are written once into shared memory, and each receiver gets a 32-byte descriptor over its socket. A publisher's ring holds at least four of its largest messages (1 MiB minimum), and KEEP_LAST subscriptions decode messages of 512 KiB and up straight from it. |
+| Discovery | One shared-memory file per domain, `/dev/shm/ros2_uds_<domain_id>`. No daemon, no multicast. |
+| Locking | The registry is lock-free (a seqlock per slot and an atomic state machine); caches inside a process use plain mutexes. |
+| Waiting | `epoll` over the socket fds, and an `eventfd` per guard condition. Messages are read inside `rmw_wait`, so an executor that waits gets no background thread. |
+| Callbacks | When an endpoint registers a listener callback, one listener thread per context starts and delivers for it. The `EventsExecutor` needs this, since it never calls `rmw_wait`. |
+| Serialization | CDR through Fast CDR and `rosidl_typesupport_fastrtps`, the same path as the DDS RMWs. |
+| Cleanup | Dead processes are found through `/proc/<pid>`. Their registry entries and socket files are reclaimed at init and during discovery queries, and their shared-memory segments at init. |
+| Tracing | The standard `tracetools` rmw tracepoints (`rmw_publish`, `rmw_take`, `rmw_publisher_init`, `rmw_subscription_init`), so `ros2 trace`, Trace Compass and CARET follow messages across processes as they do on the DDS RMWs. |
 
-Every choice — including the ones that were tried and abandoned — is written up
-with rationale in **[DESIGN.md](rmw_unix_socket_cpp/DESIGN.md)**.
+[DESIGN.md](rmw_unix_socket_cpp/DESIGN.md) explains each of these choices,
+including the ones that were tried and dropped.
 
-## Running across multiple containers
+## Running in containers
 
-Because discovery and cleanup live in shared kernel resources (`/dev/shm`,
-`/tmp`, and the PID namespace), co-located containers must **share** those
-namespaces to see each other. Each container also needs `RMW_IMPLEMENTATION` set.
+Discovery and cleanup use shared kernel resources (`/dev/shm`, `/tmp` and the PID
+namespace), so containers on the same host must share them to see each other.
 
-Required per container:
-
-| Requirement | Why |
+| Setting | Why |
 |---|---|
 | `RMW_IMPLEMENTATION=rmw_unix_socket_cpp` | Selects this middleware. |
-| `--ipc=host` | All containers share `/dev/shm` → the same discovery registry. |
-| `--pid=host` | Stale-PID cleanup uses `/proc/<pid>`; without a shared PID namespace one container reclaims another's live entries and corrupts the registry. |
-| `-v /tmp/ros2_uds:/tmp/ros2_uds` | All containers share the socket files data actually flows over. |
-| same `ROS_DOMAIN_ID` | The registry file and socket directory are per-domain. |
+| `--ipc=host` | Shares `/dev/shm`, so every container uses the same discovery registry and the same large-message rings. |
+| `--pid=host` | Stale-entry cleanup checks `/proc/<pid>`. Without a shared PID namespace, one container would reclaim another's live entries as dead. |
+| `-v /tmp/ros2_uds:/tmp/ros2_uds` | Shares the socket files the data flows through. |
+| `--sysctl net.unix.max_dgram_qlen=4096` | This limit is per network namespace, so a container starts at the kernel default of 10, whatever the host is set to. Not needed with `--network=host`. |
+| Same `ROS_DOMAIN_ID` | The registry file and the socket directory are per domain. |
 
-`docker compose` example:
+With `docker compose`:
 
 ```yaml
 services:
@@ -92,6 +92,8 @@ services:
       - ROS_DOMAIN_ID=0
     ipc: host
     pid: host
+    sysctls:
+      - net.unix.max_dgram_qlen=4096
     volumes:
       - /tmp/ros2_uds:/tmp/ros2_uds
     command: ros2 run demo_nodes_cpp talker
@@ -103,66 +105,74 @@ services:
       - ROS_DOMAIN_ID=0
     ipc: host
     pid: host
+    sysctls:
+      - net.unix.max_dgram_qlen=4096
     volumes:
       - /tmp/ros2_uds:/tmp/ros2_uds
     command: ros2 run demo_nodes_cpp listener
 ```
 
-`docker run` equivalent:
+With `docker run`:
 
 ```bash
-docker run --ipc=host --pid=host \
+docker run --ipc=host --pid=host --sysctl net.unix.max_dgram_qlen=4096 \
   -e RMW_IMPLEMENTATION=rmw_unix_socket_cpp -e ROS_DOMAIN_ID=0 \
   -v /tmp/ros2_uds:/tmp/ros2_uds \
   my_ros_image ros2 run demo_nodes_cpp talker
 ```
 
-### Host kernel tuning
+### Host kernel settings
 
-Set these on the **host** (they apply to all containers). Without them you get
-silent buffer clamps and transient drops under load — fine for small control
-messages, but images and point clouds will be dropped.
+Without these, the kernel silently clamps the socket buffers and bursts of
+messages get dropped under load. Messages of 64 KiB and up go through shared
+memory and don't depend on them, unless `/dev/shm` is unavailable.
 
-| Knob | Default | Recommended | Why |
+| Setting | Default | Recommended | Why |
 |---|--:|--:|---|
-| `net.core.rmem_max` | ~212 KB | 48 MB+ | Caps `SO_RCVBUF`; large messages drop below this. |
-| `net.core.wmem_max` | ~212 KB | 48 MB+ | Caps `SO_SNDBUF`; `EMSGSIZE` on send below this. |
-| `net.unix.max_dgram_qlen` | 512 | 4096 | Per-socket pending-datagram cap; bursty fan-out overflows 512. |
-| `ulimit -n` (`nofile`) | 1024 | 65536 | Each pub/sub/service/client uses 1–2 fds. |
+| `net.core.rmem_max` | ~212 KB | 48 MB+ | Caps `SO_RCVBUF`, the room a subscriber has for a burst. |
+| `net.core.wmem_max` | ~212 KB | 48 MB+ | Caps `SO_SNDBUF`. A Unix datagram counts against the sender until it is read, so a small send buffer drops sooner when subscribers lag. |
+| `net.unix.max_dgram_qlen` | 512 on most hosts | 4096 | How many datagrams a socket can queue; bursty fan-out overflows 512. |
+| `ulimit -n` (`nofile`) | 1024 | 65536 | Each publisher, subscription, service and client uses one or two fds. |
 
 ```bash
 sudo sysctl -w net.core.rmem_max=50331648 net.core.wmem_max=50331648 \
-                net.unix.max_dgram_qlen=4096
+               net.unix.max_dgram_qlen=4096
 ```
 
-See [DESIGN.md → Operational requirements](rmw_unix_socket_cpp/DESIGN.md#operational-requirements)
-for the full rationale.
+`rmem_max` and `wmem_max` apply to the whole host, containers included.
+`max_dgram_qlen` does not: set it in each container (see above).
+[DESIGN.md → Operational requirements](rmw_unix_socket_cpp/DESIGN.md#operational-requirements)
+has the details.
 
 ## Limitations
 
-Localhost only; Linux only; no DDS interoperability. Loaned (zero-copy) messages,
-dynamic message types, network flow endpoints, and content filtering return
-`RMW_RET_UNSUPPORTED`. `deadline`, `lifespan`, and `liveliness` QoS are accepted
-but not enforced. Of the QoS status events, `message_lost` and both `matched`
-events are reported; deadline, liveliness, incompatible-QoS and
-incompatible-type are refused with `RMW_RET_UNSUPPORTED`. Deadline and liveliness
-need a clock nothing here runs, and this transport delivers to every
-subscription on a topic whatever its QoS or type, so an incompatible-QoS event
-would report a failure that does not happen (#92 plans QoS- and type-aware
-matching). `rclcpp` catches the refusal for
-the handlers it installs by default (with a warning per handler on kilted and
-later); on jazzy, a handler for a refused type that the application registers
-itself throws. The listener callbacks an `EventsExecutor` needs are supported. The full list and the reasoning behind each is in
-[DESIGN.md → Limitations and Unsupported Features](rmw_unix_socket_cpp/DESIGN.md#limitations-and-unsupported-features).
+- One host and Linux only; no DDS interoperability.
+- Loaned messages, dynamic message types, network flow endpoints and content
+  filtering return `RMW_RET_UNSUPPORTED`.
+- `deadline`, `lifespan` and `liveliness` QoS are accepted but not enforced.
+- Of the QoS status events, `message_lost` and both `matched` events are reported.
+  Deadline, liveliness, incompatible QoS and incompatible type are refused with
+  `RMW_RET_UNSUPPORTED`: deadline and liveliness need a clock that nothing here
+  runs, and every subscription on a topic receives its messages whatever its QoS
+  or type, so an incompatible-QoS event would report a failure that does not
+  happen (#92 plans QoS- and type-aware matching). `rclcpp` catches the refusal
+  for the handlers it installs by default, with a warning per handler on Rolling
+  and Lyrical; on Jazzy, a handler the application registers itself for a refused
+  event throws.
+- The listener callbacks the `EventsExecutor` needs are supported.
+
+[DESIGN.md → Limitations and unsupported features](rmw_unix_socket_cpp/DESIGN.md#limitations-and-unsupported-features)
+lists everything, with the reasons.
 
 ## Documentation
 
-| Document | What it is |
+| Document | Contents |
 |---|---|
-| **[DESIGN.md](rmw_unix_socket_cpp/DESIGN.md)** | Self-contained design rationale: every wire format, sync primitive, QoS decision, and operational quirk. Start here. |
-| **[test/README.md](rmw_unix_socket_cpp/test/README.md)** | Every test in the suite, what it validates, and why it exists. |
-| **[test/perf/README.md](rmw_unix_socket_cpp/test/perf/README.md)** | Standalone latency/scale benchmarks (not run by `colcon test`). |
+| [DESIGN.md](rmw_unix_socket_cpp/DESIGN.md) | How it works and why: wire formats, synchronization, QoS, operations. Start here. |
+| [test/README.md](rmw_unix_socket_cpp/test/README.md) | Every test, what it checks and why. |
+| [test/perf/README.md](rmw_unix_socket_cpp/test/perf/README.md) | Standalone benchmarks, not run by `colcon test`. |
+| [RELEASING.md](RELEASING.md) | How releases are cut and published with bloom. |
 
 ## License
 
-Apache-2.0.
+Apache-2.0, see [LICENSE](LICENSE).
