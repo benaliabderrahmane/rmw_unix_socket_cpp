@@ -14,7 +14,9 @@ sudo apt install python3-bloom python3-catkin-pkg
 ## Supported distros
 
 `jazzy`, `kilted`, `rolling`, `lyrical` — one bloom track each, matching the CI
-and release workflow matrices.
+and release workflow matrices. Kilted reaches end of life around the end of
+2026, and rosdistro takes no new release into an end-of-life distro: skip its
+track if the first release comes later.
 
 **Not Humble.** `src/serialization.cpp` uses
 `eprosima::fastcdr::CdrVersion::DDS_CDR`, which is Fast CDR 2.x. Humble ships
