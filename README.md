@@ -25,7 +25,7 @@ datagram sockets; the wait set is `epoll` + `eventfd`.
 
 - ROS 2 **Jazzy**, **Rolling**, and **Lyrical** — built and tested in CI.
 - **Linux** on **x86_64** and **aarch64** (uses `epoll`, `eventfd`, `/dev/shm`, `AF_UNIX`).
-- Version `0.5.0`, Apache-2.0.
+- Version `0.6.0`, Apache-2.0.
 
 ## Quick start
 

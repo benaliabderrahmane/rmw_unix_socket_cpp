@@ -2,8 +2,8 @@
 Changelog for package rmw_unix_socket_cpp
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-Forthcoming
------------
+0.6.0 (2026-11-18)
+------------------
 The EventsExecutor release, with the message_lost and matched QoS events,
 ros2_tracing tracepoints, aarch64 support and a faster receive path. ``rclcpp``'s ``EventsExecutor`` — the default in
 ``performance_test`` and ``ros2-benchmark-container`` — crashed on every pub/sub
