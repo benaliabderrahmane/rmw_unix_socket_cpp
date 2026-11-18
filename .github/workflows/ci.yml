@@ -9,12 +9,15 @@ on:
 
 jobs:
   build-and-test:
-    name: build & test (${{ matrix.ros_distro }})
-    runs-on: ubuntu-latest
+    name: build & test (${{ matrix.ros_distro }}, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         ros_distro: [jazzy, kilted, rolling, lyrical]
+        # x86_64 and aarch64, on real arm64 hardware: x86's stronger memory
+        # ordering (QEMU on x86 included) hides a missing fence in the shm code.
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     container:
       image: ros:${{ matrix.ros_distro }}-ros-base
       # Default Docker /dev/shm is 64MB; one domain registry mmap is ~37MB
@@ -98,6 +101,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-logs-${{ matrix.ros_distro }}
+          name: test-logs-${{ matrix.ros_distro }}-${{ matrix.runner }}
           path: log/
           retention-days: 7
