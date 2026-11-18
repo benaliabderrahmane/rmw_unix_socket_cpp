@@ -145,6 +145,39 @@ struct ReceivedMessage
   int64_t received_timestamp_ns;
 };
 
+// Payload buffers a receiving endpoint keeps for reuse (#84). A take hands its
+// message's buffer back here instead of freeing it, and a drain receives the
+// next message into one, so a steady stream cycles through the same few
+// buffers. Freeing one per message let glibc trim a large buffer off the heap
+// and the next message page-fault it back in, zeroed by the kernel. Guarded by
+// the endpoint's queue_mutex. A drain allocates only when it found this empty,
+// so the endpoint never owns more buffers than its queue depth, plus one per
+// thread taking at once, plus the drain's own.
+using SparePayloads = std::vector<std::vector<uint8_t>>;
+
+// Give `buf` to `spares`. Never throws: if the list cannot grow, the buffer is
+// freed with its owner, as before.
+inline void recycle_payload(SparePayloads & spares, std::vector<uint8_t> & buf) noexcept
+{
+  if (buf.capacity() == 0) {
+    return;
+  }
+  try {
+    spares.push_back(std::move(buf));
+  } catch (...) {
+  }
+}
+
+// Recycles a taken message's payload when the take ends, on every return path.
+// Declared after the queue_mutex lock and the message, so it runs under the
+// lock and before the message is destroyed.
+struct PayloadRecycler
+{
+  SparePayloads & spares;
+  std::vector<uint8_t> & buf;
+  ~PayloadRecycler() {recycle_payload(spares, buf);}
+};
+
 // True if `hdr` was sent by a publisher created from `context_id` — i.e. the
 // rmw_context_t that owns the comparing subscription. UdsGid::generate()
 // embeds the sender's context id in the trailing 8 bytes of the GID, which is
@@ -432,6 +465,8 @@ struct UdsSubscription
   std::mutex drain_mutex;
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> message_queue;
+  SparePayloads spare_payloads;       // guarded by queue_mutex
+  std::vector<uint8_t> recv_payload;  // the drain's receive buffer; guarded by drain_mutex
   size_t queue_depth = 10;
   std::atomic<uint64_t> reception_seq{1};
   int32_t registry_index = -1;
@@ -500,6 +535,8 @@ struct UdsService
   std::mutex drain_mutex;
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> request_queue;
+  SparePayloads spare_payloads;       // guarded by queue_mutex
+  std::vector<uint8_t> recv_payload;  // the drain's receive buffer; guarded by drain_mutex
   int32_t registry_index = -1;
   UdsContext * context = nullptr;
   UdsNode * node = nullptr;
@@ -543,6 +580,8 @@ struct UdsClient
   std::mutex drain_mutex;
   std::mutex queue_mutex;
   std::deque<ReceivedMessage> response_queue;
+  SparePayloads spare_payloads;       // guarded by queue_mutex
+  std::vector<uint8_t> recv_payload;  // the drain's receive buffer; guarded by drain_mutex
   std::atomic<int64_t> sequence_number{1};
   int32_t registry_index = -1;
   UdsContext * context = nullptr;
