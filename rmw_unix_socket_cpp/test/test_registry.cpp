@@ -1,0 +1,681 @@
+// Copyright 2026 Abderahmane BENALI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <gtest/gtest.h>
+
+#include <algorithm>
+#include <cstring>
+#include <string>
+#include <vector>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+
+#include "../src/registry.hpp"
+
+class RegistryTest : public ::testing::Test
+{
+protected:
+  void * registry_ptr = nullptr;
+  size_t registry_size = 0;
+  int registry_fd = -1;
+  size_t domain_id = 98;  // Unique to avoid clashing with running systems
+
+  void SetUp() override
+  {
+    // Make sure no stale registry from a previous test (or older layout) is
+    // lying around — the new code uses O_CREAT|O_EXCL and would otherwise
+    // attach to a v2 file.
+    char name[64];
+    std::snprintf(name, sizeof(name), "/ros2_uds_%zu", domain_id);
+    shm_unlink(name);
+
+    registry_fd = rmw_uds::registry_open(domain_id, &registry_ptr, &registry_size);
+    ASSERT_GE(registry_fd, 0);
+    ASSERT_NE(nullptr, registry_ptr);
+    ASSERT_GT(registry_size, 0u);
+  }
+
+  void TearDown() override
+  {
+    rmw_uds::registry_close(registry_fd, registry_ptr, registry_size);
+    char name[64];
+    std::snprintf(name, sizeof(name), "/ros2_uds_%zu", domain_id);
+    shm_unlink(name);
+  }
+};
+
+TEST_F(RegistryTest, OpenCreatesValidHeader)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  EXPECT_EQ(rmw_uds::REGISTRY_VERSION, header->version.load());
+  EXPECT_EQ(rmw_uds::REGISTRY_MAX_ENTRIES, header->max_entries);
+}
+
+TEST_F(RegistryTest, AddAndRemoveEntry)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+
+  rmw_uds::RegistryEntry entry;
+  std::memset(&entry, 0, sizeof(entry));
+  entry.type = rmw_uds::ENTRY_NODE;
+  entry.pid = getpid();
+  std::strncpy(entry.node_name, "test_node", sizeof(entry.node_name) - 1);
+  std::strncpy(entry.node_namespace, "/test", sizeof(entry.node_namespace) - 1);
+
+  int32_t idx = rmw_uds::registry_add(header, entry);
+  ASSERT_GE(idx, 0);
+
+  auto results = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_NODE, nullptr, "test_node", "/test");
+  ASSERT_EQ(1u, results.size());
+  EXPECT_EQ("test_node", results[0].node_name);
+  EXPECT_EQ("/test", results[0].node_namespace);
+
+  rmw_uds::registry_remove(header, idx);
+  results = rmw_uds::registry_query(header, rmw_uds::ENTRY_NODE, nullptr, "test_node", nullptr);
+  EXPECT_EQ(0u, results.size());
+}
+
+TEST_F(RegistryTest, GenerationIncrementsOnChange)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  uint64_t gen0 = rmw_uds::registry_generation(header);
+
+  rmw_uds::RegistryEntry entry;
+  std::memset(&entry, 0, sizeof(entry));
+  entry.type = rmw_uds::ENTRY_PUBLISHER;
+  entry.pid = getpid();
+  std::strncpy(entry.topic_name, "/gen_test", sizeof(entry.topic_name) - 1);
+
+  int32_t idx = rmw_uds::registry_add(header, entry);
+  ASSERT_GE(idx, 0);
+  uint64_t gen1 = rmw_uds::registry_generation(header);
+  EXPECT_GT(gen1, gen0);
+
+  rmw_uds::registry_remove(header, idx);
+  uint64_t gen2 = rmw_uds::registry_generation(header);
+  EXPECT_GT(gen2, gen1);
+}
+
+// A snapshot copies each name only up to the word that holds its terminator
+// (shm_load_cstr_relaxed). Every length must still round-trip, wherever the
+// terminator lands: in a field's unaligned head, on a word boundary, in its
+// tail, or in the last byte the field holds.
+TEST_F(RegistryTest, QueryReturnsNamesOfEveryLength)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  const size_t path_cap = sizeof(rmw_uds::RegistryEntry::socket_path) - 1;
+  std::vector<int32_t> added;
+  for (size_t len = 0; len < sizeof(rmw_uds::RegistryEntry::node_name); ++len) {
+    rmw_uds::RegistryEntry e;
+    std::memset(&e, 0, sizeof(e));
+    e.type = rmw_uds::ENTRY_PUBLISHER;
+    e.pid = getpid();
+    e.gid[0] = static_cast<uint8_t>(len);
+    std::memset(e.node_name, 'n', len);
+    std::memset(e.node_namespace, 's', len);
+    std::memset(e.topic_name, 't', len);
+    std::memset(e.type_name, 'y', len);
+    std::memset(e.socket_path, 'p', std::min(len, path_cap));
+    const int32_t idx = rmw_uds::registry_add(header, e);
+    ASSERT_GE(idx, 0) << "len " << len;
+    added.push_back(idx);
+  }
+
+  auto results = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_PUBLISHER, nullptr, nullptr, nullptr);
+  ASSERT_EQ(added.size(), results.size());
+  for (const auto & r : results) {
+    const size_t len = r.gid[0];
+    EXPECT_EQ(std::string(len, 'n'), r.node_name) << "len " << len;
+    EXPECT_EQ(std::string(len, 's'), r.node_namespace) << "len " << len;
+    EXPECT_EQ(std::string(len, 't'), r.topic_name) << "len " << len;
+    EXPECT_EQ(std::string(len, 'y'), r.type_name) << "len " << len;
+    EXPECT_EQ(std::string(std::min(len, path_cap), 'p'), r.socket_path) << "len " << len;
+  }
+
+  for (const int32_t idx : added) {
+    rmw_uds::registry_remove(header, idx);
+  }
+}
+
+TEST_F(RegistryTest, QueryFiltersByType)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+
+  rmw_uds::RegistryEntry pub_entry;
+  std::memset(&pub_entry, 0, sizeof(pub_entry));
+  pub_entry.type = rmw_uds::ENTRY_PUBLISHER;
+  pub_entry.pid = getpid();
+  std::strncpy(pub_entry.topic_name, "/topic_a", sizeof(pub_entry.topic_name) - 1);
+
+  rmw_uds::RegistryEntry sub_entry;
+  std::memset(&sub_entry, 0, sizeof(sub_entry));
+  sub_entry.type = rmw_uds::ENTRY_SUBSCRIPTION;
+  sub_entry.pid = getpid();
+  std::strncpy(sub_entry.topic_name, "/topic_a", sizeof(sub_entry.topic_name) - 1);
+
+  int32_t idx1 = rmw_uds::registry_add(header, pub_entry);
+  int32_t idx2 = rmw_uds::registry_add(header, sub_entry);
+  ASSERT_GE(idx1, 0);
+  ASSERT_GE(idx2, 0);
+
+  auto pubs = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_PUBLISHER, "/topic_a", nullptr, nullptr);
+  auto subs = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_SUBSCRIPTION, "/topic_a", nullptr, nullptr);
+  auto all = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_EMPTY, "/topic_a", nullptr, nullptr);
+
+  rmw_uds::registry_remove(header, idx1);
+  rmw_uds::registry_remove(header, idx2);
+
+  EXPECT_EQ(1u, pubs.size());
+  EXPECT_EQ(1u, subs.size());
+  EXPECT_EQ(2u, all.size());
+}
+
+// Pins the invariant that the type pre-filter (which short-circuits on the
+// pre-snapshot state) must still return exactly the entry whose validated
+// type matches — with same-topic decoys of other types present. Guards
+// against a future edit dropping the authoritative post-snapshot re-check.
+TEST_F(RegistryTest, QueryTypeFilterExcludesOtherTypesSameTopic)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+
+  rmw_uds::RegistryEntry pub_entry;
+  std::memset(&pub_entry, 0, sizeof(pub_entry));
+  pub_entry.type = rmw_uds::ENTRY_PUBLISHER;
+  pub_entry.pid = getpid();
+  std::strncpy(pub_entry.topic_name, "/shared", sizeof(pub_entry.topic_name) - 1);
+
+  rmw_uds::RegistryEntry sub_entry;
+  std::memset(&sub_entry, 0, sizeof(sub_entry));
+  sub_entry.type = rmw_uds::ENTRY_SUBSCRIPTION;
+  sub_entry.pid = getpid();
+  std::strncpy(sub_entry.topic_name, "/shared", sizeof(sub_entry.topic_name) - 1);
+
+  rmw_uds::RegistryEntry srv_entry;
+  std::memset(&srv_entry, 0, sizeof(srv_entry));
+  srv_entry.type = rmw_uds::ENTRY_SERVICE;
+  srv_entry.pid = getpid();
+  std::strncpy(srv_entry.topic_name, "/shared", sizeof(srv_entry.topic_name) - 1);
+
+  int32_t pub_idx = rmw_uds::registry_add(header, pub_entry);
+  int32_t sub_idx = rmw_uds::registry_add(header, sub_entry);
+  int32_t srv_idx = rmw_uds::registry_add(header, srv_entry);
+  ASSERT_GE(pub_idx, 0);
+  ASSERT_GE(sub_idx, 0);
+  ASSERT_GE(srv_idx, 0);
+
+  auto pubs = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_PUBLISHER, "/shared", nullptr, nullptr);
+  auto subs = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_SUBSCRIPTION, "/shared", nullptr, nullptr);
+
+  rmw_uds::registry_remove(header, pub_idx);
+  rmw_uds::registry_remove(header, sub_idx);
+  rmw_uds::registry_remove(header, srv_idx);
+
+  ASSERT_EQ(1u, pubs.size());
+  EXPECT_EQ(rmw_uds::ENTRY_PUBLISHER, pubs[0].type);
+  ASSERT_EQ(1u, subs.size());
+  EXPECT_EQ(rmw_uds::ENTRY_SUBSCRIPTION, subs[0].type);
+}
+
+TEST_F(RegistryTest, MultipleEntriesSameType)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  std::vector<int32_t> indices;
+
+  for (int i = 0; i < 50; ++i) {
+    rmw_uds::RegistryEntry entry;
+    std::memset(&entry, 0, sizeof(entry));
+    entry.type = rmw_uds::ENTRY_NODE;
+    entry.pid = getpid();
+    std::snprintf(entry.node_name, sizeof(entry.node_name), "node_%d", i);
+    std::strncpy(entry.node_namespace, "/", sizeof(entry.node_namespace) - 1);
+    int32_t idx = rmw_uds::registry_add(header, entry);
+    ASSERT_GE(idx, 0);
+    indices.push_back(idx);
+  }
+
+  auto nodes = rmw_uds::registry_query(header, rmw_uds::ENTRY_NODE, nullptr, nullptr, nullptr);
+  EXPECT_EQ(50u, nodes.size());
+
+  for (int32_t idx : indices) {
+    rmw_uds::registry_remove(header, idx);
+  }
+}
+
+// The high-water bound must shrink the scan range without dropping the
+// highest-index entry. Adding sequentially from an empty (fresh SetUp)
+// registry fills slots 0..4, so high_water must equal max(idx)+1 = the count.
+// Fails on unmodified main (no high_water_slot member) and on a buggy fix
+// that scans [0, hw) with hw==idx or [0, hw-1).
+TEST_F(RegistryTest, HighWaterBoundsScanWithoutLosingTopEntry)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  std::vector<int32_t> idx;
+  for (int i = 0; i < 5; ++i) {
+    rmw_uds::RegistryEntry e;
+    std::memset(&e, 0, sizeof(e));
+    e.type = rmw_uds::ENTRY_NODE;
+    e.pid = getpid();
+    std::snprintf(e.node_name, sizeof(e.node_name), "hw_%d", i);
+    int32_t k = rmw_uds::registry_add(header, e);
+    ASSERT_GE(k, 0);
+    idx.push_back(k);
+  }
+
+  // high_water is the count (slots fill 0..4), i.e. max(idx)+1.
+  uint32_t hw = header->high_water_slot.load();
+  EXPECT_EQ(static_cast<uint32_t>(*std::max_element(idx.begin(), idx.end())) + 1, hw);
+  EXPECT_LT(hw, header->max_entries);  // bound far below 32768 -> scan is cheap
+
+  // The top (highest-index) entry must still be found -> guards the [0, hw) vs
+  // [0, hw-1) and idx vs idx+1 off-by-ones.
+  auto top = rmw_uds::registry_query(header, rmw_uds::ENTRY_NODE, nullptr, "hw_4", nullptr);
+  EXPECT_EQ(1u, top.size());
+  auto all = rmw_uds::registry_query(header, rmw_uds::ENTRY_NODE, nullptr, nullptr, nullptr);
+  EXPECT_EQ(5u, all.size());
+
+  for (int32_t k : idx) {
+    rmw_uds::registry_remove(header, k);
+  }
+}
+
+// A PID that is extremely unlikely to exist. /proc/<this> should be ENOENT,
+// which is what cleanup_stale uses to decide an entry's owner is dead.
+static constexpr pid_t DEAD_PID = 2147483000;
+
+TEST_F(RegistryTest, CleanupStaleRemovesDeadPidEntries)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+
+  rmw_uds::RegistryEntry dead_entry;
+  std::memset(&dead_entry, 0, sizeof(dead_entry));
+  dead_entry.type = rmw_uds::ENTRY_NODE;
+  dead_entry.pid = DEAD_PID;
+  std::strncpy(dead_entry.node_name, "ghost", sizeof(dead_entry.node_name) - 1);
+
+  rmw_uds::RegistryEntry live_entry;
+  std::memset(&live_entry, 0, sizeof(live_entry));
+  live_entry.type = rmw_uds::ENTRY_NODE;
+  live_entry.pid = getpid();
+  std::strncpy(live_entry.node_name, "alive", sizeof(live_entry.node_name) - 1);
+
+  int32_t dead_idx = rmw_uds::registry_add(header, dead_entry);
+  int32_t live_idx = rmw_uds::registry_add(header, live_entry);
+  ASSERT_GE(dead_idx, 0);
+  ASSERT_GE(live_idx, 0);
+
+  rmw_uds::registry_cleanup_stale(header);
+  auto remaining = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_NODE, nullptr, nullptr, nullptr);
+  rmw_uds::registry_remove(header, live_idx);
+
+  ASSERT_EQ(1u, remaining.size());
+  EXPECT_EQ("alive", remaining[0].node_name);
+}
+
+// Fill the registry, then call registry_add again: the overflow path must
+// reclaim stale (dead-PID) slots and succeed on the retry.
+TEST_F(RegistryTest, AddReclaimsStaleSlotsOnOverflow)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+
+  // Temporarily shrink max_entries so we can actually fill the registry.
+  const uint32_t original_max = header->max_entries;
+  header->max_entries = 8;
+
+  // Fill with dead-PID entries.
+  for (uint32_t i = 0; i < header->max_entries; ++i) {
+    rmw_uds::RegistryEntry e;
+    std::memset(&e, 0, sizeof(e));
+    e.type = rmw_uds::ENTRY_NODE;
+    e.pid = DEAD_PID;
+    std::snprintf(e.node_name, sizeof(e.node_name), "dead_%u", i);
+    ASSERT_GE(rmw_uds::registry_add(header, e), 0);
+  }
+
+  // Confirm it really is full: another dead-PID add must succeed only via
+  // reclamation. First, attempt with a dead PID — also reclaims since all
+  // entries are dead. Verify count is still bounded by max_entries.
+  auto pre = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_NODE, nullptr, nullptr, nullptr);
+  EXPECT_EQ(static_cast<size_t>(header->max_entries), pre.size());
+
+  // The new entry is live; registry_add must internally call cleanup_stale
+  // and succeed on the second pass.
+  rmw_uds::RegistryEntry live;
+  std::memset(&live, 0, sizeof(live));
+  live.type = rmw_uds::ENTRY_NODE;
+  live.pid = getpid();
+  std::strncpy(live.node_name, "survivor", sizeof(live.node_name) - 1);
+  int32_t live_idx = rmw_uds::registry_add(header, live);
+  EXPECT_GE(live_idx, 0);
+
+  auto results = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_NODE, nullptr, "survivor", nullptr);
+  EXPECT_EQ(1u, results.size());
+
+  for (uint32_t i = 0; i < header->max_entries; ++i) {
+    rmw_uds::registry_remove(header, static_cast<int32_t>(i));
+  }
+  header->max_entries = original_max;
+}
+
+// An existing shm file with a smaller size (e.g., created by a previous
+// build of this RMW with a different RegistryEntrySlot layout) must be
+// detected and replaced. Without this, mmap'ing the larger expected size on
+// top of the smaller file would SIGBUS on first slot-array access — the
+// exact failure mode seen in production when REGISTRY_VERSION was bumped
+// from 2 to 3 without cleaning /dev/shm.
+TEST_F(RegistryTest, OpenReplacesShmWithWrongSize)
+{
+  // Tear down our SetUp() registry; we want to set up a hostile starting
+  // state by hand.
+  rmw_uds::registry_close(registry_fd, registry_ptr, registry_size);
+  registry_ptr = nullptr;
+  registry_fd = -1;
+
+  // Create a too-small shm file under the name our domain would use.
+  char name[64];
+  std::snprintf(name, sizeof(name), "/ros2_uds_%zu", domain_id);
+  shm_unlink(name);
+  int bad_fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0666);
+  ASSERT_GE(bad_fd, 0);
+  // 4 KB is much smaller than the real registry size — guaranteed mismatch.
+  ASSERT_EQ(0, ftruncate(bad_fd, 4096));
+  close(bad_fd);
+
+  // Now open the registry normally. It must detect the size mismatch,
+  // unlink the stale file, and create a fresh one of the right size.
+  registry_fd = rmw_uds::registry_open(domain_id, &registry_ptr, &registry_size);
+  ASSERT_GE(registry_fd, 0);
+  ASSERT_NE(nullptr, registry_ptr);
+
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  EXPECT_EQ(rmw_uds::REGISTRY_VERSION, header->version.load());
+
+  // Round-trip an entry to confirm the new file is fully usable
+  // (also implicitly exercises every slot is mapped — would SIGBUS if not).
+  rmw_uds::RegistryEntry e;
+  std::memset(&e, 0, sizeof(e));
+  e.type = rmw_uds::ENTRY_NODE;
+  e.pid = getpid();
+  std::strncpy(e.node_name, "post_recovery", sizeof(e.node_name) - 1);
+  int32_t idx = rmw_uds::registry_add(header, e);
+  ASSERT_GE(idx, 0);
+  rmw_uds::registry_remove(header, idx);
+}
+
+// Live-PID entries must survive the overflow reclamation pass.
+TEST_F(RegistryTest, AddOverflowKeepsLivePidEntries)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  const uint32_t original_max = header->max_entries;
+  header->max_entries = 4;
+
+  // Half live, half dead.
+  for (uint32_t i = 0; i < header->max_entries; ++i) {
+    rmw_uds::RegistryEntry e;
+    std::memset(&e, 0, sizeof(e));
+    e.type = rmw_uds::ENTRY_NODE;
+    e.pid = (i % 2 == 0) ? getpid() : DEAD_PID;
+    std::snprintf(e.node_name, sizeof(e.node_name), "n_%u", i);
+    ASSERT_GE(rmw_uds::registry_add(header, e), 0);
+  }
+
+  rmw_uds::RegistryEntry extra;
+  std::memset(&extra, 0, sizeof(extra));
+  extra.type = rmw_uds::ENTRY_NODE;
+  extra.pid = getpid();
+  std::strncpy(extra.node_name, "extra", sizeof(extra.node_name) - 1);
+  int32_t extra_idx = rmw_uds::registry_add(header, extra);
+  EXPECT_GE(extra_idx, 0);
+
+  auto all = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_NODE, nullptr, nullptr, nullptr);
+  // All remaining entries must have a live PID (ours) — no dead PIDs left.
+  for (const auto & r : all) {
+    EXPECT_NE(0, std::strncmp(r.node_name.c_str(), "n_1", 3))
+      << "dead-PID entry '" << r.node_name << "' survived overflow cleanup";
+    EXPECT_NE(0, std::strncmp(r.node_name.c_str(), "n_3", 3))
+      << "dead-PID entry '" << r.node_name << "' survived overflow cleanup";
+  }
+
+  for (uint32_t i = 0; i < header->max_entries; ++i) {
+    rmw_uds::registry_remove(header, static_cast<int32_t>(i));
+  }
+  header->max_entries = original_max;
+}
+
+// Issue #53: ring_doorbells walks the header's doorbell_bits bitmap instead of
+// every slot below high_water_slot, so the bitmap must name exactly the slots
+// that hold a doorbell - set on add, cleared on remove and on stale reclaim.
+// Fails to build on a registry without the bitmap.
+static bool doorbell_bit(rmw_uds::RegistryHeader * header, int32_t idx)
+{
+  return (header->doorbell_bits[idx / 64].load() >> (idx % 64)) & 1u;
+}
+
+TEST_F(RegistryTest, DoorbellBitTracksDoorbellSlots)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  rmw_uds::RegistryEntry e;
+  std::memset(&e, 0, sizeof(e));
+  e.pid = getpid();
+  std::vector<int32_t> nodes;
+  e.type = rmw_uds::ENTRY_NODE;
+  for (int i = 0; i < 70; ++i) {  // push the doorbell into the second word
+    nodes.push_back(rmw_uds::registry_add(header, e));
+    ASSERT_GE(nodes.back(), 0);
+  }
+  e.type = rmw_uds::ENTRY_DOORBELL;
+  const int32_t bell = rmw_uds::registry_add(header, e);
+  ASSERT_EQ(70, bell);
+  EXPECT_TRUE(doorbell_bit(header, bell));
+  for (int32_t n : nodes) {
+    EXPECT_FALSE(doorbell_bit(header, n)) << "node slot " << n;
+  }
+  rmw_uds::registry_remove(header, bell);
+  EXPECT_FALSE(doorbell_bit(header, bell)) << "remove left the bit set";
+
+  e.pid = DEAD_PID;  // a crashed process's doorbell
+  const int32_t ghost = rmw_uds::registry_add(header, e);
+  ASSERT_GE(ghost, 0);
+  EXPECT_TRUE(doorbell_bit(header, ghost));
+  rmw_uds::registry_cleanup_stale(header);
+  EXPECT_FALSE(doorbell_bit(header, ghost)) << "stale reclaim left the bit set";
+
+  for (int32_t n : nodes) {
+    rmw_uds::registry_remove(header, n);
+  }
+}
+
+// A bound, non-blocking datagram socket standing in for a doorbell or a data
+// endpoint; the caller closes socks and unlinks paths.
+static std::string bind_test_socket(
+  const char * tag, std::vector<int> & socks, std::vector<std::string> & paths)
+{
+  const std::string path = "/tmp/test_registry_" + std::to_string(getpid()) + "_" + tag;
+  unlink(path.c_str());
+  const int s = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path.c_str());
+  EXPECT_EQ(0, bind(s, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)));
+  socks.push_back(s);
+  paths.push_back(path);
+  return path;
+}
+
+// Drains s and returns how many wake octets were queued on it.
+static int pending(int s)
+{
+  int n = 0;
+  uint8_t b;
+  while (recv(s, &b, 1, MSG_DONTWAIT) == 1) {
+    ++n;
+  }
+  return n;
+}
+
+// A mutation rings every doorbell the bitmap names, in any word, and nothing
+// else: a stale bit over a slot that is not a doorbell (here forced by hand)
+// must not send the wake octet to that slot's data socket.
+TEST_F(RegistryTest, MutationRingsOnlyDoorbellSlots)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  std::vector<int> socks;
+  std::vector<std::string> paths;
+  auto bind_socket = [&](const char * tag) {return bind_test_socket(tag, socks, paths);};
+  rmw_uds::RegistryEntry e;
+  std::memset(&e, 0, sizeof(e));
+  e.pid = getpid();
+  e.type = rmw_uds::ENTRY_NODE;
+  std::vector<int32_t> fill;
+  for (int i = 0; i < 130; ++i) {
+    fill.push_back(rmw_uds::registry_add(header, e));
+  }
+  e.type = rmw_uds::ENTRY_DOORBELL;
+  std::strncpy(e.socket_path, bind_socket("high").c_str(), sizeof(e.socket_path) - 1);
+  const int32_t high = rmw_uds::registry_add(header, e);  // word 2
+  rmw_uds::registry_remove(header, fill[5]);
+  std::strncpy(e.socket_path, bind_socket("low").c_str(), sizeof(e.socket_path) - 1);
+  const int32_t low = rmw_uds::registry_add(header, e);  // reuses slot 5, word 0
+  ASSERT_EQ(130, high);
+  ASSERT_EQ(5, low);
+  e.type = rmw_uds::ENTRY_SUBSCRIPTION;
+  std::strncpy(e.socket_path, bind_socket("data").c_str(), sizeof(e.socket_path) - 1);
+  const int32_t data = rmw_uds::registry_add(header, e);
+  ASSERT_GE(data, 0);
+  header->doorbell_bits[data / 64].fetch_or(uint64_t{1} << (data % 64));
+  pending(socks[0]);
+  pending(socks[1]);  // the remove of fill[5] and the subscription's add rang them
+
+  e.type = rmw_uds::ENTRY_NODE;
+  e.socket_path[0] = '\0';
+  const int32_t node = rmw_uds::registry_add(header, e);
+  EXPECT_EQ(1, pending(socks[0])) << "doorbell in slot " << high << " not rung";
+  EXPECT_EQ(1, pending(socks[1])) << "doorbell in slot " << low << " not rung";
+  EXPECT_EQ(0, pending(socks[2])) << "a stale bit sent the wake octet to a data socket";
+
+  header->doorbell_bits[data / 64].fetch_and(~(uint64_t{1} << (data % 64)));
+  for (int32_t idx : {node, data, high, low}) {
+    rmw_uds::registry_remove(header, idx);
+  }
+  for (int32_t idx : fill) {
+    rmw_uds::registry_remove(header, idx);
+  }
+  for (size_t i = 0; i < socks.size(); ++i) {
+    close(socks[i]);
+    unlink(paths[i].c_str());
+  }
+}
+
+// The bitmap walk's word boundary: a doorbell in the last bit of word 0 (slot
+// 63) and one in the first bit of word 1 (slot 64) are each rung exactly once.
+// An off-by-one in the skip-to-next-word step loses or doubles one of them.
+TEST_F(RegistryTest, MutationRingsDoorbellsAtWordBoundary)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  std::vector<int> socks;
+  std::vector<std::string> paths;
+  rmw_uds::RegistryEntry e;
+  std::memset(&e, 0, sizeof(e));
+  e.pid = getpid();
+  e.type = rmw_uds::ENTRY_NODE;
+  std::vector<int32_t> fill;
+  for (int i = 0; i < 63; ++i) {
+    fill.push_back(rmw_uds::registry_add(header, e));
+  }
+  e.type = rmw_uds::ENTRY_DOORBELL;
+  std::strncpy(e.socket_path, bind_test_socket("b63", socks, paths).c_str(),
+    sizeof(e.socket_path) - 1);
+  const int32_t b63 = rmw_uds::registry_add(header, e);
+  std::strncpy(e.socket_path, bind_test_socket("b64", socks, paths).c_str(),
+    sizeof(e.socket_path) - 1);
+  const int32_t b64 = rmw_uds::registry_add(header, e);
+  ASSERT_EQ(63, b63);
+  ASSERT_EQ(64, b64);
+
+  e.type = rmw_uds::ENTRY_NODE;
+  e.socket_path[0] = '\0';
+  const int32_t node = rmw_uds::registry_add(header, e);  // slot 65: one ring
+  ASSERT_EQ(65, node);
+  EXPECT_EQ(1, pending(socks[0])) << "doorbell in slot 63 not rung exactly once";
+  EXPECT_EQ(1, pending(socks[1])) << "doorbell in slot 64 not rung exactly once";
+  rmw_uds::registry_remove(header, node);
+  EXPECT_EQ(1, pending(socks[0]));
+  EXPECT_EQ(1, pending(socks[1]));
+
+  for (int32_t idx : {b63, b64}) {
+    rmw_uds::registry_remove(header, idx);
+  }
+  for (int32_t idx : fill) {
+    rmw_uds::registry_remove(header, idx);
+  }
+  for (size_t i = 0; i < socks.size(); ++i) {
+    close(socks[i]);
+    unlink(paths[i].c_str());
+  }
+}
+
+// The header is shared memory any local process can write (0666). A corrupt
+// high_water_slot or max_entries must not walk the slot array or doorbell_bits
+// past their REGISTRY_MAX_ENTRIES entries: add, ring, query and cleanup clamp.
+// Without the clamp, ring_doorbells reads far past the mapping and crashes.
+TEST_F(RegistryTest, CorruptHeaderBoundsStayInsideTheRegistry)
+{
+  auto * header = rmw_uds::registry_header(registry_ptr);
+  std::vector<int> socks;
+  std::vector<std::string> paths;
+  rmw_uds::RegistryEntry e;
+  std::memset(&e, 0, sizeof(e));
+  e.pid = getpid();
+  e.type = rmw_uds::ENTRY_DOORBELL;
+  std::strncpy(e.socket_path, bind_test_socket("corrupt", socks, paths).c_str(),
+    sizeof(e.socket_path) - 1);
+  const int32_t bell = rmw_uds::registry_add(header, e);
+  ASSERT_GE(bell, 0);
+
+  const uint32_t original_max = header->max_entries;
+  const uint32_t original_hw = header->high_water_slot.load();
+  header->max_entries = UINT32_MAX;
+  header->high_water_slot.store(UINT32_MAX);
+
+  e.type = rmw_uds::ENTRY_NODE;
+  e.socket_path[0] = '\0';
+  std::strncpy(e.node_name, "corrupt_bounds", sizeof(e.node_name) - 1);
+  const int32_t node = rmw_uds::registry_add(header, e);
+  ASSERT_GE(node, 0);
+  EXPECT_EQ(1, pending(socks[0])) << "the doorbell was not rung";
+  EXPECT_EQ(1u, rmw_uds::registry_query(
+      header, rmw_uds::ENTRY_NODE, nullptr, "corrupt_bounds", nullptr).size());
+  rmw_uds::registry_cleanup_stale(header);
+
+  header->max_entries = original_max;
+  header->high_water_slot.store(original_hw);
+  rmw_uds::registry_remove(header, node);
+  rmw_uds::registry_remove(header, bell);
+  close(socks[0]);
+  unlink(paths[0].c_str());
+}

@@ -1,0 +1,305 @@
+// Copyright 2026 Abderahmane BENALI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <gtest/gtest.h>
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+#include "../src/transport.hpp"
+#include "../src/types.hpp"
+
+class TransportTest : public ::testing::Test
+{
+protected:
+  size_t domain_id = 97;
+
+  void SetUp() override
+  {
+    rmw_uds::ensure_socket_dir(domain_id);
+  }
+};
+
+TEST_F(TransportTest, MakePeerLabelFormatsNodeAndTopic)
+{
+  EXPECT_EQ(
+    "node '/ns/talker' on topic '/chatter'",
+    rmw_uds::make_peer_label("/ns", "talker", "/chatter"));
+  // Root namespace "/" collapses to a single leading slash (not "//talker").
+  EXPECT_EQ(
+    "node '/talker' on topic '/chatter'",
+    rmw_uds::make_peer_label("/", "talker", "/chatter"));
+  // Empty namespace behaves like root; a null topic drops the topic clause.
+  EXPECT_EQ("node '/talker'", rmw_uds::make_peer_label("", "talker", nullptr));
+  // All-null is tolerated (name falls back to a placeholder).
+  EXPECT_EQ("node '/<unknown>'", rmw_uds::make_peer_label(nullptr, nullptr, nullptr));
+}
+
+TEST_F(TransportTest, CreateBoundSocket)
+{
+  auto path = rmw_uds::make_socket_path(domain_id, "test");
+  int fd = rmw_uds::create_bound_socket(path);
+  ASSERT_GE(fd, 0);
+  rmw_uds::close_socket(fd, path);
+}
+
+TEST_F(TransportTest, CreateSendSocket)
+{
+  int fd = rmw_uds::create_send_socket();
+  ASSERT_GE(fd, 0);
+  close(fd);
+}
+
+TEST_F(TransportTest, SendAndReceive)
+{
+  auto recv_path = rmw_uds::make_socket_path(domain_id, "recv");
+  int recv_fd = rmw_uds::create_bound_socket(recv_path);
+  ASSERT_GE(recv_fd, 0);
+
+  int send_fd = rmw_uds::create_send_socket();
+  ASSERT_GE(send_fd, 0);
+
+  // Build a message
+  rmw_uds::WireHeader send_hdr;
+  std::memset(&send_hdr, 0, sizeof(send_hdr));
+  send_hdr.sequence_number = 42;
+  send_hdr.source_timestamp_ns = 123456789;
+  send_hdr.msg_type = 0;
+
+  std::vector<uint8_t> payload = {1, 2, 3, 4, 5};
+  send_hdr.payload_size = static_cast<uint32_t>(payload.size());
+
+  ASSERT_EQ(
+    rmw_uds::SendResult::Ok,
+    rmw_uds::send_to(
+      send_fd, recv_path, send_hdr, payload.data(), payload.size()));
+
+  // Receive
+  rmw_uds::WireHeader recv_hdr;
+  std::vector<uint8_t> recv_payload;
+  ASSERT_TRUE(rmw_uds::recv_from(recv_fd, recv_hdr, recv_payload));
+
+  EXPECT_EQ(42, recv_hdr.sequence_number);
+  EXPECT_EQ(123456789, recv_hdr.source_timestamp_ns);
+  EXPECT_EQ(0, recv_hdr.msg_type);
+  EXPECT_EQ(payload, recv_payload);
+
+  close(send_fd);
+  rmw_uds::close_socket(recv_fd, recv_path);
+}
+
+TEST_F(TransportTest, RecvFromEmptyReturnsF)
+{
+  auto path = rmw_uds::make_socket_path(domain_id, "empty");
+  int fd = rmw_uds::create_bound_socket(path);
+  ASSERT_GE(fd, 0);
+
+  rmw_uds::WireHeader hdr;
+  std::vector<uint8_t> payload;
+  EXPECT_FALSE(rmw_uds::recv_from(fd, hdr, payload));
+
+  rmw_uds::close_socket(fd, path);
+}
+
+TEST_F(TransportTest, RecvFromConsumesZeroLengthDatagram)
+{
+  auto path = rmw_uds::make_socket_path(domain_id, "zerolen");
+  int recv_fd = rmw_uds::create_bound_socket(path);
+  ASSERT_GE(recv_fd, 0);
+
+  int send_fd = rmw_uds::create_send_socket();
+  ASSERT_GE(send_fd, 0);
+
+  struct sockaddr_un addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+  ASSERT_EQ(
+    0, sendto(
+      send_fd, nullptr, 0, 0,
+      reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)));
+
+  // A zero-length datagram carries no WireHeader, so it is not a message.
+  rmw_uds::WireHeader hdr;
+  std::vector<uint8_t> payload;
+  EXPECT_FALSE(rmw_uds::recv_from(recv_fd, hdr, payload));
+
+  // It must still have been consumed. MSG_PEEK does not dequeue, so leaving it
+  // would keep the socket readable forever and spin every wait polling this fd.
+  char probe = 0;
+  errno = 0;
+  const ssize_t left = recv(recv_fd, &probe, sizeof(probe), MSG_DONTWAIT | MSG_PEEK);
+  EXPECT_EQ(-1, left) << "zero-length datagram was left queued on the socket";
+  EXPECT_TRUE(errno == EAGAIN || errno == EWOULDBLOCK);
+
+  close(send_fd);
+  rmw_uds::close_socket(recv_fd, path);
+}
+
+// A junk datagram must not end a drain: with a zero-length datagram queued
+// ahead of a real message, a single recv_from call must consume the junk and
+// return the real message. Every drain loop stops on the first false, so
+// returning false here would leave the real message stranded until the next
+// wake.
+TEST_F(TransportTest, RecvFromSkipsZeroLengthDatagramToRealMessage)
+{
+  auto path = rmw_uds::make_socket_path(domain_id, "zerolen_then_real");
+  int recv_fd = rmw_uds::create_bound_socket(path);
+  ASSERT_GE(recv_fd, 0);
+
+  int send_fd = rmw_uds::create_send_socket();
+  ASSERT_GE(send_fd, 0);
+
+  struct sockaddr_un addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  std::strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
+  ASSERT_EQ(
+    0, sendto(
+      send_fd, nullptr, 0, 0,
+      reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)));
+
+  rmw_uds::WireHeader send_hdr;
+  std::memset(&send_hdr, 0, sizeof(send_hdr));
+  send_hdr.sequence_number = 7;
+  std::vector<uint8_t> payload = {9, 8, 7};
+  send_hdr.payload_size = static_cast<uint32_t>(payload.size());
+  ASSERT_EQ(
+    rmw_uds::SendResult::Ok,
+    rmw_uds::send_to(send_fd, path, send_hdr, payload.data(), payload.size()));
+
+  rmw_uds::WireHeader hdr;
+  std::vector<uint8_t> recv_payload;
+  EXPECT_TRUE(rmw_uds::recv_from(recv_fd, hdr, recv_payload)) <<
+    "the zero-length datagram terminated the drain with a real message queued";
+  EXPECT_EQ(7, hdr.sequence_number);
+  EXPECT_EQ(payload, recv_payload);
+
+  // Nothing left: the junk was consumed, not skipped over.
+  EXPECT_FALSE(rmw_uds::recv_from(recv_fd, hdr, recv_payload));
+
+  close(send_fd);
+  rmw_uds::close_socket(recv_fd, path);
+}
+
+TEST_F(TransportTest, MultipleMessages)
+{
+  auto path = rmw_uds::make_socket_path(domain_id, "multi");
+  int recv_fd = rmw_uds::create_bound_socket(path);
+  int send_fd = rmw_uds::create_send_socket();
+  ASSERT_GE(recv_fd, 0);
+  ASSERT_GE(send_fd, 0);
+
+  constexpr int N = 10;
+  for (int i = 0; i < N; ++i) {
+    rmw_uds::WireHeader hdr;
+    std::memset(&hdr, 0, sizeof(hdr));
+    hdr.sequence_number = i;
+    hdr.payload_size = sizeof(int);
+    hdr.msg_type = 0;
+    ASSERT_EQ(
+      rmw_uds::SendResult::Ok,
+      rmw_uds::send_to(
+        send_fd, path, hdr, reinterpret_cast<const uint8_t *>(&i), sizeof(i)));
+  }
+
+  for (int i = 0; i < N; ++i) {
+    rmw_uds::WireHeader recv_hdr;
+    std::vector<uint8_t> recv_payload;
+    ASSERT_TRUE(rmw_uds::recv_from(recv_fd, recv_hdr, recv_payload));
+    EXPECT_EQ(i, recv_hdr.sequence_number);
+    int val;
+    std::memcpy(&val, recv_payload.data(), sizeof(val));
+    EXPECT_EQ(i, val);
+  }
+
+  close(send_fd);
+  rmw_uds::close_socket(recv_fd, path);
+}
+
+// Helper: write an empty file with a specific name under the test domain dir.
+// Returns the full path written.
+static std::string write_fake_sock(size_t domain_id, const char * name)
+{
+  char path[256];
+  std::snprintf(path, sizeof(path), "/tmp/ros2_uds/%zu/%s", domain_id, name);
+  FILE * f = std::fopen(path, "w");
+  if (f) {std::fclose(f);}
+  return std::string(path);
+}
+
+static bool file_exists(const std::string & path)
+{
+  struct stat st;
+  return stat(path.c_str(), &st) == 0;
+}
+
+TEST_F(TransportTest, CleanupOrphanFilesRemovesDeadPidFiles)
+{
+  // Create files shaped like make_socket_path() output:
+  //   sub_<pid>_<hex>.sock
+  // One with a dead PID (should be unlinked), one with our own PID (kept).
+  const std::string dead = write_fake_sock(domain_id, "sub_2147483000_deadbeef.sock");
+  char live_name[64];
+  std::snprintf(live_name, sizeof(live_name), "cli_%d_cafebabe.sock", getpid());
+  const std::string live = write_fake_sock(domain_id, live_name);
+
+  ASSERT_TRUE(file_exists(dead));
+  ASSERT_TRUE(file_exists(live));
+
+  rmw_uds::cleanup_orphan_socket_files(domain_id);
+
+  EXPECT_FALSE(file_exists(dead)) << "dead-PID socket file should have been unlinked";
+  EXPECT_TRUE(file_exists(live)) << "live-PID socket file must not be unlinked";
+
+  // Clean up the live one we created.
+  unlink(live.c_str());
+}
+
+TEST_F(TransportTest, CleanupOrphanFilesIgnoresUnparsableNames)
+{
+  // A file that doesn't match our <prefix>_<pid>_<unique>.sock pattern
+  // must be left alone. We don't want to unlink random files placed in
+  // /tmp/ros2_uds/<N>/ by third parties.
+  const std::string weird1 = write_fake_sock(domain_id, "noprefix");
+  const std::string weird2 = write_fake_sock(domain_id, "prefix_notanumber_x.sock");
+  const std::string weird3 = write_fake_sock(domain_id, "only_one_underscore.sock");
+
+  ASSERT_TRUE(file_exists(weird1));
+  ASSERT_TRUE(file_exists(weird2));
+  ASSERT_TRUE(file_exists(weird3));
+
+  rmw_uds::cleanup_orphan_socket_files(domain_id);
+
+  EXPECT_TRUE(file_exists(weird1));
+  EXPECT_TRUE(file_exists(weird2));
+  EXPECT_TRUE(file_exists(weird3));
+
+  unlink(weird1.c_str());
+  unlink(weird2.c_str());
+  unlink(weird3.c_str());
+}
+
+TEST_F(TransportTest, CleanupOrphanFilesMissingDirIsNoop)
+{
+  // Non-existent domain directory must not crash or error.
+  rmw_uds::cleanup_orphan_socket_files(99999);
+  SUCCEED();
+}

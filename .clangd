@@ -1,0 +1,16 @@
+CompileFlags:
+  CompilationDatabase: .
+  Add:
+    - "-xc++"
+    - "-std=c++17"
+
+Diagnostics:
+  UnusedIncludes: Strict
+  ClangTidy:
+    Remove:
+      - modernize-use-trailing-return-type
+
+InlayHints:
+  Enabled: Yes
+  ParameterNames: Yes
+  DeducedTypes: Yes
