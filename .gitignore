@@ -1,0 +1,18 @@
+# Colcon
+build/
+install/
+log/
+
+# Compile database (symlinked from build)
+compile_commands.json
+
+# IDE
+.vscode/
+.clangd/
+.cache/
+
+# C++ build artifacts
+*.o
+*.so
+*.a
+*.d

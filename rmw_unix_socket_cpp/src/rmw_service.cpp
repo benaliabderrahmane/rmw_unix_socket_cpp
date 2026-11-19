@@ -1,0 +1,370 @@
+// Copyright 2026 Abderahmane BENALI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include "drain.hpp"
+#include "identifier.hpp"
+#include "listener.hpp"
+#include "logging.hpp"
+#include "registry.hpp"
+#include "serialization.hpp"
+#include "transport.hpp"
+#include "types.hpp"
+
+#include <chrono>
+#include <cstring>
+
+#include "rcutils/strdup.h"
+#include "rmw/allocators.h"
+#include "rmw/check_type_identifiers_match.h"
+#include "rmw/error_handling.h"
+#include "rmw/rmw.h"
+
+static rmw_qos_profile_t resolve_qos(const rmw_qos_profile_t * qos)
+{
+  rmw_qos_profile_t resolved = *qos;
+  if (resolved.history == RMW_QOS_POLICY_HISTORY_SYSTEM_DEFAULT) {
+    resolved.history = RMW_QOS_POLICY_HISTORY_KEEP_LAST;
+  }
+  if (resolved.depth == 0) {resolved.depth = 10;}
+  if (resolved.reliability == RMW_QOS_POLICY_RELIABILITY_SYSTEM_DEFAULT ||
+    resolved.reliability == RMW_QOS_POLICY_RELIABILITY_BEST_AVAILABLE)
+  {
+    resolved.reliability = RMW_QOS_POLICY_RELIABILITY_RELIABLE;
+  }
+  if (resolved.durability == RMW_QOS_POLICY_DURABILITY_SYSTEM_DEFAULT ||
+    resolved.durability == RMW_QOS_POLICY_DURABILITY_BEST_AVAILABLE)
+  {
+    resolved.durability = RMW_QOS_POLICY_DURABILITY_VOLATILE;
+  }
+  return resolved;
+}
+
+static int64_t system_now_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
+extern "C"
+{
+
+rmw_service_t * rmw_create_service(
+  const rmw_node_t * node,
+  const rosidl_service_type_support_t * type_support,
+  const char * service_name,
+  const rmw_qos_profile_t * qos_profile)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(node, nullptr);
+  RMW_CHECK_ARGUMENT_FOR_NULL(type_support, nullptr);
+  RMW_CHECK_ARGUMENT_FOR_NULL(service_name, nullptr);
+  RMW_CHECK_ARGUMENT_FOR_NULL(qos_profile, nullptr);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    node, node->implementation_identifier,
+    rmw_uds::identifier, return nullptr);
+
+  auto * node_data = static_cast<rmw_uds::UdsNode *>(node->data);
+  auto * ctx = node_data->context;
+
+  auto sc = rmw_uds::get_service_callbacks(type_support);
+  if (!sc.request || !sc.response) {
+    RMW_SET_ERROR_MSG("failed to get service type support callbacks");
+    return nullptr;
+  }
+
+  auto * srv_data = new (std::nothrow) rmw_uds::UdsService();
+  if (!srv_data) {
+    RMW_SET_ERROR_MSG("failed to allocate service data");
+    return nullptr;
+  }
+
+  srv_data->gid.generate(ctx->context_id);
+  srv_data->service_name = service_name;
+  srv_data->type_name = rmw_uds::make_ros_type_name(sc.service_namespace, sc.service_name);
+  srv_data->qos = resolve_qos(qos_profile);
+  srv_data->request_callbacks = sc.request;
+  srv_data->response_callbacks = sc.response;
+  srv_data->context = ctx;
+  srv_data->node = node_data;
+
+  // Create and bind socket
+  srv_data->socket_path = rmw_uds::make_socket_path(ctx->domain_id, "srv");
+  srv_data->socket_fd = rmw_uds::create_bound_socket(srv_data->socket_path);
+  if (srv_data->socket_fd < 0) {
+    delete srv_data;
+    RMW_SET_ERROR_MSG("failed to create service socket");
+    return nullptr;
+  }
+
+  // Register in shared memory
+  auto * header = rmw_uds::registry_header(ctx->registry_ptr);
+  rmw_uds::RegistryEntry entry;
+  std::memset(&entry, 0, sizeof(entry));
+  entry.type = rmw_uds::ENTRY_SERVICE;
+  entry.pid = getpid();
+  std::memcpy(entry.gid, srv_data->gid.data, sizeof(entry.gid));
+  std::strncpy(entry.node_name, node_data->name.c_str(), sizeof(entry.node_name) - 1);
+  std::strncpy(entry.node_namespace, node_data->ns.c_str(), sizeof(entry.node_namespace) - 1);
+  std::strncpy(entry.topic_name, service_name, sizeof(entry.topic_name) - 1);
+  std::strncpy(entry.type_name, srv_data->type_name.c_str(), sizeof(entry.type_name) - 1);
+  std::strncpy(entry.socket_path, srv_data->socket_path.c_str(), sizeof(entry.socket_path) - 1);
+  entry.qos_reliability = static_cast<uint8_t>(srv_data->qos.reliability);
+  entry.qos_durability = static_cast<uint8_t>(srv_data->qos.durability);
+  entry.qos_depth = static_cast<uint32_t>(srv_data->qos.depth);
+
+  srv_data->registry_index = rmw_uds::registry_add(header, entry);
+
+  if (srv_data->registry_index < 0) {
+    rmw_uds::close_socket(srv_data->socket_fd, srv_data->socket_path);
+    delete srv_data;
+    RMW_SET_ERROR_MSG("registry full");
+    return nullptr;
+  }
+
+  auto * srv = rmw_service_allocate();
+  if (!srv) {
+    rmw_uds::registry_remove(header, srv_data->registry_index);
+    rmw_uds::close_socket(srv_data->socket_fd, srv_data->socket_path);
+    delete srv_data;
+    return nullptr;
+  }
+
+  srv->implementation_identifier = rmw_uds::identifier;
+  srv->data = srv_data;
+  srv->service_name = rcutils_strdup(service_name, node->context->options.allocator);
+  return srv;
+}
+
+rmw_ret_t rmw_destroy_service(rmw_node_t * node, rmw_service_t * service)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(node, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+
+  auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
+  if (srv_data) {
+    // Stop the listener watching this socket first: listener_unwatch blocks
+    // until an in-flight drain has returned, so the delete below cannot race it.
+    rmw_uds::listener_unwatch(srv_data->context, srv_data->socket_fd);
+    if (srv_data->context && srv_data->registry_index >= 0) {
+      auto * header = rmw_uds::registry_header(srv_data->context->registry_ptr);
+      rmw_uds::registry_remove(header, srv_data->registry_index);
+    }
+    rmw_uds::close_socket(srv_data->socket_fd, srv_data->socket_path);
+    rmw_uds::shm_writer_close(srv_data->shm_ring);
+    rmw_uds::shm_reader_close(srv_data->shm_cache);
+    delete srv_data;
+  }
+
+  rcutils_allocator_t alloc = node->context->options.allocator;
+  if (service->service_name) {
+    alloc.deallocate(const_cast<char *>(service->service_name), alloc.state);
+  }
+  rmw_service_free(service);
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_take_request(
+  const rmw_service_t * service,
+  rmw_service_info_t * request_header,
+  void * ros_request,
+  bool * taken)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(request_header, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(ros_request, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(taken, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+
+  *taken = false;
+  auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
+
+  rmw_uds::drain_endpoint(rmw_uds::drain_target(srv_data));
+
+  std::lock_guard<std::mutex> lock(srv_data->queue_mutex);
+  // Drop-garbage-and-continue: one corrupt datagram must not destroy a
+  // legitimate in-flight request and wedge the client into a timeout.
+  while (!srv_data->request_queue.empty()) {
+    auto msg = std::move(srv_data->request_queue.front());
+    srv_data->request_queue.pop_front();
+    rmw_uds::PayloadRecycler recycle{srv_data->spare_payloads, msg.payload};
+
+    if (!rmw_uds::deserialize(msg.payload.data(), msg.payload.size(),
+      srv_data->request_callbacks, ros_request))
+    {
+      RMW_UDS_LOG_ERROR_THROTTLE(
+        1000,
+        "rmw_take_request: CDR deserialization failed on service '%s' "
+        "(payload=%zu bytes) — dropping datagram",
+        srv_data->service_name.c_str(), msg.payload.size());
+      continue;
+    }
+
+    // Fill request header
+    std::memcpy(request_header->request_id.writer_guid, msg.header.gid,
+      RMW_GID_STORAGE_SIZE);
+    request_header->request_id.sequence_number = msg.header.sequence_number;
+    request_header->source_timestamp = msg.header.source_timestamp_ns;
+    request_header->received_timestamp = msg.received_timestamp_ns;
+
+    *taken = true;
+    return RMW_RET_OK;
+  }
+
+  std::memset(request_header, 0, sizeof(rmw_service_info_t));
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_send_response(
+  const rmw_service_t * service,
+  rmw_request_id_t * request_header,
+  void * ros_response)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(request_header, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(ros_response, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+
+  auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
+
+  // Build wire header (payload_size filled by the serialize step below)
+  rmw_uds::WireHeader hdr;
+  std::memset(&hdr, 0, sizeof(hdr));
+  std::memcpy(hdr.gid, request_header->writer_guid, sizeof(hdr.gid));
+  hdr.sequence_number = request_header->sequence_number;
+  hdr.source_timestamp_ns = system_now_ns();
+  hdr.msg_type = 2;  // response
+
+  // Serialize the response, choosing its destination by size: a large one is
+  // written directly into the service's ring record (descriptor on the wire),
+  // a small one inline. Both send sites below fan out the same wire span.
+  std::vector<uint8_t> payload;
+  rmw_uds::ShmPayloadDescriptor desc;
+  rmw_uds::OutboundPayload wire{nullptr, 0};
+  if (!rmw_uds::shm_serialize_prepare_send(
+      srv_data->shm_ring, srv_data->shm_mutex, srv_data->context->domain_id,
+      ros_response, srv_data->response_callbacks, hdr, desc, payload, wire))
+  {
+    RMW_SET_ERROR_MSG("failed to serialize response");
+    return RMW_RET_ERROR;
+  }
+
+  // PERFORMANCE: cache the (GID -> path) client list; only refresh on graph change.
+  auto * header = rmw_uds::registry_header(srv_data->context->registry_ptr);
+  uint64_t current_gen = rmw_uds::registry_generation(header);
+  std::vector<rmw_uds::CachedClient> clients_local;
+  {
+    std::lock_guard<std::mutex> lock(srv_data->client_cache_mutex);
+    if (current_gen != srv_data->cached_generation) {
+      auto clients = rmw_uds::registry_query(
+        header, rmw_uds::ENTRY_CLIENT, srv_data->service_name.c_str(),
+        nullptr, nullptr);
+      srv_data->cached_generation = current_gen;
+      srv_data->cached_clients.clear();
+      srv_data->cached_clients.reserve(clients.size());
+      for (const auto & c : clients) {
+        if (c.socket_path.empty()) {continue;}
+        rmw_uds::CachedClient cc;
+        cc.socket_path = c.socket_path;
+        std::memcpy(cc.gid, c.gid, sizeof(cc.gid));
+        srv_data->cached_clients.push_back(std::move(cc));
+      }
+    }
+    clients_local = srv_data->cached_clients;
+  }
+
+  for (const auto & c : clients_local) {
+    if (std::memcmp(c.gid, request_header->writer_guid, sizeof(c.gid)) == 0) {
+      rmw_uds::send_to(
+        srv_data->context->send_socket_fd,
+        c.socket_path, hdr, wire.data, wire.size);
+      return RMW_RET_OK;
+    }
+  }
+
+  // Cache miss — the cache may be stale. Do an authoritative direct query by
+  // client GID before giving up so a response is never silently discarded.
+  auto clients = rmw_uds::registry_query(
+    header, rmw_uds::ENTRY_CLIENT, srv_data->service_name.c_str(),
+    nullptr, nullptr);
+  for (const auto & c : clients) {
+    if (c.socket_path.empty()) {continue;}
+    if (std::memcmp(c.gid, request_header->writer_guid, sizeof(c.gid)) == 0) {
+      rmw_uds::send_to(
+        srv_data->context->send_socket_fd,
+        c.socket_path, hdr, wire.data, wire.size);
+      return RMW_RET_OK;
+    }
+  }
+  // No live client matches this request id: the client timed out and shut down
+  // between issuing its request and our response, so its registry entry is gone.
+  // This is normal lifecycle, not an error — return OK and drop the response,
+  // matching rmw_cyclonedds (client_present_t::GONE -> RMW_RET_OK). Returning an
+  // error here would make rclcpp throw inside the executor callback.
+  RMW_UDS_LOG_DEBUG(
+    "rmw_send_response on '%s': no live client for the request id "
+    "(client gone) — response dropped",
+    srv_data->service_name.c_str());
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_service_request_subscription_get_actual_qos(
+  const rmw_service_t * service,
+  rmw_qos_profile_t * qos)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(qos, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
+  *qos = srv_data->qos;
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_service_response_publisher_get_actual_qos(
+  const rmw_service_t * service,
+  rmw_qos_profile_t * qos)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_ARGUMENT_FOR_NULL(qos, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
+  *qos = srv_data->qos;
+  return RMW_RET_OK;
+}
+
+rmw_ret_t rmw_service_set_on_new_request_callback(
+  rmw_service_t * service,
+  rmw_event_callback_t callback,
+  const void * user_data)
+{
+  RMW_CHECK_ARGUMENT_FOR_NULL(service, RMW_RET_INVALID_ARGUMENT);
+  RMW_CHECK_TYPE_IDENTIFIERS_MATCH(
+    service, service->implementation_identifier,
+    rmw_uds::identifier, return RMW_RET_INCORRECT_RMW_IMPLEMENTATION);
+  auto * srv_data = static_cast<rmw_uds::UdsService *>(service->data);
+  return rmw_uds::listener_set_callback(
+    srv_data->context, rmw_uds::drain_target(srv_data),
+    rmw_uds::ARMED_SERVICE, srv_data, srv_data->uid, callback, user_data);
+}
+
+}  // extern "C"

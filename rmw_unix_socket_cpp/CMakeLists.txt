@@ -1,0 +1,268 @@
+cmake_minimum_required(VERSION 3.14)
+project(rmw_unix_socket_cpp)
+
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+  set(CMAKE_CXX_STANDARD_REQUIRED ON)
+endif()
+
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+endif()
+
+find_package(ament_cmake REQUIRED)
+find_package(rcutils REQUIRED)
+find_package(rcpputils REQUIRED)
+find_package(rmw REQUIRED)
+find_package(rosidl_runtime_c REQUIRED)
+find_package(fastcdr CONFIG REQUIRED)
+find_package(rosidl_typesupport_fastrtps_c REQUIRED)
+find_package(rosidl_typesupport_fastrtps_cpp REQUIRED)
+find_package(tracetools REQUIRED)
+
+# rmw_init_options_t::localhost_only was removed in Kilted (rmw >= 7.8).
+# Probe so we can keep setting it on older distros without breaking newer ones.
+include(CheckCXXSourceCompiles)
+# The probe only needs the rmw headers, so feed it include dirs rather than
+# linking rmw::rmw / rcutils::rcutils. Linking the C rcutils target pulls its
+# INTERFACE_COMPILE_FEATURES (a C compile feature) into this CXX-only
+# try_compile; on toolchains where the scratch project doesn't enable C that
+# aborts configure with "No known features for C compiler" (seen on Rolling).
+set(_rmw_probe_saved_inc "${CMAKE_REQUIRED_INCLUDES}")
+# init_options.h pulls in rcutils/allocator.h, so the probe needs both the rmw
+# and rcutils include dirs (gathered without linking either target).
+set(CMAKE_REQUIRED_INCLUDES "")
+get_target_property(_rmw_probe_rmw_inc rmw::rmw INTERFACE_INCLUDE_DIRECTORIES)
+if(_rmw_probe_rmw_inc)
+  list(APPEND CMAKE_REQUIRED_INCLUDES ${_rmw_probe_rmw_inc})
+endif()
+get_target_property(_rmw_probe_rcutils_inc rcutils::rcutils INTERFACE_INCLUDE_DIRECTORIES)
+if(_rmw_probe_rcutils_inc)
+  list(APPEND CMAKE_REQUIRED_INCLUDES ${_rmw_probe_rcutils_inc})
+endif()
+check_cxx_source_compiles("
+#include <rmw/init_options.h>
+int main() {
+  rmw_init_options_t o{};
+  o.localhost_only = RMW_LOCALHOST_ONLY_DEFAULT;
+  return 0;
+}
+" RMW_HAS_LOCALHOST_ONLY)
+set(CMAKE_REQUIRED_INCLUDES "${_rmw_probe_saved_inc}")
+
+add_library(rmw_unix_socket_cpp SHARED
+  src/drain.cpp
+  src/listener.cpp
+  src/registry.cpp
+  src/serialization.cpp
+  src/shm_transport.cpp
+  src/transport.cpp
+  src/rmw_init.cpp
+  src/rmw_node.cpp
+  src/rmw_publisher.cpp
+  src/rmw_subscription.cpp
+  src/rmw_service.cpp
+  src/rmw_client.cpp
+  src/rmw_guard_condition.cpp
+  src/rmw_wait.cpp
+  src/rmw_graph.cpp
+  src/rmw_event.cpp
+  src/rmw_serialize.cpp
+  src/rmw_features.cpp
+  src/rmw_unsupported.cpp
+)
+
+target_include_directories(rmw_unix_socket_cpp PRIVATE src)
+
+if(RMW_HAS_LOCALHOST_ONLY)
+  target_compile_definitions(rmw_unix_socket_cpp PRIVATE RMW_HAS_LOCALHOST_ONLY=1)
+endif()
+
+target_link_libraries(rmw_unix_socket_cpp PUBLIC
+  rmw::rmw
+)
+
+target_link_libraries(rmw_unix_socket_cpp PRIVATE
+  rcutils::rcutils
+  rcpputils::rcpputils
+  rosidl_runtime_c::rosidl_runtime_c
+  fastcdr
+  rosidl_typesupport_fastrtps_c::rosidl_typesupport_fastrtps_c
+  rosidl_typesupport_fastrtps_cpp::rosidl_typesupport_fastrtps_cpp
+  tracetools::tracetools
+  pthread
+  rt
+)
+
+configure_rmw_library(rmw_unix_socket_cpp)
+
+register_rmw_implementation(
+  "c:rosidl_typesupport_c:rosidl_typesupport_fastrtps_c"
+  "cpp:rosidl_typesupport_cpp:rosidl_typesupport_fastrtps_cpp"
+)
+
+install(
+  TARGETS rmw_unix_socket_cpp
+  EXPORT export_rmw_unix_socket_cpp
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin
+)
+
+ament_export_targets(export_rmw_unix_socket_cpp)
+
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest REQUIRED)
+  # rosidl_buffer was introduced in Rolling and is referenced by test_msgs'
+  # exported imported targets, but test_msgsConfig.cmake doesn't load it
+  # transitively. Pull it in first (QUIET so the call is a no-op on Jazzy /
+  # Kilted where the package doesn't exist).
+  find_package(rosidl_buffer QUIET)
+  find_package(test_msgs REQUIRED)
+  find_package(rosidl_typesupport_cpp REQUIRED)
+
+  # Common includes for unit tests that compile sources directly
+  set(_unit_test_deps rmw::rmw
+    fastcdr
+    rosidl_typesupport_fastrtps_c::rosidl_typesupport_fastrtps_c
+    rosidl_typesupport_fastrtps_cpp::rosidl_typesupport_fastrtps_cpp
+    pthread rt)
+
+  # Imported targets for tests that pull in IDL-generated message types.
+  # ament_target_dependencies() was removed in Rolling, so link directly to
+  # ${test_msgs_TARGETS} (set by find_package(test_msgs)) and the
+  # rosidl_typesupport_cpp imported target. Same pattern works on Jazzy/Kilted.
+  set(_test_msg_deps
+    ${test_msgs_TARGETS}
+    rosidl_typesupport_cpp::rosidl_typesupport_cpp)
+
+  # Unit test: registry
+  ament_add_gtest(test_registry test/test_registry.cpp src/registry.cpp)
+  target_link_libraries(test_registry ${_unit_test_deps})
+  target_include_directories(test_registry PRIVATE src)
+
+  # Unit test: registry concurrency / lock-free seqlock stress
+  ament_add_gtest(test_registry_concurrent
+    test/test_registry_concurrent.cpp src/registry.cpp)
+  target_link_libraries(test_registry_concurrent ${_unit_test_deps})
+  target_include_directories(test_registry_concurrent PRIVATE src)
+
+  # Unit test: serialization round-trips
+  ament_add_gtest(test_serialization test/test_serialization.cpp src/serialization.cpp)
+  target_link_libraries(test_serialization ${_unit_test_deps} ${_test_msg_deps})
+  target_include_directories(test_serialization PRIVATE src)
+
+  # Unit test: transport (transport.cpp's shm helpers call into
+  # shm_transport.cpp and, for serialize-into-ring, serialization.cpp —
+  # both are compiled in too).
+  ament_add_gtest(test_transport
+    test/test_transport.cpp src/transport.cpp src/shm_transport.cpp
+    src/serialization.cpp)
+  target_link_libraries(test_transport ${_unit_test_deps})
+  target_include_directories(test_transport PRIVATE src)
+
+  # Unit test: shared-memory payload transport
+  ament_add_gtest(test_shm_transport test/test_shm_transport.cpp src/shm_transport.cpp)
+  target_link_libraries(test_shm_transport ${_unit_test_deps})
+  target_include_directories(test_shm_transport PRIVATE src)
+
+  # Common link/include for all RMW API tests (they include types.hpp which
+  # needs fastrtps headers; linking the shared lib pulls them in).
+  set(_rmw_test_libs rmw_unix_socket_cpp
+    rosidl_typesupport_fastrtps_cpp::rosidl_typesupport_fastrtps_cpp)
+
+  # RMW API: init/shutdown lifecycle
+  ament_add_gtest(test_rmw_init test/test_rmw_init.cpp)
+  target_link_libraries(test_rmw_init ${_rmw_test_libs})
+  target_include_directories(test_rmw_init PRIVATE src)
+
+  # RMW API: node management
+  ament_add_gtest(test_rmw_node test/test_rmw_node.cpp)
+  target_link_libraries(test_rmw_node ${_rmw_test_libs})
+  target_include_directories(test_rmw_node PRIVATE src)
+  target_compile_definitions(test_rmw_node PRIVATE RMW_TEST_DOMAIN_ID=100)
+
+  # RMW API: guard conditions
+  ament_add_gtest(test_rmw_guard_condition test/test_rmw_guard_condition.cpp)
+  target_link_libraries(test_rmw_guard_condition ${_rmw_test_libs})
+  target_include_directories(test_rmw_guard_condition PRIVATE src)
+  target_compile_definitions(test_rmw_guard_condition PRIVATE RMW_TEST_DOMAIN_ID=101)
+
+  # RMW API: publish/subscribe round-trip
+  ament_add_gtest(test_rmw_pub_sub test/test_rmw_pub_sub.cpp)
+  target_link_libraries(test_rmw_pub_sub ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_pub_sub PRIVATE src)
+  target_compile_definitions(test_rmw_pub_sub PRIVATE RMW_TEST_DOMAIN_ID=102)
+
+  # RMW API: service/client round-trip
+  ament_add_gtest(test_rmw_service_client test/test_rmw_service_client.cpp)
+  target_link_libraries(test_rmw_service_client ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_service_client PRIVATE src)
+  target_compile_definitions(test_rmw_service_client PRIVATE RMW_TEST_DOMAIN_ID=103)
+
+  # RMW API: wait set
+  ament_add_gtest(test_rmw_wait test/test_rmw_wait.cpp)
+  target_link_libraries(test_rmw_wait ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_wait PRIVATE src)
+  target_compile_definitions(test_rmw_wait PRIVATE RMW_TEST_DOMAIN_ID=104)
+
+  # RMW API: graph introspection. registry.cpp is compiled in as well so the
+  # test can seed the shared registry directly; the rmw library does not export
+  # those internal symbols. Both copies act on the same shared memory; the only
+  # process-local state in registry.cpp is ring_doorbells' thread_local send-fd
+  # cache, one per copy, so the duplication is benign.
+  ament_add_gtest(test_rmw_graph test/test_rmw_graph.cpp src/registry.cpp)
+  target_link_libraries(test_rmw_graph ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_graph PRIVATE src)
+  target_compile_definitions(test_rmw_graph PRIVATE RMW_TEST_DOMAIN_ID=105)
+
+  # RMW API: QoS, TRANSIENT_LOCAL, multi-subscriber/client
+  ament_add_gtest(test_rmw_qos test/test_rmw_qos.cpp)
+  target_link_libraries(test_rmw_qos ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_qos PRIVATE src)
+  target_compile_definitions(test_rmw_qos PRIVATE RMW_TEST_DOMAIN_ID=106)
+
+  # RMW API: publisher/subscription events. registry.cpp is compiled in, as in
+  # test_registry, so a test can fill the registry (the library hides it).
+  ament_add_gtest(test_rmw_event test/test_rmw_event.cpp src/registry.cpp)
+  target_link_libraries(test_rmw_event ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_event PRIVATE src)
+  # Own domain: a test here clamps and fills the registry, which must not
+  # starve another test binary of slots in a parallel ctest run.
+  target_compile_definitions(test_rmw_event PRIVATE RMW_TEST_DOMAIN_ID=107)
+
+  # RMW API: on_new_message / on_new_request / on_new_response listener
+  # callbacks, which every drain path must fire.
+  ament_add_gtest(test_rmw_listener_callbacks test/test_rmw_listener_callbacks.cpp)
+  target_link_libraries(test_rmw_listener_callbacks ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_listener_callbacks PRIVATE src)
+
+  # Integration: fork()-based two-process tests pushing >4 MB payloads across
+  # a real PID boundary through the shared-memory path.
+  ament_add_gtest(test_rmw_cross_process test/test_rmw_cross_process.cpp)
+  target_link_libraries(test_rmw_cross_process ${_rmw_test_libs} ${_test_msg_deps})
+  target_include_directories(test_rmw_cross_process PRIVATE src)
+
+  # Benchmark (standalone, not a ctest): cost of one registry mutation on a
+  # populated registry, ring_doorbells included (issue #53). It recreates the
+  # registry of its domain (default 231, unused by the tests).
+  add_executable(bench_registry_ring test/perf/bench_registry_ring.cpp src/registry.cpp)
+  target_link_libraries(bench_registry_ring ${_unit_test_deps})
+  target_include_directories(bench_registry_ring PRIVATE src)
+
+  # Benchmark (standalone, not a ctest — run manually; see test/perf/README):
+  # publish-side staging cost of serialize-into-ring vs serialize-then-copy.
+  add_executable(bench_serialize_into_ring
+    test/perf/bench_serialize_into_ring.cpp
+    src/serialization.cpp src/transport.cpp src/shm_transport.cpp)
+  target_link_libraries(bench_serialize_into_ring
+    ${_unit_test_deps} ${_test_msg_deps})
+  target_include_directories(bench_serialize_into_ring PRIVATE src)
+
+  # Benchmark (standalone, not a ctest): CPU time and page faults per
+  # publish + take round trip through the public API (#84).
+  add_executable(bench_take_path test/perf/bench_take_path.cpp)
+  target_link_libraries(bench_take_path ${_rmw_test_libs} ${_test_msg_deps})
+endif()
+
+ament_package()

@@ -1,0 +1,893 @@
+# rmw_unix_socket_cpp - Design Document
+
+`rmw_unix_socket_cpp` is a ROS 2 middleware (RMW) implementation that runs entirely on a single host. It replaces the DDS layer that ROS 2 normally sits on top of. There is no discovery daemon, no message broker, and no central router. Two Linux kernel primitives do all the work: `AF_UNIX` datagram sockets carry every message directly from sender to receiver, and a single POSIX shared-memory object per ROS domain serves as the discovery registry that every process reads and writes. When no process is using the system, nothing is running. The shared-memory table *is* the discovery system.
+
+The design solves one problem: DDS discovery does not scale well to large single-host node graphs. On a production system of well over a hundred nodes, DDS-based RMW implementations made bring-up slow and unstable, and discovery never settled. Adding one node, or even a `ros2 topic list`, could trigger another round of discovery traffic that disturbed the running system. This RMW optimizes for two goals, in order. The first is robustness: discovery must be cheap so that bring-up is fast and stable, and so that adding a node or issuing a CLI command does not set off a storm of activity across the graph. The second is near-zero configuration: there should be no large set of QoS and discovery parameters to tune before the middleware behaves. The target is install it, set `RMW_IMPLEMENTATION`, and run.
+
+The scope is narrow. This is a localhost-only transport by design. `AF_UNIX` sockets are local to one machine, the shared-memory registry lives in that machine's `/dev/shm`, and the socket files live under its `/tmp/ros2_uds/`. There is no network path and no DDS interoperability, so every node on the host must use this RMW, and nodes cannot span hosts. That constraint is what makes discovery cheap enough to meet the robustness goal: a single shared table on one machine is the simplest way for processes to find each other, and it avoids the network-wide announcement traffic that makes distributed discovery expensive. The rest of this document explains the registry, the transport, the wait mechanism, the simplifications that fall out of being single-host, and the reasoning behind each choice.
+
+## Architecture Overview
+
+The middleware has four components: a shared-memory discovery registry, an AF_UNIX datagram transport, a serialization layer, and a wait mechanism built on `epoll`. There is no daemon and no broker process. Every process that loads the RMW maps the same registry, opens its own sockets, and talks directly to its peers. When no ROS 2 process is running, nothing of this middleware is running either. This is the central design decision: discovery is reduced to reading and writing a shared table, which is what makes bring-up fast and stable at high node counts.
+
+**Discovery registry (shared memory).** The registry is a single POSIX shared-memory object, created with `shm_open` and mapped `MAP_SHARED` into every process so they all see the same bytes. The name carries the ROS domain id (`/dev/shm/ros2_uds_<domain_id>`), so different domains map different files and never see each other. The layout is fixed up front: a small header (`RegistryHeader`) followed by a flat array of 32768 fixed-size slots (`RegistryEntrySlot`, 1168 bytes each). A fixed array avoids the complexity of dynamic growth, free lists, and pointer invalidation. Every node, publisher, subscription, service, and client occupies exactly one slot holding what a peer needs to reach it: entity type, owning PID, GID, names, type string, QoS, and the Unix socket path that is the endpoint's actual address. Reads and writes are lock-free. Each slot is a seqlock (an even/odd sequence counter that lets a reader detect a torn read — seeing half of one write and half of the next) with an atomic `state` field, so writers claim and publish slots with compare-and-swap (CAS) and readers never take a global lock. A robust mutex in the header is used only once, for the creation handshake. Putting a lock on the discovery path would serialize every process at startup, which is exactly the contention this RMW exists to avoid.
+
+**Transport (AF_UNIX datagrams).** All data, whether topic messages, service requests, or service responses, travels over `SOCK_DGRAM` Unix domain sockets. Each receiving endpoint binds its own socket to a file under `/tmp/ros2_uds/<domain_id>/`; that file path is its address, and it is the same path published in the registry. Each process has exactly one unbound send socket shared by all of its publishers and clients. `SOCK_DGRAM` is chosen over `SOCK_STREAM` because it preserves message boundaries (one `recvmsg` returns exactly one message, so there is no framing code) and is connectionless (no `connect`, `accept`, or per-peer state to manage). The data never touches the IP stack, the loopback interface, or a port number; it goes straight through the kernel's Unix-socket layer from one process to another. The cost of this simplicity is an extra copy: a message is copied through a kernel socket buffer rather than shared in place. Two rules soften that for large messages. Payloads of 64 KiB and above normally skip the datagram entirely — the publisher writes them once into a per-publisher shared-memory ring and the datagram carries only a small descriptor, falling back to the inline datagram if shared memory is unavailable (see Large payloads under Transport). Below the threshold, a single message must fit in one datagram (roughly 400 KB on a stock kernel; see the per-message size cap under Transport).
+
+**Serialization (CDR via fastcdr).** Messages are serialized to CDR using `fastcdr` driven by the `rosidl_typesupport_fastrtps_cpp` callbacks generated for each message type. This is the same encoding the default DDS-based RMWs use. Because the serialize and deserialize routines are compiled per message type, there is no runtime field walking. The Serialization section explains why an earlier introspection-based serializer was abandoned.
+
+**Wait mechanism (`epoll` + `eventfd` + a doorbell).** `rmw_wait()` blocks on `epoll`, watching the receive-socket file descriptors (fds) of every subscription, service, and client in the wait set plus an `eventfd` per guard condition, plus — in processes that consume graph events — one per-context doorbell socket that other processes ring after any registry mutation, so a blocked graph wait learns about changes without polling (see The doorbell under Wait set). `epoll` is used here rather than `poll`/`select`; the wait section explains why. There are no background receiver threads while the executor waits: socket draining happens inside `rmw_wait()`, which the executor already calls in a tight loop. This keeps the data path single-threaded per process and avoids lock contention on internal queues. The one exception is an executor that does not wait at all — `rclcpp`'s `EventsExecutor` asks to be called back instead — for which the context starts a single listener thread on demand (see The listener thread).
+
+**End-to-end publish flow.** On `rmw_publish`, the node serializes the ROS message to CDR once — into a heap payload for small messages, or directly into the shared-memory ring record for large ones (see Staging and fanout). It fills in a fixed 37-byte wire header (sender GID, sequence number, send timestamp, payload size, and a type byte). It then reads the registry's `generation` counter and compares it to the value cached on the publisher. If the graph has not changed, the publisher reuses its cached list of subscriber socket paths and never touches the registry. Only when `generation` has moved does it re-scan the registry to rebuild that list. For each subscriber path it issues one `sendmsg` with gather I/O, so the header and payload become one datagram with no intermediate copy. Sends are non-blocking and best-effort, one kernel copy into each subscriber's socket buffer. Payloads of 64 KiB and above take a different route: the publisher stages the bytes once in its shared-memory ring and each subscriber receives only a 32-byte descriptor datagram (see Large payloads under Transport). On the receiving side, a later `rmw_wait()` drains the bound socket, splits the header from the payload, and queues the message; `rmw_take` then deserializes it and hands it to the subscription callback. In steady state, the only discovery cost per publish is a single atomic read of the generation counter.
+
+```
+PUBLISHER PROCESS                                  SUBSCRIBER PROCESS
+-----------------                                  ------------------
+
+  rmw_publish(msg)
+        |
+        v
+  +------------------+
+  | fastCDR serialize|   ROS message -> CDR bytes (the payload)
+  +------------------+
+        |
+        v
+  +------------------+
+  | build WireHeader |   37 bytes: gid, seq, timestamp, size, type
+  +------------------+
+        |
+        |   look up subscriber paths (cached;
+        |   re-queried only when registry
+        |   generation counter changes)
+        v
+  for each subscriber path:
+  +-----------------------------+
+  | sendmsg() gather I/O        |
+  | iov[0]=header  iov[1]=payload|
+  | one datagram, named to path |
+  +-----------------------------+
+        |
+        |   ===== kernel AF_UNIX datagram =====
+        |   (no TCP, no IP, no loopback;
+        |    one copy into the dest buffer)
+        |
+        v
+                                          /tmp/ros2_uds/<domain>/sub_<pid>_<id>.sock
+                                          +---------------------------+
+                                          | bound receive socket      |
+                                          | (one per subscription)    |
+                                          +---------------------------+
+                                                      |
+                                                      v
+                                          +---------------------------+
+                                          | recv_from: peek size,     |
+                                          | grow buffer, real recv,   |
+                                          | split header + payload    |
+                                          +---------------------------+
+                                                      |
+                                                      v
+                                          +---------------------------+
+                                          | rmw_take -> deserialize   |
+                                          | -> subscription callback  |
+                                          +---------------------------+
+```
+
+## ABI conventions
+
+These apply everywhere in `src/` and are non-obvious to readers new to the RMW layer.
+
+- **All public entry points are `extern "C"`.** rcl `dlopen`s the RMW shared library and calls fixed C symbols; C++ name mangling would break linkage.
+- **The implementation identifier is compared by pointer, not by `strcmp`.** Every RMW handle carries `implementation_identifier`. We declare it as `inline constexpr char identifier[] = "rmw_unix_socket_cpp";` so it has a single address across all translation units (C++17 guarantee).
+- **No exceptions cross the RMW boundary.** Every public function returns `rmw_ret_t` or a pointer. Exceptions from `fastcdr` are caught at the serialization boundary.
+- **The `void * data` field on every RMW struct holds our private struct** (`UdsNode`, `UdsPublisher`, ...). Defined in `types.hpp`. Recovered by `static_cast` on every entry.
+- **Lock-free registry, mutex-protected per-entity caches.** The shared-memory registry uses a per-slot seqlock + atomic state machine (no global mutex on hot paths). Per-publisher / -client / -service caches use `std::mutex` because they are process-local and rare.
+
+## Transport: AF_UNIX datagram sockets
+
+All message data (topic publications, service requests, and service responses) moves between processes over `AF_UNIX` (Unix domain) sockets of type `SOCK_DGRAM`. This is the local-only kernel transport. It never touches the IP stack: there is no TCP, no loopback interface, no `127.0.0.1`, and no port numbers. A datagram is handed to the kernel addressed to a filesystem path, and the kernel copies it into the receiving process's socket buffer. For single-host communication this is the shortest path the kernel offers.
+
+### Why `SOCK_DGRAM` and not `SOCK_STREAM`
+
+The transport is connectionless on purpose, and the choice of `SOCK_DGRAM` follows directly from how pub/sub works.
+
+A datagram socket preserves message boundaries. Each `sendmsg()` produces exactly one datagram, and each `recvmsg()` returns exactly one complete message. A ROS message maps one-to-one onto a datagram, so there is no framing layer: no length prefixes, no buffering partial reads, no logic to find where one message ends and the next begins. With `SOCK_STREAM` the kernel delivers an undelimited byte stream, and the RMW would have to add and parse that framing itself.
+
+A datagram socket is also connectionless. The sender names a destination path on every send; there is no `connect()`, no `accept()`, and no per-connection state. This matters at the node counts this RMW targets. A publisher with N subscribers would otherwise need N open stream connections, each set up, torn down, and tracked. With datagrams the publisher holds no connection state at all. It sends to a path, and if nobody is bound there the send simply fails (the publisher treats that as a routine teardown race; see the send path below). Fewer file descriptors, no connection lifecycle, no half-open states to reason about.
+
+This is closer in behavior to UDP than to TCP, but without any of the network stack. The kernel's Unix domain socket layer moves the bytes from one process directly to another.
+
+### Addressing: the file path is the address
+
+A Unix domain socket is addressed by a path on the filesystem. The path is stored in the kernel's `sockaddr_un.sun_path` field, which is 108 bytes; that fixed size is why the registry stores socket paths in a 108-byte field.
+
+Each receiving endpoint creates its own socket and `bind()`s it to a unique path under `/tmp/ros2_uds/<domain_id>/`. "Receiving endpoint" means a subscription, a service server, or a service client. Each calls `create_bound_socket()` with a path from `make_socket_path()`. That bound path is the endpoint's address, and it is exactly what the endpoint writes into its registry slot. Discovery's entire job is to hand a publisher the bound socket paths of the subscribers it should send to.
+
+The domain id appears in the directory name (`/tmp/ros2_uds/0/`, `/tmp/ros2_uds/1/`, and so on), so endpoints on different ROS domains bind under different directories and never address each other. The path within that directory is built by `make_socket_path()` as `<prefix>_<pid>_<unique>.sock`, where the prefix names the endpoint kind (`sub`, `srv`, `cli`), the PID identifies the owning process, and a per-process counter combined with a time component guarantees uniqueness. Two endpoints never collide, and because the PID is embedded in the name, a socket file left behind by a crashed process can be recognized and unlinked later (`cleanup_orphan_socket_files()` parses the PID out of the name and checks `/proc/<pid>`).
+
+### One shared send socket per process
+
+Receiving needs a bound, addressable socket; sending does not. A sender only ever names a destination, so it needs no address of its own.
+
+Each process therefore creates exactly one send socket, in `rmw_init()`, stored on the context as `send_socket_fd`. It is an unbound, anonymous `SOCK_DGRAM` socket. Every publisher, service, and client in that process shares it: they all call `sendmsg()` on the same descriptor, naming the destination path per call. The send socket never receives anything and never binds to a path. Because the descriptor is shared, concurrent senders rely on a single `sendmsg()` being atomic at the datagram level, which the kernel guarantees for `SOCK_DGRAM`: two threads each sending one datagram cannot interleave their bytes.
+
+This keeps the file-descriptor count low: a process pays one fd per receiving endpoint plus a single shared send fd, regardless of how many publishers it hosts or how many peers they talk to.
+
+Both socket types request a large buffer (`SO_RCVBUF` on the bound socket, `SO_SNDBUF` on the send socket). The kernel silently clamps these requests to `net.core.rmem_max` / `net.core.wmem_max`, which bounds the largest message a single datagram can carry; see The per-message size cap below.
+
+### The send path
+
+On `rmw_publish`, the ROS message is serialized exactly once. The publisher hands the message to the cached `rosidl_typesupport_fastrtps` callback, which produces a single flat byte buffer: the CDR encapsulation header followed by the message body. This buffer is the payload. It is built once per publish regardless of how many subscribers will receive it, because the bytes on the wire are identical for every subscriber.
+
+Next a fixed wire header is filled in. `WireHeader` is a packed 37-byte struct (`types.hpp`), and its layout is pinned by `static_assert`s so it stays a stable cross-process, cross-build contract. The fields are:
+
+- `gid` (16 bytes): the publisher's GID. Its routing role is covered under Services.
+- `sequence_number` (8 bytes): a per-publisher monotonic counter, taken with a relaxed atomic fetch-add.
+- `source_timestamp_ns` (8 bytes): the send time in nanoseconds, used by the receiver to populate message info.
+- `payload_size` (4 bytes): the CDR payload length, which lets the receiver split the datagram back into header and payload and detect truncation.
+- `msg_type` (1 byte): `0` for a topic message, `1` for a service request, `2` for a service response. The same transport carries all three, and this byte tells the receiver which queue the datagram belongs in. The high bit (`SHM_PAYLOAD_FLAG`, combinable with any of the three) marks a datagram whose payload is a shared-memory descriptor instead of CDR bytes; receivers mask it off before dispatching on the type (see Large payloads below).
+
+The header is built on the stack and is never serialized through CDR. It is a plain byte blit, which is why its layout must be fixed rather than negotiated.
+
+With the payload and header in hand, the publisher resolves the subscriber list (the cached set of socket paths, refreshed only when the registry generation counter has moved) and then loops over it. For each subscriber path it calls `send_to`, which performs the actual transmission.
+
+`send_to` sends the header and payload as one datagram using gather I/O (a single `sendmsg` that reads from several separate buffers and writes them as one datagram). It sets up a two-element `iovec`: `iov[0]` points at the wire header, `iov[1]` points at the payload buffer. A single `sendmsg` call, with the destination socket path set in `msg_name`, then writes both regions into one datagram. The kernel reads from both buffers and stitches them into a single message, so there is no intermediate buffer that concatenates header and payload first. Each subscriber therefore costs one `sendmsg` and one kernel copy into that subscriber's receive buffer. With N subscribers the publisher issues N `sendmsg` calls and pays N copies; there is no multicast and no shared buffer between subscribers. If the payload is empty, `msg_iovlen` is set to 1 so only the header is sent.
+
+The send is non-blocking and best-effort. `sendmsg` is called with `MSG_DONTWAIT` (never block on a full buffer) and `MSG_NOSIGNAL` (a dead peer returns an error instead of raising `SIGPIPE` and killing the process). On success the function returns true. On failure it classifies `errno`, logs at an appropriate throttled level, and returns false. It does not throw, retry, or abort the loop. The publisher ignores the return value and proceeds to the next subscriber. This is the deliberate fan-out semantics: a failure for one peer causes a drop for that peer only, and delivery to every other subscriber is unaffected. The error classification is described under Send failure handling below.
+
+### The receive path
+
+Every receiving endpoint owns its socket. Each subscription (and each service and client) creates one `AF_UNIX` `SOCK_DGRAM` socket and binds it to a file under `/tmp/ros2_uds/<domain_id>/` (the path format is covered under Addressing above). That bound socket is the endpoint's address: it is the path a publisher writes into the registry, and the path senders name on every `sendmsg`. Because the socket is per-subscription, the kernel keeps a separate receive buffer per endpoint, so a slow subscriber can only fill its own queue. There is no shared inbox and no demultiplexing step on the receive side.
+
+Reading one datagram off a socket is done by `recv_from` in `transport.cpp`. The complication it solves is that the caller does not know in advance how big the next message is, and a `SOCK_DGRAM` `recv` that supplies too small a buffer silently truncates the datagram and discards the rest. The function avoids that in two steps:
+
+1. **Peek to learn the size.** A first `recv` is issued with `MSG_PEEK | MSG_TRUNC | MSG_DONTWAIT`. `MSG_PEEK` leaves the datagram on the socket, and `MSG_TRUNC` makes the call return the datagram's true length even when the peek buffer was smaller. A thread-local 256 KB scratch buffer is reused across calls so the common small-message case allocates nothing. The peek return value `n` is the real size on the wire.
+2. **Size the buffer, then recv for real.** If `n` is larger than the scratch buffer, the buffer is grown to `n`. A second `recv` (without `MSG_PEEK`) then consumes the datagram into a buffer that is now guaranteed large enough, so no truncation occurs.
+
+`recv_from` distinguishes the three outcomes of the peek. A negative return with `errno == EAGAIN`/`EWOULDBLOCK` is the steady-state "nothing to read" case driven by the `rmw_wait` loop and is silent by design; any other negative errno (for example `EBADF` after shutdown) is logged throttled. A zero return means no message. Only a positive return proceeds to the real `recv`.
+
+**Splitting the wire header from the payload.** Each datagram is one `WireHeader` (the 37-byte struct built on the send path) immediately followed by the serialized message body. After the real `recv`, `recv_from` validates and splits:
+
+- If fewer than `sizeof(WireHeader)` bytes arrived, the datagram is a runt and is dropped (logged throttled).
+- The header is copied out of the front of the buffer with a single `memcpy` into `header_out`.
+- The payload length is computed as `n - sizeof(WireHeader)`. It is cross-checked against the `payload_size` field the sender wrote into the header. A mismatch means the kernel truncated an oversized datagram on the way in; the length is clamped to the header's value and the event is logged so it can be correlated with the sender-side `EMSGSIZE`.
+- The remaining bytes are copied into the caller's `payload_out` vector.
+
+`recv_from` returns one parsed message at a time. The subscription drains its socket in a loop: `drain_endpoint` calls `recv_from` repeatedly until it returns false (socket empty). One function serves every endpoint kind and every caller — `rmw_wait`, the `rmw_take*` family, and the listener thread — because when the receive loop existed in four copies they drifted, and the drift is where the delivery gaps were. Each datagram is filtered by `msg_type` so that only topic messages land in this queue, wrapped in a `ReceivedMessage` (header plus payload), and pushed onto the per-subscription queue under its mutex. The queue is capped at the QoS `depth`; when a push exceeds the cap the oldest entry is dropped, which is the KEEP_LAST history policy enforced at the rcl boundary rather than in the kernel. This drain normally runs inside `rmw_wait` on the executor's own thread; only an endpoint with a listener callback registered is also drained by the context's listener thread (see The listener thread).
+
+**Payload buffers are reused, not freed per message.** Each receiving endpoint keeps the payload buffers of the messages it has taken (`spare_payloads`, under `queue_mutex`) and the buffer its drain receives into (`recv_payload`, under `drain_mutex`). A take hands its message's buffer back when it returns, a KEEP_LAST overflow hands back the buffer of the entry it drops, and the drain receives the next datagram — and, for a service, a client or a KEEP_ALL subscription, copies a shared-memory payload out — into a spare buffer, so a steady stream cycles through the same few buffers with no allocation. Allocating and freeing one per message was costly for large payloads (#84): glibc returned a freed buffer of hundreds of KB to the kernel (`madvise(MADV_DONTNEED)`), and the next message page-faulted it back in and the kernel zeroed it again — about 250 faults per 1 MB message in the five-topic fan-in of `bench_take_path`. A drain that finds `queue_mutex` held by a take (which deserializes under it) when it wants a spare does not wait: it allocates, as before. The cost is memory held instead of returned: an endpoint keeps up to as many buffers as it once had in flight together — its queue depth, plus one per thread taking at once, plus the drain's own — each as large as the largest message it held, until the endpoint is destroyed.
+
+**Deserialize and deliver.** `rmw_take` (and its variants) first drains the socket, then pops one `ReceivedMessage` from the queue. The payload, which is still raw CDR bytes, is handed to `deserialize`, which invokes the message type's compiled `cdr_deserialize` callback to reconstruct the ROS message in place. On a deserialization failure the take returns "no message taken" rather than a hard error, since a corrupted or truncated payload should not abort the executor; the failure is logged throttled. The `_with_info` variants additionally copy the source timestamp, sequence number, and publisher GID out of the wire header into the `rmw_message_info_t` returned to the caller. The subscription callback registered by the executor is triggered from the drain step when a new message is enqueued, which is what wakes `rmw_take`.
+
+#### In-process concurrency
+
+Unless a listener callback is registered there are no background threads, so all sends, drains, and takes run on the caller's thread, typically the executor thread inside `rmw_wait`. Under a `MultiThreadedExecutor`, several threads may call `rmw_take`, `rmw_publish`, and `rmw_wait` concurrently on different entities. The data structures are sized for this: each subscription, service, and client guards its own receive queue with a per-entity `queue_mutex`, and each publisher, service, and client guards its discovery cache with its own cache mutex (`sub_cache_mutex`, `cache_mutex`, `svc_cache_mutex`, `client_cache_mutex`). The large-payload machinery adds two more per-entity locks: `shm_mutex` serializes writers staging into one publisher's ring, and the subscription's `ShmReaderCache` locks internally because `rmw_wait` and `rmw_take` may both resolve descriptors on the same subscription. Concurrent operations on different entities therefore do not contend. The one process-wide shared resource on the send side is the single send socket; concurrent senders on it are safe because the kernel delivers each `SOCK_DGRAM` `sendmsg` as one atomic datagram, so two threads' messages never interleave.
+
+### The per-message size cap (~400 KB)
+
+Everything in this section applies to the inline path: topic payloads under 64 KiB, small TRANSIENT_LOCAL payloads, and small service requests/responses. Payloads at or above 64 KiB — topics, large TRANSIENT_LOCAL messages (via either publish entry point), and large service requests/responses alike — bypass the datagram size cap by going through shared memory (see Large payloads below).
+
+Each inline message travels as exactly one `SOCK_DGRAM` datagram. A datagram is atomic: the kernel either accepts the whole thing or rejects it. So one ROS message, after the 37-byte wire header and the CDR payload are added together, must fit inside a single datagram. The ceiling on that datagram size is the socket buffer, and the socket buffer is not whatever the code asks for.
+
+`create_bound_socket()` and `create_send_socket()` both request a 48 MiB buffer:
+
+```c
+static constexpr int RECV_BUF_SIZE = 48 * 1024 * 1024;  // source comment loosely labels this 48 MB; the value is 48 MiB
+static constexpr int SEND_BUF_SIZE = 48 * 1024 * 1024;
+```
+
+That request is not honored as written. When `setsockopt(SO_SNDBUF)` or `setsockopt(SO_RCVBUF)` is called, the kernel clamps the value to the system-wide limits `net.core.wmem_max` (send) and `net.core.rmem_max` (receive). `setsockopt` still returns 0 on a clamp, so the clamp is silent: there is no error to catch, the buffer is just smaller than asked for. Neither call site reads the effective size back with `getsockopt`; the warning at `transport.cpp:66-68` / `86-88` fires only on an outright `setsockopt` failure and logs the requested constant, not the effective size. So a clamp is invisible to the process.
+
+The kernel stores twice the requested `SO_SNDBUF`/`SO_RCVBUF` value (`sk_sndbuf = 2 x request`, itself clamped to `wmem_max`), and an `AF_UNIX` datagram must fit within that doubled buffer minus per-`skb` overhead. On a stock kernel both `wmem_max` and `rmem_max` default to `212992` bytes (about 208 KiB), so the doubled buffer is about 416 KiB and the usable single-datagram payload is somewhat less after overhead, on the order of a few hundred KB. The 48 MiB request is far above this and gets clamped on any untuned system.
+
+A message that exceeds the cap is not split or queued. `sendmsg()` fails immediately with `EMSGSIZE`. The transport treats this as a configuration error rather than transient backpressure, and the error message names the fix directly:
+
+```
+UDS send to '%s' failed: message too big (%zu bytes incl. header).
+Raise net.core.{wmem_max,rmem_max} or split the message.
+```
+
+This mostly stops mattering because point clouds, images, and other large payloads ride shared memory instead of the datagram — large topics, large TRANSIENT_LOCAL messages (staged into a durable per-cache-entry segment, see Large payloads below, whether published through `rmw_publish` or `rmw_publish_serialized_message`), and large service requests/responses (staged into the ephemeral ring) all bypass the cap. The cap now bites only the shm-failure inline fallback, when `/dev/shm` is unavailable. To raise it, increase both sysctls (the send side is bounded by `wmem_max`, the receive side by `rmem_max`, so both must be raised) before the nodes start:
+
+```bash
+sysctl -w net.core.wmem_max=8388608
+sysctl -w net.core.rmem_max=8388608
+```
+
+These values are 8 MiB; after the kernel's 2x they yield a usable single-datagram ceiling of roughly 16 MiB. The 48 MiB request in the code is deliberately well above any reasonable sysctl value so that raising the limits is the only thing a user has to do; the code never has to be rebuilt to use a larger buffer.
+
+### Large payloads: the shared-memory ring
+
+Copying a multi-megabyte payload into the kernel once per subscriber and out again on each receive is the dominant cost of the datagram path, and the per-datagram size cap makes it a hard ceiling rather than just a slow path. For large topic messages both problems are solved the same way the registry solves discovery: the bytes go through `/dev/shm`, and only control information crosses the socket.
+
+**When it applies.** `rmw_publish` (and `rmw_publish_serialized_message`) compares the serialized payload against `SHM_PAYLOAD_THRESHOLD` (64 KiB, `shm_transport.hpp`). Below it, nothing changes — small messages stay on the inline datagram path, which is both simpler and faster at that size. At or above it, the payload is staged in the publisher's ring and each subscriber receives a datagram whose payload is a 32-byte `ShmPayloadDescriptor` and whose `msg_type` carries `SHM_PAYLOAD_FLAG`. TRANSIENT_LOCAL publishers cannot use the *cycling* ring — a lapped record would corrupt a message a late joiner still needs to replay — so a large latched payload is staged into a dedicated *durable* segment instead (see Durable segments for latched replay below); this applies equally to `rmw_publish` and `rmw_publish_serialized_message`, which share the replay-cache path. Large service requests and responses use shared memory too, but through the *cycling* ring (via per-entity `shm_ring`/`shm_cache` on the service and client): a request/response is not latched, so nothing needs to outlive the ring, and a lapped or unresolvable descriptor is dropped best-effort — the same outcome a full socket buffer produces — even though service QoS resolves to RELIABLE, leaving the peer to time out and retry. If staging fails — shared memory unavailable, `/dev/shm` full — the message falls back to the inline datagram (logged throttled), where a payload above the kernel's datagram cap fails with `EMSGSIZE` exactly as before; a system relying on the ring for large messages should still size `net.core.{w,r}mem_max` as a safety net.
+
+**The ring.** Each publisher lazily creates one POSIX shared-memory segment, `/dev/shm/ros2_uds_data_<domain>_<pid>_<owner>_<segment>`, on its first large publish. After a small validated header (`ShmRingHeader`: magic, version, capacity), the segment is a byte ring of 64-byte-aligned records, each an `ShmRecordHeader` (seqlock word + length) followed by the payload. The publisher is the only writer; its cursor and record counter live in process memory (`ShmRingWriter`), not in the shared segment, so there is no cross-process write coordination at all. The ring is sized to hold at least four records of the largest payload staged so far (minimum 1 MiB — `posix_fallocate` commits the whole ring's RAM up front and every large-message sender pays it, so the floor is kept modest); a payload that outgrows it triggers a new, larger segment under a bumped `<segment>` generation, and the old name is unlinked. The publisher never writes an old segment again once it has moved to a new one, so a reader that already mapped the old segment keeps reading it (an unlinked segment lives until the last unmap). Mapping the new generation evicts the reader's old-generation mapping, except while queued subscription messages still point into it (see Receiving): it is then kept, marked superseded, and unmapped when the last of them is taken or dropped. A reader that never mapped the old generation cannot resolve it, and those straggling messages drop cleanly (counted in message_lost for a subscription), exactly like messages from an exited publisher.
+
+**Staging and fanout.** Staging is a two-phase seqlock write (`shm_stage_reserve` / `shm_stage_commit`): reserve marks the record's `seq` odd (an absolute `exchange`, because the slot may hold stale bytes) and hands out the record's payload area; commit publishes the actual length and stores the even `seq` derived from the sender's monotonic record counter. For senders that serialize a ROS message — `rmw_publish`, `rmw_send_request`, `rmw_send_response` — the CDR serializer writes **directly into the reserved record** (`shm_serialize_prepare_send`): the size walk picks the destination up front, so a large message never exists as an intermediate heap payload at all, and the zero-init, serialize-into-vector, and staging-copy passes of the old path collapse into the single CDR write (measured ~2–3× faster staging, e.g. ~1.3 ms saved per 4 MiB message). A failed serialize aborts the reservation: the seqlock stays odd, the cursor does not advance, and the half-written record is unobservable. Pre-serialized bytes still stage with one `memcpy` — `rmw_publish_serialized_message` via `shm_stage_payload` (= reserve + copy + commit); TRANSIENT_LOCAL caching via `shm_stage_durable` into its dedicated immutable segment (see Durable segments below), never through the cycling ring. One consequence of writing CDR in place: alignment-padding bytes inside a staged record are unspecified (decoders skip them), so two byte-wise dumps of the same message may differ in padding. The descriptor — segment identity, record offset, expected `seq`, payload length — is then fanned out with the normal `sendmsg` loop. N subscribers cost one serializer pass plus N tiny datagrams, instead of N kernel copies of the payload.
+
+**Receiving.** The drain loop (`drain_endpoint`) recognizes `SHM_PAYLOAD_FLAG` and resolves the descriptor: it maps the named segment on first use (cached per receiving endpoint in `ShmReaderCache`, read-only), bounds-checks the descriptor against the validated ring capacity so a corrupt or hostile descriptor can never read outside the mapping, and checks the record's seqlock — `seq` must equal the descriptor's expected value. What happens next depends on the endpoint.
+
+- **A KEEP_LAST subscription does not copy the payload at the drain** (#86, Fast DDS data-sharing semantics). `shm_pin_payload` validates the descriptor as above, takes a pin on the segment's mapping, and the descriptor itself is queued (`ReceivedMessage::shm_desc`, the flag kept, no payload buffer). The take deserializes straight from the mapped record (`shm_read_pinned`), under the seqlock: `seq` must equal the descriptor's value before the read and still equal it after, with an acquire fence between. If it does not, the publisher overwrote the record while the message sat in the queue or while it was being read: whatever the read produced is discarded, the message is counted in the subscription's `message_lost` status, and the take moves on to the next queued message. A torn read is therefore never delivered, but it may already have been written into the caller's message: a take that then finds no intact message returns `taken = false` with that message partly overwritten, so a caller of `rmw_take` (or `rclcpp::Subscription::take`) must not rely on its message being untouched when nothing was taken. The drain also drops queued records the publisher has already overwritten, from the front of the queue, and counts them in `message_lost` there, so the `on_new_message` count it reports (a take credit for the EventsExecutor) covers only messages a take can still return. It checks the front only: a lapped record queued behind another publisher's intact one still costs a credit until it reaches the front. Deserialization runs in Fast CDR, which bounds every read by the descriptor's length, and `deserialize` catches every exception (a torn sequence length can make it throw `std::bad_alloc` or `std::length_error`); a failure on bytes the seqlock shows intact is a real decode failure and is reported as one. `rmw_take_serialized_message` copies the bytes out at take time under the same checks. The mapping cannot go away under a reader: the take holds the endpoint's own `ShmReaderCache::mutex` across the read, and every unmap happens under it — a pinned mapping is never unmapped by the sweeps (they mark it superseded instead; the last unpin unmaps it), and `shm_reader_close` runs only at destruction. No code path truncates a ring segment: the publisher sizes it once with `posix_fallocate` and only ever unlinks it, so a reader holding a mapping never takes SIGBUS. To keep a lap during the read rare, the mapping remembers the newest record `seq` the drain pinned from it; a record two or more publishes behind that (the ring holds at least four records of its largest payload, and a wrap wastes less than one) is first copied into a reused buffer, checked, and the copy is deserialized, which is the pre-#86 path. So is every payload under 512 KiB (`SHM_TAKE_IN_PLACE_MIN`): `bench_take_path` measured the in-place read slower than copy-then-deserialize from 192 to 448 KiB (see the CHANGELOG), so only payloads of 512 KiB and up are read in place. Either way the queue holds the descriptor, so the ring-bounded history below applies from 64 KiB. A superseded segment is never written again, so its large records are always read in place.
+- **A service, a client or a KEEP_ALL subscription copies the payload out** at drain time, with the same checks (`shm_fetch_payload`), and queues the copy. A lost request or response would leave its caller waiting with no status to report it in, and a KEEP_ALL subscription must not lose a message it already received, so they keep the pre-#86 semantics.
+
+A lapped record found at the drain is dropped the same way for every endpoint: the same observable outcome as a socket-buffer overflow on the inline path, never a torn payload.
+
+**Durable segments for latched replay.** The cycling ring cannot back TRANSIENT_LOCAL replay: its records are overwritten as new payloads are staged, but a latched message must stay intact until every late joiner has replayed it — possibly long after it was published. So when a TRANSIENT_LOCAL publisher caches a payload at or above `SHM_PAYLOAD_THRESHOLD` (via either `rmw_publish` or `rmw_publish_serialized_message`, which share a single replay-cache path in `transient_local_publish`), it is staged with `shm_stage_durable` into a *dedicated, immutable, single-record* segment (`/dev/shm/ros2_uds_data_<domain>_<pid>_<owner>_1`), whose `<owner>` id is drawn from the same process-global counter as ring segments so a durable segment's name can never collide with a ring segment or another cached message. The `CachedMessage` stores the 32-byte descriptor as its payload (with `SHM_PAYLOAD_FLAG` set on the cached header) and owns the segment through a `std::unique_ptr<DurableShmSegment>`; the segment is `munmap`+`shm_unlink`ed exactly when the cache entry is evicted — trimmed past `qos.depth`, or the publisher destroyed. Replay to late joiners and the live fanout both send the descriptor through the unchanged `send_to` path, and the subscriber resolves it exactly like a ring payload: a durable segment is indistinguishable from a ring segment to the reader, except its write-once record is never lapped, so replay never races a producer. A crashed publisher's durable segments are reclaimed by the same `shm_cleanup_orphan_segments` sweep as ring segments and socket files. Two properties fall out of the design. First, the segment lives for as long as the cache entry, so a payload cached at depth `N` costs one durable segment (its own `4 x` -free, single-record size) until it ages out — a KEEP_LAST latched publisher with depth 1 holds exactly one. Second, there is a small behavioural divergence from the pre-durable path: a large latched payload whose publisher is destroyed before an already-connected subscriber drains the descriptor is now lost (the segment is unlinked at destroy), where the old inline datagram would have survived in the subscriber's socket buffer. This matches the ring's own teardown semantics and the transport's best-effort stance. The only latched payloads still bound by the datagram cap are those that fall back to inline because shm staging failed (`/dev/shm` unavailable or full). Cost note: because each cached entry gets its own segment, a latched publish creates a segment (`shm_open`+`posix_fallocate`+`mmap`, tens of µs to a couple of ms depending on size) and its eviction destroys one — so a depth-1 publisher that re-latches at a high rate pays a create+destroy per publish. That is acceptable because TRANSIENT_LOCAL data is by nature low-rate (maps, calibration, static transforms); a high-rate large stream should use VOLATILE, which rides the reusable cycling ring. The staging and the eviction both run outside `cache_mutex` (see `transient_local_publish`) so this cost never serializes other publishers or the wait-side replay.
+
+**Copy accounting.** The inline path moves a payload through the kernel twice per subscriber — 2N copies for N subscribers. The ring path costs no copy for a subscription that deserializes: its take reads the ring record directly, so beyond serialization (whose single CDR pass lands in the ring) the only pass is the deserialization every RMW does; a payload under 512 KiB, a record close to being lapped, a serialized take, a KEEP_ALL subscription, and a service or client still cost one copy out each. There is no syscall proportional to the payload and no dependency on `net.core.wmem_max`.
+
+**Cleanup.** `rmw_destroy_publisher` unmaps and unlinks the ring, and releases any durable TRANSIENT_LOCAL segments as the publisher's replay-cache entries are destroyed; `rmw_destroy_subscription` unmaps its cached segments. Segments orphaned by an ungraceful exit are reclaimed by `shm_cleanup_orphan_segments` at `rmw_init`, using the same dead-PID test (and the same PID-namespace reasoning) as the registry and socket-file cleanup.
+
+**Limits, deliberately accepted.** A subscriber slower than the ring depth loses messages by design — the publisher never blocks and never waits for readers, matching the transport's best-effort semantics. Because a subscription's queue holds descriptors, not copies, this is measured at the take, not at the drain: a KEEP_LAST depth-N subscription to large messages keeps at most what the publisher's ring still holds (at least four records of the largest payload), and older queued messages are reported as lost (`message_lost`) by the next drain or take that finds them, never delivered. KEEP_ALL subscriptions copy at the drain and are not affected. Descriptors still in flight when the publisher is destroyed resolve only for subscribers that already mapped that ring generation (the ring is unlinked at destroy, whereas inline in-flight payloads survive in the socket buffer), so the final large messages before a teardown are best-effort. A receiver built without `SHM_PAYLOAD_FLAG` support that shares a domain with a new-build sender silently drops flagged (large) messages while small ones flow — this applies to subscribers, and since services and clients also emit flagged datagrams for large requests/responses, to service peers too — mixed-build fleets on one host should upgrade together. Delivery still requires a shared `/dev/shm` (the registry already requires this, so the ring adds no new deployment constraint). The seqlock check makes a lapped read fail with probability 1 minus the chance of a 64-bit coincidence (matching `seq` and matching length in reused bytes), which is treated as negligible.
+
+### Send failure handling
+
+Every send goes through `send_to` in `transport.cpp`, which calls `sendmsg()` once with `MSG_DONTWAIT | MSG_NOSIGNAL`. The send is non-blocking and never raises `SIGPIPE`, so a failure surfaces as a return value plus `errno` rather than a signal or a stall. On success the function returns immediately. On failure it captures `errno` and routes it through a `switch` that maps each cause to a deliberate log level and message. Classifying matters because "send failed" covers three very different situations: a misconfigured system, a slow consumer, and a peer that is simply gone. Logging them identically would either bury a real problem or flood the log with noise that is not a problem.
+
+Every category is reachable on the hot path, so the loud ones are rate-limited (`*_THROTTLE` with a per-category interval in milliseconds). A single persistently-failing peer cannot drown the log. The destination path in the message identifies the offending endpoint on its own: `make_socket_path` encodes the peer's prefix and PID into the filename, so the path alone is enough to find the subscriber without correlating against other state.
+
+**`EMSGSIZE` (logged as error, 5s throttle).** The message exceeds the kernel's per-datagram cap (see The per-message size cap above). This is a configuration-level fault, not transient backpressure: it will fail every time until the limits are raised or the message is split, and it indicates the system is set up wrong for the traffic it carries. So it is logged at error level with the full byte count (header plus payload) and an actionable message naming the two sysctls to raise. The 5s throttle is looser than the slow-consumer case because this condition is steady, not bursty.
+
+**`EAGAIN` / `EWOULDBLOCK` / `ENOBUFS` (logged as warning, 1s throttle).** These mean the destination socket's receive queue is full (or, briefly, the local send queue). This is the classic slow-subscriber symptom: the subscriber is not calling `rmw_take` fast enough to drain its socket, so the kernel has nowhere to put the new datagram and the message is dropped. It is a warning, not an error, because the system is wired correctly and may recover once the consumer catches up; it is also not routine teardown, so silently dropping it would hide a real performance problem. The message reports the byte count and points at the two likely causes (a slow subscriber or an undersized `SO_RCVBUF`). The 1s throttle is tighter than `EMSGSIZE` because a backed-up consumer can fail on every publish.
+
+**`ENOENT` / `ECONNREFUSED` (logged as debug).** `ENOENT` means the destination socket file no longer exists; `ECONNREFUSED` means it exists but is no longer bound. Both happen routinely during graceful shutdown. A publisher caches its subscriber socket paths and only re-reads the registry when the generation counter moves, so its cached list can lag one topology change behind reality: a subscriber may have unbound and unlinked its socket while the publisher still holds the path. This is the cache catching up, not a fault, so it is demoted to debug. Logging it as a warning would alarm users at every node teardown for something that is expected and harmless. These two cases are not throttled because they are already silent at the default log level.
+
+**Any other `errno` (logged as warning, 1s throttle).** The default arm catches anything unclassified and logs it at warning level with the raw `errno`, its string form, and the byte count, throttled at 1s. This is the safety net: an unexpected failure is surfaced rather than swallowed, but still rate-limited so a novel persistent failure cannot flood the log.
+
+In all failure cases `send_to` returns `false` and the publisher moves on to the next subscriber. Delivery is best-effort and fire-and-forget, so a failed send to one subscriber never blocks delivery to the rest.
+
+## Discovery: the shared-memory registry
+
+The registry is a single POSIX shared-memory object per ROS domain. It is created with `shm_open(O_CREAT | O_RDWR)` and mapped into each process with `mmap(..., PROT_READ | PROT_WRITE, MAP_SHARED, ...)`. `MAP_SHARED` is the part that matters: every process maps the same physical pages, so a write by one process is immediately visible to all the others with no copying and no message passing. A registry lookup is a plain memory read, and registration is a plain memory write. This is what keeps discovery cheap and bring-up stable: there is no protocol to converge, no traffic to settle, and no separate process whose startup, crash, or restart has to be managed.
+
+On Linux a POSIX shared-memory object is backed by a file under `/dev/shm`, so the registry can be inspected directly. The object name carries the ROS domain id. `registry_open()` formats the name as `/ros2_uds_<domain_id>`, which appears on disk as `/dev/shm/ros2_uds_0` for domain 0, `/dev/shm/ros2_uds_1` for domain 1, and so on. This per-domain naming is how ROS domain isolation is enforced: processes on different domains map different files and therefore can never see each other's endpoints. There is no filtering step; isolation falls out of the file name.
+
+The shm object is **not** unlinked on a clean context shutdown. `rmw_context_fini` only unmaps the region (via `registry_close`); it does not `shm_unlink`. So `/dev/shm/ros2_uds_<domain>` persists for the lifetime of the host and is reused by the next process that comes up on that domain. It is removed only by an incompatible-version reclaim (described below) or manually (`rm /dev/shm/ros2_uds_<id>`). The practical implications: a container gets a fresh `/dev/shm` and therefore a fresh registry, and `/dev/shm` must have room for the fixed region (about 38 MB, page-resident only as slots are touched, see Registry layout). A default `/dev/shm` tmpfs is typically sized at half of RAM, so this is rarely a constraint, but it is charged against that budget.
+
+Because multiple processes may start at the same instant, the creation and initialization handshake is what makes concurrent startup safe; it is described in full under Creation and the init handshake below.
+
+The header itself is small: the layout `version`, the `max_entries` count, a 64-bit `generation` counter that is bumped on every add, remove, and reclaim, a single robust `pthread_mutex_t`, the `high_water_slot` bound on used slots, and the 4 KiB `doorbell_bits` bitmap (one bit per slot). That mutex exists only for the one-time creation handshake. None of the hot paths (add, remove, query, cleanup) ever take it; they are lock-free and rely on per-slot atomics instead, which is why concurrent discovery activity from many processes does not serialize on a shared lock.
+
+### Registry layout
+
+The registry is one POSIX shared-memory object per ROS domain, mapped `MAP_SHARED` into every process. Its contents are a fixed-size header immediately followed by a flat array of fixed-size slots. There is no dynamic growth, no `mremap`, no free list, and no hash table. The whole region is sized once at creation and never changes shape.
+
+```
+  Host (one ROS domain)
+  ──────────────────────────────────────────────────────────────────
+
+  /dev/shm/ros2_uds_0          (POSIX shm, mmap'd MAP_SHARED into every process)
+  ┌──────────────────────────────────────────────────────────────┐
+  │ RegistryHeader                                                 │
+  │   version    = 5          (layout tag + init handshake)        │
+  │   max_entries = 32768                                          │
+  │   generation  = N         (bumped on every add/remove/reclaim) │
+  │   init_mutex              (one-time creation handshake only)   │
+  │   high_water_slot         (bound on used slot indices)         │
+  │   doorbell_bits[512]      (4 KiB, 1 bit per slot = doorbell)   │
+  ├──────────────────────────────────────────────────────────────┤
+  │ slot[0]      RegistryEntrySlot  (1168 bytes)                   │
+  │ slot[1]      RegistryEntrySlot                                 │
+  │ slot[2]      RegistryEntrySlot                                 │
+  │   ...                                                          │
+  │ slot[32767]  RegistryEntrySlot                                 │
+  └──────────────────────────────────────────────────────────────┘
+                         │
+                         │  one slot =
+                         ▼
+  ┌──────────────────────────────────────────────────────────────┐
+  │ RegistryEntrySlot                                              │
+  │   seq        (seqlock: even = stable, odd = mid-write)         │
+  │   state      EMPTY | NODE | PUBLISHER | SUBSCRIPTION |         │
+  │              SERVICE | CLIENT | DOORBELL                       │
+  │              (RESERVED = claimed, uncommitted)                 │
+  │   pid        owning process (liveness check)                   │
+  │   gid[16]    RMW GID                                           │
+  │   node_name[256]                                               │
+  │   node_namespace[256]                                          │
+  │   topic_name[256]   (service name for services/clients)        │
+  │   type_name[256]    e.g. "pkg/msg/Name"                        │
+  │   socket_path[108]  <-- the Unix socket address to connect to  │
+  │   qos: reliability, durability, history, depth                 │
+  └──────────────────────────────────────────────────────────────┘
+```
+
+The header is `RegistryHeader`. It holds an atomic `version` tag (currently `5`), the slot count `max_entries`, an atomic `generation` counter bumped on every add, remove, and reclaim, a single `init_mutex`, the `high_water_slot` bound on used slot indices, and `doorbell_bits`, a 4 KiB bitmap with one bit per slot that marks the slots holding a doorbell (see The doorbell under Wait set). The first three are integers at fixed offsets (0, 4, 8) guarded by `static_assert`. The `init_mutex` follows at offset 16. Its total size is deliberately not pinned by a `static_assert`, because `sizeof(pthread_mutex_t)` varies by C library and CPU architecture (56 bytes on glibc/x86_64). That mutex is taken only once, during the one-time creation handshake when the shm object is first initialized. None of the hot paths (add, remove, query, cleanup) ever touch it.
+
+After the header comes the slot array. There are `REGISTRY_MAX_ENTRIES = 32768` slots, each a `RegistryEntrySlot` of exactly `1168` bytes (pinned by `static_assert`, so a layout change forces a `REGISTRY_VERSION` bump). That is roughly 38 MB of slot array. The array starts at `sizeof(RegistryHeader)` bytes past the base pointer, so a slot index maps directly to an address with no indirection. A slot carries the entity type, owning PID, GID, node name and namespace, topic or service name, type string, the Unix socket path used to reach the endpoint, and the QoS fields. Each slot also begins with a per-slot seqlock (`seq`) and an atomic `state`, which is what lets the array be scanned without a lock.
+
+The layout is fixed and flat for two reasons.
+
+First, lock-free scanning. Because every slot is the same size and sits at a computable offset, a reader walks the array by simple pointer arithmetic and reads each slot's atomic `state` directly. An empty slot costs a single atomic read before the scan moves on. A live slot is read through its seqlock as a consistent snapshot, with bounded retries if a writer was mid-update, and is otherwise skipped. Readers never block and never take a global lock. A dynamic structure (a hash table, or anything with a free list) would need its own synchronization to stay consistent under concurrent inserts and removals across processes, which is exactly the cost this design avoids.
+
+Second, a shared mapping must contain no pointers. The region is mapped at a different virtual address in each process, so any internal pointer would be meaningless in another process. A flat array sidesteps this entirely: positions are referenced by integer index, which is valid in every mapping. The same property is why dynamic growth is rejected. Growing the region would mean `mremap` and re-pointering in every process at once, an operation with no safe cross-process coordination here. Sizing the region once at creation removes that problem, at the cost of a fixed upper bound on entity count.
+
+### What a slot holds
+
+Every entity in the system claims exactly one slot in the shared-memory registry. That includes each node, but also each publisher, subscription, service server, and service client individually. A node with ten publishers and ten subscriptions occupies twenty-one slots (one for the node plus one for each of the twenty endpoints), not one. This is the slot-accounting rule for the whole registry: the count that fills the fixed array is the number of entities, not the number of nodes.
+
+A slot is the `RegistryEntrySlot` struct mapped into shared memory (`registry.hpp`). It is plain data with no pointers, because pointers would be meaningless across processes that map the region at different addresses. Two fields at the front coordinate concurrent access, and the rest describe the endpoint:
+
+- `seq` (32-bit atomic) — the seqlock counter. Even means the payload is stable; odd means a writer is mid-update. Every read and write of the payload below goes through relaxed atomic copies (`shm_load_relaxed` / `shm_store_relaxed` in `registry.cpp`), with a release fence after the writer's first bump and an acquire fence before the reader's re-check: a plain `memcpy` racing a writer would be a data race, undefined behaviour in C++ even though the counter discards the torn copy.
+- `state` (8-bit atomic) — the entity kind and lifecycle marker: `ENTRY_EMPTY`, `ENTRY_NODE`, `ENTRY_PUBLISHER`, `ENTRY_SUBSCRIPTION`, `ENTRY_SERVICE`, `ENTRY_CLIENT`, `ENTRY_DOORBELL` (one per context, holding the socket path of that process's wakeup doorbell — see The doorbell under Wait set; type-filtered queries never match it, so it is invisible to graph introspection), plus the internal `ENTRY_RESERVED` value that marks a slot as claimed but not publishable — set by a writer before its payload is filled in, and by a remover before the payload is erased.
+- `pid` — the owning process ID. This is the liveness handle. Stale-entry cleanup reclaims a slot when `/proc/<pid>` no longer exists.
+- `gid[16]` — the RMW GID, the 16-byte unique identity of this endpoint.
+- `node_name[256]` and `node_namespace[256]` — which node owns this endpoint, used to answer graph queries.
+- `topic_name[256]` — the topic for publishers and subscriptions, or the service name for services and clients.
+- `type_name[256]` — the ROS type string in `pkg/msg/Name` form, used to match endpoints by type.
+- `socket_path[108]` — the filesystem path of this endpoint's bound `AF_UNIX` socket. The 108-byte size matches the kernel's `sockaddr_un.sun_path` limit, so the path can be copied straight into a socket address without a length check.
+- QoS, stored as four small fields: `qos_reliability`, `qos_durability`, `qos_history`, and `qos_depth`. These are kept as compact integers rather than the full `rmw_qos_profile_t` because only these four policies affect behavior on this transport.
+
+The `socket_path` is the field everything else exists to deliver. The wire protocol addresses a datagram to a path, not to a GID or a topic name. So the entire purpose of discovery is to turn a query ("who subscribes to topic `/foo` with a matching type?") into the set of `socket_path` strings a publisher can send to. Every other field in the slot is there to answer that query correctly: `state` and `type_name` and `topic_name` decide whether a slot matches, `pid` decides whether it is still alive, and `socket_path` is the answer that gets returned.
+
+The same data exists in a second form. `RegistryEntry` (also in `registry.hpp`) is the caller-facing copy passed to `registry_add()`. It carries the same payload fields plus a plain `type` field (which the registry copies into the slot's atomic `state`), and omits the `seq`/`state` concurrency machinery the caller has no business touching. This makes `RegistryEntry` 1164 bytes against the slot's 1168. The registry code copies the payload from `RegistryEntry` into the live `RegistryEntrySlot` under the seqlock. Both layouts are pinned with `static_assert`s on their size and field offsets, because the bytes are shared across processes and across separately compiled builds. Any change to the field set is a wire-format change and must bump `REGISTRY_VERSION`.
+
+### Creation and the init handshake
+
+The registry is a single shared-memory object per ROS domain, named `/ros2_uds_<domain_id>`. Any number of processes can start at the same instant and all race to open it. Creation has to produce exactly one initialized header no matter how many processes arrive together, and no process may read a slot before the header is valid. The handshake below guarantees both.
+
+#### First writer wins; everyone else waits
+
+Each process opens the object with `shm_open(name, O_CREAT | O_EXCL | O_RDWR, …)`. The `O_EXCL` flag makes the create atomic: the kernel hands the file to exactly one caller and fails every other caller with `EEXIST`. This is what elects a single creator without any lock being held yet (the lock itself lives inside the not-yet-initialized header, so it cannot be used to coordinate its own creation).
+
+- The winner sees a valid fd, sets `we_created = true`, and grows the empty object to the full layout size with `ftruncate`. It then maps the region and calls `initialize_header`.
+- Every loser gets `EEXIST`, reopens the same object with plain `O_RDWR` (no `O_EXCL`), maps it, and waits for the creator to finish.
+
+The creator initializes the header in a fixed order. It zeroes the whole region, writes `max_entries`, resets `generation`, and constructs the process-shared robust `init_mutex`. The version field is written last:
+
+```
+header->version.store(REGISTRY_VERSION, std::memory_order_release);
+```
+
+#### The version field is the ready signal
+
+The version is published last, with release ordering, so it doubles as a one-time "initialization complete" flag. A late joiner spins on it with acquire ordering:
+
+```
+for (int i = 0; i < 10000; ++i) {
+  if (header->version.load(std::memory_order_acquire) == REGISTRY_VERSION) { initialized = true; break; }
+  sched_yield();
+}
+```
+
+The release/acquire pair is what makes this safe. Because the waiter reads `REGISTRY_VERSION` with acquire ordering, every write the creator performed before the release store (the zeroing, `max_entries`, the mutex construction) is guaranteed visible to the waiter once it observes the version. So seeing the right version is not just a flag check, it certifies that the entire header is constructed. Until then the field reads as 0 (the object is zero-filled by the kernel on creation, and `ftruncate` of a fresh object yields zeroes), so a waiter that arrives in the small window before the creator's last store simply spins. The spin is bounded and yields the CPU between checks, so it costs nothing meaningful in the normal case where init finishes in microseconds.
+
+This is why `version` sits at offset 0 of the header and why bumping `REGISTRY_VERSION` is the required action whenever the layout changes: it is both the layout tag and the synchronization point.
+
+#### Mismatched or stale layouts are reclaimed, not mapped
+
+A leftover object from an incompatible build is dangerous. If its size is smaller than the current layout, mapping it and then touching the slot array would read past the end of the file and the process would take a `SIGBUS`. Two checks guard against this, both of which `shm_unlink` the bad object and `continue` to retry the create-exclusive path. One retry is enough: after the unlink, the next `O_CREAT | O_EXCL` makes a fresh, correctly sized object.
+
+- **Wrong size.** A process that found an existing object (`EEXIST`) calls `fstat` and compares `st_size` against the expected `compute_registry_size()`. A mismatch means the object was created by a build with a different `REGISTRY_MAX_ENTRIES` or a different slot size, so it is unlinked and recreated.
+- **Wrong version tag.** If the spin times out and the version field holds a non-zero value that is neither 0 nor `REGISTRY_VERSION`, the object is the right size by coincidence but carries different semantics. It is treated as stale, unmapped, unlinked, and recreated.
+
+The retry loop runs at most twice (`attempt < 2`) for exactly this reason: a single reclaim-and-recreate resolves any stale object, and a second failure means something is genuinely wrong, so the function returns an error rather than looping forever.
+
+#### If the creator dies mid-init, a waiter takes over
+
+There is a narrow window where the elected creator could crash after `shm_open` but before its final version store. The object would then exist at the right size with `version` stuck at 0, and every waiter would spin forever. The bounded spin handles this. When a waiter exhausts its 10000 iterations and the version is still 0 (not a mismatched non-zero tag, which is the stale-layout case above), it falls through to a best-effort takeover and runs `initialize_header` itself:
+
+```
+// Best-effort init: creator crashed in the ~ms window during init.
+initialize_header(header, total_size);
+```
+
+Re-running `initialize_header` is safe to repeat because it fully reconstructs the header from scratch, and the only state at risk in that tiny window is header bytes that were never validly published. The takeover converges the system to a single initialized registry even when the original creator never finished.
+
+### Registering an entry
+
+Adding an entry to the registry takes no lock. The point of the design is that a node coming up should never block on, or be blocked by, any other process touching the table. A single atomic compare-and-swap claims a slot, and a per-slot seqlock guards the payload while it is written. Readers never wait on a writer, and writers never wait on each other beyond the one CAS that decides who owns a slot.
+
+The sequence is a scan, a claim, a fill, and a publish.
+
+**Scan for an empty slot.** `try_add_once` walks the slot array from index 0. Each slot's `state` byte is the gate. A slot with `state == ENTRY_EMPTY` is a candidate. Because the table is a fixed flat array with no free list, the scan is just a linear loop over `max_entries`.
+
+**Claim it with one CAS.** When the scan finds a candidate, it attempts to flip the slot's `state` from `ENTRY_EMPTY` to `ENTRY_RESERVED` with a single `compare_exchange_strong`. Exactly one writer can win this CAS on a given slot; any concurrent writer that also saw the slot as empty loses the exchange and moves on to the next slot. The winner now owns the slot.
+
+`ENTRY_RESERVED` is the reason a half-written entry is never observed. It is a transient marker that lives only in the atomic `state` field. Readers (`snapshot_slot`) treat `ENTRY_RESERVED` exactly like `ENTRY_EMPTY` and skip the slot. So between the moment a writer claims the slot and the moment it publishes the real entity type, no reader will copy out the slot's payload, even though the payload is being filled in concurrently.
+
+**Fill the payload under a seqlock.** Once the writer owns the slot, `write_slot_payload` writes the entry fields (pid, gid, names, socket path, QoS) using a seqlock. A seqlock is the right tool here because the payload is larger than any single atomic and readers must be able to detect a torn read (seeing half of one write and half of the next) without taking a lock:
+
+1. `seq.fetch_add(1)` bumps the counter from even to **odd**, marking a write in progress.
+2. The payload fields are copied into the slot.
+3. `seq.fetch_add(1)` bumps the counter from odd back to **even**, marking the snapshot stable.
+
+A reader records `seq` before and after copying the payload. If it read an odd value, or the two reads differ, it knows a writer touched the slot mid-read and retries (bounded) or skips. This is the seqlock protocol the whole registry relies on; the reader side and its retry bound are described under Looking up entries.
+
+**Publish the real state.** With the payload committed (seq even), the writer stores the actual entity type into `state` with release ordering:
+
+```cpp
+slots[i].state.store(static_cast<uint8_t>(entry.type), std::memory_order_release);
+```
+
+The release store pairs with the acquire load every reader does on `state`. Any reader that now observes a real type (`ENTRY_NODE`, `ENTRY_PUBLISHER`, and so on) is guaranteed to also see the fully-written payload that was published before it. This store is the single point at which the slot becomes visible to discovery. Until it happens, the slot reads as `ENTRY_RESERVED` and is invisible.
+
+**Bump the generation counter, then ring the doorbells.** Finally the writer does `header->generation.fetch_add(1)`. The generation counter is the table's change signal. Publishers, services, and clients cache their lookup results and re-scan only when the generation moves, so bumping it here tells every cached reader that the graph changed and its cache is stale. Immediately after the bump, the writer sends one octet to every registered doorbell (`ring_doorbells`), which wakes any process blocked in `rmw_wait` so it re-reads the counter. The order is load-bearing: ring strictly after the bump, paired with the wait side draining its doorbell strictly before reading the counter, is what makes a lost wakeup impossible (see The doorbell under Wait set). This is what turns a new registration into a graph event without any daemon: the table is the state, the doorbell is the edge.
+
+**The slot index is remembered, so removal needs no scan.** `registry_add` returns the slot index, and the owning entity stores it. Removal (`registry_remove`) indexes straight to that slot and CASes its `state` to `ENTRY_RESERVED`, erases the payload, then publishes `ENTRY_EMPTY`. There is no second scan to find the entry on the way out, which keeps teardown cheap and makes removal symmetric with the claim-then-publish sequence used on the way in.
+
+**Failure path.** If the scan finds no empty slot, `registry_add` runs the stale-cleanup pass once (reclaiming slots whose owning PID is dead) and retries the scan a single time. If the table is still full after that, the add fails and returns -1. There is no resize and no spinning.
+
+### Looking up entries
+
+A lookup is a linear scan over the whole slot array. It returns every slot whose contents match the filters the caller passes: entity type, topic name, node name, and node namespace. Any filter left null matches everything. The scan is the only way to find endpoints because the registry has no index; it is a flat array with a header, chosen for its simplicity over a hash table or free list.
+
+Most slots in a large table are empty, so the scan keeps the empty case as cheap as possible. Before doing anything else it reads the slot's `state` with a single atomic acquire load. If that value is `ENTRY_EMPTY`, the slot holds nothing and the scan moves on immediately. This fast pre-check means an empty slot costs exactly one atomic read.
+
+A non-empty slot is read through a seqlock snapshot, using the protocol described under Registering an entry: the reader loads `seq`, skips the slot if it is odd (a write is in progress), otherwise records the even value, copies the non-atomic payload fields (PID, GID, names, socket path, QoS), then loads `seq` a second time. If the two reads match, no write happened in between and the snapshot is consistent. If they differ, the copy was torn by a concurrent writer and the reader discards it.
+
+A torn read is retried, but only a bounded number of times (`MAX_READ_RETRIES`, 16). A writer that keeps the slot perpetually odd would otherwise spin a reader forever; bounding the retries means a slot that cannot be read cleanly right now is simply skipped for this query rather than blocking the whole scan. Skipping is safe because the registry is queried often and a missed entry will be seen on the next lookup once the writer is done. A slot in the `ENTRY_RESERVED` state is treated like an empty one and skipped for the same reason: it is claimed but not yet published.
+
+Once a snapshot succeeds, the scan applies the filters against the snapshot copy, not the live slot, so the comparison sees a stable view. The type filter, then the topic, node name, and namespace string comparisons run in turn, and any mismatch skips the slot. Surviving slots are converted into a result holding the node name, namespace, topic, type, socket path, GID, and QoS, and appended to the returned vector. The socket path is the part callers actually want: it is the address a publisher sends to.
+
+Readers never take a lock. The seqlock is a one-sided protocol where only writers mutate the counter and readers merely observe it, so any number of processes can scan the registry concurrently without contending on a mutex and without blocking each other or a writer. This is what makes discovery cheap enough to run on every topology change, while the generation counter (covered next) keeps it off the per-message send path.
+
+### The generation counter and the subscriber cache
+
+A registry lookup is a linear scan of the slot array. Running that scan on every publish would be far too costly for the data path: the loop bound is the fixed table size, and on a busy topic a publisher may call `rmw_publish` thousands of times per second. The scan would also have to coordinate with concurrent writers, which is exactly the work the hot path should avoid.
+
+The registry header carries one `generation` counter, an atomic that is incremented on every successful add, remove, and stale-slot reclaim. It is the single source of truth for "did the graph change." Each publisher uses it to decide whether its view of the subscribers is still valid.
+
+A publisher keeps two pieces of cached state alongside its own data: the list of subscriber socket paths it found the last time it scanned, and the `generation` value that was current at that scan. On publish it does the following:
+
+1. Read the current generation with one atomic load (`registry_generation()`, an acquire load of the header field).
+2. Compare it to the cached generation. If they match, the graph has not changed since the last scan, so the cached paths are still correct. The publisher copies the cached list and sends to each path without ever calling `registry_query` or touching the registry.
+3. If they differ, something joined or left. The publisher re-scans the registry for matching subscriptions, rebuilds its path list, and stores the new generation. The next publish will hit the fast path again.
+
+The result is that the expensive scan happens once per topology change, not once per message. In steady state, where the graph is not changing, the per-publish discovery cost is a single atomic read followed by a local copy of an already-built vector.
+
+The cache is protected by a small per-publisher mutex (`sub_cache_mutex`), not the registry lock. This mutex is private to one publisher and is held only long enough to check the generation, optionally refresh, and copy the path list out. The actual `sendmsg` calls happen after the mutex is released, so a slow send never blocks the cache and the cache never blocks the registry.
+
+One consequence is that the cache can be a single topology change behind reality for a brief window: a subscriber may have torn down its socket while the publisher still holds the old generation and the stale path. The send to the gone path then fails (`ENOENT`/`ECONNREFUSED`), which is expected during shutdown and demoted to debug; see Send failure handling. The next publish after the generation bump rebuilds the list and the stale path disappears.
+
+Services and clients cache the same way against the same generation counter; the request and reply routing that uses those caches is covered under Services.
+
+### Cleaning up dead and crashed entries
+
+Two failure modes leave entries behind: a clean shutdown, and a process that dies without running its destructors. They are handled separately because only one of them can be trusted to tell the truth about itself.
+
+**Clean shutdown.** When an endpoint is destroyed normally, it removes its own slot. Because each entity records the slot index it was assigned at registration, removal needs no scan: it indexes straight to its slot. `registry_remove` reads the slot's current `state`, returns immediately if it is already `ENTRY_EMPTY` or `ENTRY_RESERVED` (someone else owns it), then attempts a single compare-and-swap from that state value to `ENTRY_RESERVED`. The CAS is what makes the removal safe under concurrency: exactly one caller can win it, and the winner owns the teardown. If the CAS fails, someone else already claimed the slot, so the function returns without touching anything.
+
+The teardown itself runs under the slot's seqlock (the same odd/even protocol used on the write side). `teardown_slot` bumps `seq` to odd, copies out the socket path, zeroes every payload field, then bumps `seq` back to even. Any reader that was mid-snapshot sees the odd `seq` and retries, so it can never read a half-erased slot. Only once the payload is gone does `state` become `ENTRY_EMPTY`, and then `generation` is incremented so every cached reader learns the graph changed. The socket file is unlinked last, outside both the seqlock and the claim, because a filesystem operation does not need to be observable atomically by other processes.
+
+The order matters, and getting it wrong is a real defect rather than a theoretical one. Publishing `ENTRY_EMPTY` *before* the payload is erased advertises the slot as free while the remover is still writing to it: a concurrent `registry_add` claims the slot, fills in its own entry, and the remover's `memset` then lands on the new owner's payload. The result passes every seqlock check — the sequence counter is even and the snapshot is self-consistent — yet holds a real entity type with an empty `node_name` and `pid == 0`. That is a node the graph reports with no name (`rmw_get_node_names` has no empty-name filter, so rcl rejects the whole query), or a subscription whose zeroed `socket_path` silently excludes it from every publisher's destination list. Worse, `registry_cleanup_stale` refuses to reclaim any slot with `pid == 0`, so if the owning process later dies ungracefully the slot leaks for the life of the shared-memory segment. Parking the slot in `ENTRY_RESERVED` for the duration of the erase is what keeps the payload single-writer, which is the assumption the seqlock is built on. The window between claiming and publishing `ENTRY_EMPTY` is deliberately kept to the payload `memset` alone — the socket unlink and the stale-reclaim log line both sit outside it — because a process killed inside that window strands the slot in `ENTRY_RESERVED`, which nothing reclaims.
+
+**Crash.** A process killed by SIGKILL, OOM, or a container teardown never reaches `registry_remove`. Its slot keeps a stale socket path that no longer accepts connections. There is no destructor to trust, so the registry infers death from the operating system instead. `registry_cleanup_stale` walks the table, and for each live slot it takes a seqlock snapshot and checks the owning PID by stat-ing `/proc/<pid>`. The decision is deliberately conservative:
+
+- `/proc/<pid>` is gone (`stat` returns `ENOENT`): the owner has exited, so the slot is reclaimable.
+- `/proc/<pid>` exists: the owner is alive, so the slot is kept.
+- Any other `stat` error (ambiguous): the slot is kept, treated as alive.
+
+The bias toward keeping is intentional. The cost of wrongly keeping a dead slot is one wasted slot until the next pass; the cost of wrongly reclaiming a live slot is tearing down a working endpoint. A `pid` of 0 is also never reclaimed, since that value only appears in the transient snapshot of a slot whose payload has not been written yet, never in a committed entry.
+
+The dangerous window is between vetting a slot and tearing it down. The owner could exit, the slot could be reclaimed by a clean remove, and a different process could re-add an entry of the same type into the same slot, all before this pass acts. This is the classic ABA problem: the slot looks identical but is a different entry, and the `state` value alone cannot tell them apart. The seqlock counter closes the gap. The snapshot captures the slot's `seq` (`snap_seq`), and immediately before the reclaim CAS the pass re-reads `seq` and compares. Any intervening write (a remove or a re-add both go through the seqlock) advances the counter, so a mismatch means the slot is no longer the entry that was checked, and the pass skips it. Only when `seq` is unchanged does it CAS the observed `state` to `ENTRY_RESERVED`, run the same `teardown_slot`, publish `ENTRY_EMPTY`, and bump `generation`. The one-line breadcrumb naming the slot, PID, node, and topic — which is what makes an ungraceful exit visible in the ROS log — is written afterwards, from the local snapshot: formatting and emitting a log line is far slower than the erase, and the slot must not sit unclaimable for that long.
+
+**When it runs.** There are two triggers.
+
+The first is eager and runs once at every context startup. Before a new process opens its sockets, `rmw_init` runs `registry_cleanup_stale()` and then `cleanup_orphan_socket_files()` on the domain. The two are paired because an ungraceful exit leaves two distinct kinds of garbage: a dead registry slot, and a dangling socket file under `/tmp/ros2_uds/<domain>/`. The registry sweep reclaims slots whose PID is gone; the file sweep parses the PID out of each socket file name and unlinks files whose owner is no longer alive. Running both at every startup means a process joining the domain cleans up after crashed predecessors, which is what keeps an uncleaned shutdown from permanently leaking either resource even if the table never fills.
+
+The second is lazy and runs only when `registry_add` scans the whole table and finds no empty slot: it calls `registry_cleanup_stale` once and retries the add a single time. If the table is still full after reclaiming, the add fails. This second path is what bounds the worst case where the table actually fills during a long-running session, paying the linear sweep only at the moment a slot is genuinely needed.
+
+### Scaling characteristics
+
+Every registry walk iterates over the fixed table size, `REGISTRY_MAX_ENTRIES` (32768 slots), not over the number of entries currently in use. A discovery scan (`registry_query`), a worst-case add (`try_add_once`), and the stale-cleanup pass (`registry_cleanup_stale`) all loop from slot 0 to `max_entries` regardless of whether the system holds 5 endpoints or 5000. The loop bound is a compile-time constant, so these operations are O(table size), not O(live count). The per-empty-slot work is kept to a single atomic load, so a sparsely-populated table is still scanned quickly.
+
+On the data path the scan is not paid per message; the generation counter keeps it off the send path (see The generation counter and the subscriber cache). In steady state, sending a message costs one atomic read, and each endpoint pays for a full scan only once per topology change.
+
+The fixed table is the thing to watch as a system grows. Because every entity (not just every node) consumes one slot, a system with well over a hundred nodes and many endpoints each can occupy a meaningful fraction of the 32768 slots, and the cost of the add-time scan and the cleanup pass is tied to that fixed table size rather than to the live count. The design works at the 200-node target, but how close the live entity count comes to filling the table is the scaling parameter to monitor.
+
+## Locking
+
+Almost nothing in this RMW takes a lock. The discovery registry, which every process reads and writes, is coordinated entirely with lock-free atomics: a compare-and-swap (CAS) to claim a slot, and a per-slot seqlock to publish and read its payload. The single `pthread_mutex_t` in the system, `init_mutex` in the registry header, exists only for the one-time creation handshake of the shared region and is never touched on any data or discovery path.
+
+### Why the hot paths are lock-free
+
+The registry lives in shared memory mapped into every process on the host. A cross-process lock taken on a hot path is dangerous in a way an in-process lock is not: if the lock holder is killed (SIGKILL, OOM, container stop) while holding it, every other process that needs the lock blocks forever. With well over a hundred nodes mapping the same region, one unlucky crash would freeze discovery for the entire system. The hot path must never be able to block one process behind another across a process boundary.
+
+So the hot paths avoid locks entirely. They rely on the fact that `std::atomic<uint8_t>`, `<uint32_t>`, and `<uint64_t>` are lock-free and work correctly no matter which address they live at (the C++ standard calls this "address-free"). Address-freedom matters because the same atomic is accessed through different virtual addresses in different processes, and an atomic that depended on its address could not be shared this way. Static asserts at the top of `registry.cpp` make both properties a compile-time requirement, so the build fails loudly on any platform where they do not hold.
+
+Three mechanisms replace the lock:
+
+- **Claiming a slot is a single CAS.** To add an entry, a writer scans for an empty slot and flips its `state` from `ENTRY_EMPTY` to `ENTRY_RESERVED` with one atomic compare-and-swap. Exactly one writer wins. `ENTRY_RESERVED` is a private "claimed, not publishable" marker (see Registering an entry for the full read/write protocol). Removal is the mirror image: a CAS of `state` to `ENTRY_RESERVED` decides who owns the teardown, and `ENTRY_EMPTY` is published only once the payload has been erased.
+
+- **Publishing and reading a slot is a seqlock.** A writer brackets the payload copy with an odd/even `seq` counter; a reader snapshots `seq` before and after the copy and retries on mismatch. The full protocol is described in Registering an entry. The point for locking is that readers never block a writer and writers never block a reader, and the bounded retry (`MAX_READ_RETRIES`) guarantees a persistent writer cannot spin a reader forever.
+
+- **The send path reads one atomic.** Publishers, clients, and services cache the socket paths they discovered along with the `generation` they saw, and on each send compare a single atomic load of `generation` against that cached value (see The generation counter and the subscriber cache). The expensive linear scan happens only when the graph actually changes.
+
+The cost of being lock-free is that readers can observe a torn or stale view and must cope with it rather than exclude it: snapshots are validated by the seqlock re-read, the stale-slot reclaim re-checks the captured `seq` before tearing a slot down (an ABA guard against a remove-and-re-add in the window), and a cached socket path may briefly outlive the subscriber it points to. That last case produces routine send failures during shutdown, which the transport demotes to debug level (see Send failure handling). These are accepted as the price of never holding a cross-process lock on a path that runs per message.
+
+### Why the one lock is a robust mutex
+
+The single mutex guards the moment the shared region is brought into existence. When several processes start at once, exactly one wins the `O_CREAT | O_EXCL` creation and is responsible for initializing the header, including initializing this very mutex. The mutex is created with two non-default attributes:
+
+- `PTHREAD_PROCESS_SHARED`, because it lives in the mapped region and must be meaningful to every process, not just the one that created it. A default mutex is only valid within the process that initialized it.
+- `PTHREAD_MUTEX_ROBUST`, because the holder is a separate process that can die at any instant. A robust mutex lets the kernel hand the next acquirer an `EOWNERDEAD` return instead of an unrecoverable deadlock. That process can then call `pthread_mutex_consistent()` to take ownership and repair whatever the dead holder left half-done. Without the robust attribute, a process killed while holding the mutex during initialization would wedge every later process that tried to lock it, and the registry could never be opened again until the shm file was manually removed.
+
+The creation handshake itself relies primarily on the lock-free `version` signal rather than the mutex; that handshake, including takeover when the creator dies mid-init, is described in full under Creation and the init handshake. The robust mutex backs it up so that any path which does acquire the mutex can detect and recover from a holder that died mid-init, rather than inherit a corrupt or permanently locked region. It is a recovery guarantee for a rare one-time event, not a serialization point on any path that runs while the system is up.
+
+## Serialization
+
+Messages are serialized with eProsima fastCDR, driven by the per-type callbacks generated by `rosidl_typesupport_fastrtps_cpp` (with `rosidl_typesupport_fastrtps_c` as a fallback). This is the same CDR encoding that the DDS-based RMW implementations use (`rmw_fastrtps_cpp`, `rmw_connextdds`) and that `rmw_zenoh_cpp` reuses. The consequence is that serialization is not the variable under test in any cross-RMW comparison: every implementation puts the identical bytes on the wire through the identical generated code, so a benchmark measures the discovery and transport design, not the encoder.
+
+The choice also avoids a known failure mode. An earlier version of this RMW walked message fields at runtime with `rosidl_typesupport_introspection_cpp`. That approach broke on the C-versus-C++ introspection ABI split (different `MessageMember` layouts, `std::string` versus `rosidl_runtime_c__String`, `std::vector<bool>` as a bitfield) and corrupted memory on nested production message types. The fastCDR callbacks are compiled per message type, so there is no runtime field walking and no introspection-variant ambiguity to get wrong.
+
+### How it is wired
+
+The encoder is a thin wrapper, not a reimplementation. Two helpers in `serialization.cpp` resolve the type support handle to its fastCDR callbacks: `get_callbacks()` for messages and `get_service_callbacks()` for service request/response pairs. Each tries the C++ identifier first, then falls back to the C identifier, calling `get_message_typesupport_handle()` to pull the correct `message_type_support_callbacks_t` out of the dispatch layer. For services it resolves the request and response member callbacks through the same handle lookup rather than trusting `srv_cb->request_members_` directly, because that field can hold a dispatch trampoline (an indirection stub that forwards to the real callbacks in another typesupport variant) rather than the callbacks themselves.
+
+Resolution happens once, at endpoint creation, not per message. `rmw_create_publisher` and `rmw_create_subscription` call `get_callbacks()` and store the result on the publisher's and subscription's internal data (`callbacks` in `types.hpp`). The hot path then just uses the cached pointer.
+
+Serialization itself is two functions over the cached callbacks:
+
+- `serialize()` asks `callbacks->get_serialized_size()` for the body size, reserves four bytes for the CDR encapsulation header plus that body, constructs a fastCDR `Cdr` in `DDS_CDR` mode, writes the encapsulation, then calls `callbacks->cdr_serialize()`. The buffer is finally trimmed to `get_serialized_data_length()`. On publish, `rmw_publish` calls this once per message to produce the CDR payload, which the transport then sends to each subscriber.
+- `deserialize()` is the reverse: it wraps the received bytes in a `FastBuffer`, reads the encapsulation, and calls `callbacks->cdr_deserialize()` into the destination ROS message. `rmw_take` and its variants call this on the subscription side.
+
+Both functions catch every exception. `get_serialized_size()` can throw on string or sequence overflow, the buffer allocation can throw `bad_alloc`, and `cdr_deserialize()` resizes message strings and sequences from wire-supplied lengths, so a malformed or hostile datagram can throw `bad_alloc` or `length_error`. The RMW entry points are `extern "C"`, so nothing may propagate across the C ABI; a thrown exception is converted into a `false` return and surfaced as `RMW_RET_ERROR`.
+
+The public `rmw_serialize()` / `rmw_deserialize()` API (used by rosbag and by serialized-message publish/take) calls the same two helpers, so the byte format is identical whether a message is sent normally or handled as a pre-serialized buffer.
+
+## Wait set and event delivery
+
+The ROS 2 executor finds out that work is ready by calling `rmw_wait()`. It hands in the subscriptions, services, clients, guard conditions, and events it cares about, plus an optional timeout, and the call blocks until at least one of them is ready or the timeout expires. This RMW implements that blocking entirely with one `epoll` instance per wait set, and the wait itself starts no thread: the caller's own thread sleeps in `epoll_pwait2` (or `epoll_wait`, see step 4).
+
+### One epoll instance per wait set
+
+`rmw_create_wait_set()` allocates a `UdsWaitSet` and creates a single epoll file descriptor (fd) with `epoll_create1(EPOLL_CLOEXEC)`. That fd is the only kernel object the wait set owns. Everything the executor waits on is reduced to a file descriptor and watched through this one epoll instance:
+
+- A subscription, service, or client waits on its bound `AF_UNIX` receive socket fd. The socket becomes readable when a datagram arrives.
+- A guard condition waits on an `eventfd`. `eventfd` is the lightest signaling primitive Linux offers: an 8-byte kernel counter that integrates directly with epoll, with no pipe pair and no second fd. `rmw_trigger_guard_condition()` writes `1` to it, which makes the fd readable and wakes any blocked `epoll_wait()`.
+
+`epoll` is chosen over `poll`/`select` because its cost does not grow with the number of watched fds. A system with hundreds of nodes can register thousands of fds in a single wait set, and `epoll_wait()` still returns only the fds that are actually ready. `poll`/`select` would re-scan the entire fd set on every call.
+
+### What one rmw_wait call does
+
+Each `rmw_wait()` runs the same sequence on the calling thread:
+
+1. **Check the graph.** The wait set carries its context (stored at `rmw_create_wait_set`), so this step runs for every wait — including a wait set that holds only guard conditions, which is exactly the shape rclcpp's GraphListener uses. The check first drains the context's doorbell socket, then reads the registry's `generation` counter and compares it against the value cached on the context. If it moved, the graph changed: every node's graph guard condition is triggered (see the next subsection). (`TRANSIENT_LOCAL` replay no longer runs here — it is pull-based, served inside `rmw_create_subscription` of the joining process.) The drain-before-read order is half of the lost-wakeup proof; the other half is on the registry's writer side.
+2. **Arm the fds, once.** Every entity fd, guard-condition eventfd, the context's doorbell fd and the wait set's own `delivery_fd` is added to the epoll instance with `EPOLL_CTL_ADD` the first time this wait set sees it. The wait set remembers what each fd was armed for, so in the steady state this step makes no syscall; a fd number reused by a new entity carries a different uid and is re-armed, and `EEXIST` counts as armed. A fd that fires although this call did not arm it — its entity left the wait set or was destroyed — is withdrawn with `EPOLL_CTL_DEL` in step 4 and never dereferenced. An entity epoll cannot watch (watch exhaustion) is drained directly on every call instead, and the block in step 4 is then capped at 200 ms, so the entity degrades to polling rather than going unseen.
+3. **Read `delivery_fd`, then check ready.** The wait set drains its `delivery_fd` strictly before it scans its queues — the ordering pair with the listener thread (see The listener thread). It then checks each caller queue under its `queue_mutex` and asks each event whether it holds untaken status changes. The queue check is needed because data an earlier drain left queued is invisible to epoll: its socket is already empty. Guard conditions are not checked here: epoll watches their eventfds level-triggered, so a pending trigger is reported by step 4 like any other ready fd. Only a guard condition that epoll could not watch is read directly, here and in step 5.
+4. **Block only if nothing is ready, then drain only what fired.** If step 3 found work, the call makes one non-blocking epoll pass instead of blocking, so data still sitting in a socket is reported in this call rather than the next. Otherwise it blocks in `epoll_pwait2()`, which takes the caller's timeout with nanosecond resolution so a sub-millisecond wait (the remainder of a 1 kHz timer period) is neither stretched nor cut to a whole millisecond. Where `epoll_pwait2()` is unavailable (glibc < 2.35, kernel < 5.11, or a seccomp profile that blocks it) it falls back to `epoll_wait()` with the timeout rounded up to the next millisecond. The thread is asleep in the kernel here, not spinning; there is no internal poll interval. One epoll call returns at most 64 fds; a full batch is followed by a non-blocking sweep pass, in every mode and before the deadline is checked, until a batch comes back short — so a batch of stale fds cannot hide a ready one behind an expired deadline, and a wait reports every fd that was ready, not just the first 64. Each fd that fired is handled by kind: an entity socket is drained with `drain_endpoint`, so the wait costs O(ready) rather than O(entities in the wait set); a guard condition's trigger is consumed (one that lands after epoll returned stays readable and is reported by the next wait); a doorbell ring re-runs the graph check of step 1; and a `delivery_fd` wake re-runs the caller's queue scan and asks its events again, because the listener signals it for any endpoint in the context, and whoever observes a graph change signals it while the context has matched events (see QoS status events). Only progress ends the wait — a caller queue that now holds data, a guard condition that fired, or an event with new status changes. A wake without progress — a doorbell ring, a `delivery_fd` wake for another wait set's endpoint, or a datagram `drain_endpoint` filters out (an ignored local publication, a descriptor whose sender is gone) — goes back to sleep for the caller's remaining time. The wait is retried on `EINTR` against the same deadline so a signal neither returns a false timeout nor busy-loops.
+5. **Report.** The output arrays are pruned: entities with no pending data are set to `NULL`, and the ones that are ready are left in place for the executor to service. `RMW_RET_TIMEOUT` is returned only once the caller's own deadline has passed. A wait that ends early with nothing ready — the 200 ms bounded wake of a degraded mode (an entity epoll cannot watch, or a graph wait whose doorbell could not be registered), or another thread having taken the data first — returns `RMW_RET_OK` with every entry `NULL`: a spurious wake, not a timeout. An infinite wait therefore never reports `RMW_RET_TIMEOUT`.
+
+### Which guard condition the graph change wakes
+
+Each node creates its own graph guard condition in `rmw_create_node()` and stores it on the node (`UdsNode::graph_guard_condition`). `rmw_node_get_graph_guard_condition()` hands rcl that per-node object, so the per-node guard condition is what the executor's wait set actually watches for graph changes.
+
+To reach it, the context keeps a mutex-guarded list of every node's graph guard condition. `rmw_create_node()` appends to the list as its last step (so no failure path has to undo it); `rmw_destroy_node()` removes the entry under the same mutex before destroying the guard condition, so the trigger loop can never fire a freed object. When step 1 of the wait observes a generation change, it triggers every guard condition in that list. A GraphListener blocked on a graph guard condition alone is woken by the doorbell (its fd is in the wait set's epoll), re-runs the check, triggers its own guard condition, and reports it ready — which is how `wait_for_service` and graph-change callbacks make progress with no data traffic at all.
+
+### The doorbell: cross-process wakeup without a daemon
+
+A single atomic load can tell a *running* wait that the graph changed, but it cannot wake a *blocked* one: an mmap store is invisible to `epoll`. Something a mutation can touch must be a file descriptor in the sleeping process. The doorbell is that object, chosen over the alternatives (signals, cross-process eventfd passing, inotify, io_uring futex — each fails on hygiene, permissions, coverage, or container seccomp) because it reuses the one primitive this transport is already made of: an `AF_UNIX` datagram socket.
+
+Each context binds one doorbell socket at `rmw_init` (a `ctl_*` file beside the data sockets), but registers it in the registry as `ENTRY_DOORBELL` **lazily and interest-scoped**: on the first `rmw_wait` whose wait set contains one of the context's graph guard conditions or a matched event, or on the first matched event callback — i.e. only in processes that actually consume graph events (`wait_for_service`, rclcpp's GraphListener, rosbag2 discovery, a `matched` handler). With TRANSIENT_LOCAL replay pull-based, those are the only processes a registry mutation needs to wake, so a fleet launch rings approximately as many doorbells as there are graph-event consumers, not mutations x processes — the broadcast storm that motivated this scoping. The lazy registration runs strictly before that wait's generation check (the same register-before-snapshot ordering the eager `rmw_init` recipe used), on an already-bound socket, and a failed registration (registry full) is retried on the next wait rather than latched. Every registry mutation (add, remove, stale-slot reclaim — except mutations of doorbell slots themselves, which have no wake consumers), after bumping the generation counter, sends one octet to every registered doorbell, non-blocking and best-effort. It finds them through the header's `doorbell_bits` bitmap, not by walking the slots: a doorbell's bit is set before its add bumps the generation and cleared while its remover (or the stale-slot reaper) still holds the slot `ENTRY_RESERVED`, so a mutator that has bumped the generation sees every doorbell registered before its bump. Ringing therefore reads `high_water_slot / 64` contiguous words plus one seqlock snapshot per doorbell, instead of one strided `state` read (a cache miss, 1168 bytes apart) per used slot, which on a 7400-slot launch cost more per mutation than the datagrams themselves (#53).
+
+The correctness argument is one ordering pair. The writer rings strictly **after** the generation bump; the waiter drains its doorbell strictly **before** reading the generation. Any mutation therefore either lands in the generation value the waiter is about to read, or leaves a datagram queued on a level-triggered fd that makes the next `epoll_wait` return immediately. The datagram queues whether or not the target is currently blocked, so there is no check-then-block race to lose. The proof rests entirely on those two orderings; both call sites carry a comment saying so, and a regression test pins the behavior.
+
+Best-effort has sharp edges, each handled explicitly:
+
+- **A full receiver queue is success.** `EAGAIN` because the destination's queue is full means wakeups are already pending there; dropping the octet loses nothing.
+- **A slow peer must not mute the others.** `AF_UNIX` datagrams stay charged to the *sender's* buffer until the receiver consumes them, so one process that never drains (hung, or not yet waiting) could exhaust the ring socket's budget and make sends fail for every peer. On `EAGAIN` the ring socket is closed, recreated, and the send retried once: on a fresh socket, `EAGAIN` can only mean the benign case above. No automated test drives this recreate path yet.
+- **A recycled slot must not receive the octet.** A set bit is only a hint. The ring loop re-validates the slot type inside its seqlock window, so a slot that was a doorbell when its bit was read but has been reused by a data endpoint cannot be sent to.
+- **The ring socket is per mutating thread** (thread-local, closed at thread exit), so ringing takes no lock and leaks nothing.
+
+Cleanup needs no new machinery: the doorbell is a PID-owned slot holding a socket path, so graceful shutdown removes it like any endpoint, and the existing stale-PID reaper reclaims it after a crash — slot teardown already unlinks the socket file.
+
+Two limits are accepted. A build that predates the doorbell bumps the generation but never rings, so a fleet running mixed old and new builds can miss wakeups during the upgrade window — upgrade the fleet together, as with any wire-format change. And a process whose threads are never inside `rmw_wait` at all (an executor wedged in a user callback, or a bare-rmw publisher that never waits) cannot observe anything, doorbell or not; that gap predates the doorbell and is unchanged.
+
+### In-process concurrency
+
+Socket I/O happens on the caller's thread — inside `rmw_wait()` or an `rmw_take*` — and, for an endpoint with a listener callback registered, also on the context's listener thread. The per-entity data structures are guarded so a `MultiThreadedExecutor` can call into the RMW from several threads at once. Each subscription, service, and client guards its own message queue with a per-entity `queue_mutex` and serialises drains of itself with a per-entity `drain_mutex` (held only for the receive loop, never across a callback), each publisher guards its subscriber cache (`sub_cache_mutex`) and its TRANSIENT_LOCAL cache (`cache_mutex`), services and clients guard their caches (`svc_cache_mutex`, `client_cache_mutex`), and each endpoint guards its user-callback pointer with a `callback_mutex`. The context-wide lock on the delivery path is `listener_mutex`, which the listener holds across a drain and which the watch/unwatch paths take. Above it sits `listener_registration_mutex`, also per context, which a callback setter holds for its whole call — slot update, backlog flush, watch or unwatch, and the rollback of a failed watch — so a concurrent set and clear on one endpoint cannot leave a callback installed on a socket nobody watches; it is taken before `callback_mutex` and `listener_mutex` and never by the listener thread, and it is recursive because the backlog flush runs a user callback under it, so a setter re-entered from that callback does not deadlock its own thread — it can still deadlock against a listener drain, which is why the callback rules under The listener thread forbid it. (`UdsContext` also carries `graph_gcs_mutex`, taken by `rmw_wait` and by node creation and destruction, `doorbell_reg_mutex`, taken whenever the doorbell is registered - by `rmw_wait`, by a matched callback registration, or by the listener retrying one - and `delivery_fds_mutex`, taken by wait-set creation and destruction and by whoever signals the wait sets' delivery fds; all three are leaf locks, held briefly and never across a drain or a callback.)
+
+The locking is otherwise per-entity, so concurrent `rmw_take()` and `rmw_publish()` on different entities do not contend; the supported granularity is one thread per entity, not one global lock. Two callers draining the *same* endpoint do now serialise on its `drain_mutex` — that is what keeps a publisher's samples in order when the listener and an executor thread drain the same socket.
+
+The one shared resource on the send side is the single per-process send socket (one unbound `AF_UNIX` datagram socket shared by every publisher and client in the process). Concurrent `sendmsg()` calls on it are relied upon to be atomic at the datagram level, which the kernel guarantees for `SOCK_DGRAM`: each datagram is written whole, so interleaved senders never produce a torn datagram.
+
+### No background threads, and why
+
+There are no timer threads and no dispatch threads, and no receiver thread at all for an executor that waits: socket I/O happens inside `rmw_wait()`, on the executor thread that called it. This is a deliberate choice.
+
+The exception is narrow and opt-in by behavior. An endpoint that registers a listener callback is handed to a single per-context listener thread, because an executor that asks to be called back never calls `rmw_wait` and so would leave its own sockets undrained forever. Nothing starts that thread but a callback registration, so a process whose executor waits still runs no background thread of this middleware — see The listener thread.
+
+Background receiver threads would each need a lock-protected handoff queue between themselves and the executor, which adds contention on the hot path and a set of threads to create, shut down, and reason about under crashes. The ROS 2 executor model already calls `rmw_wait()` in a tight loop and then services whatever it reports, so draining the sockets at exactly that point is both natural and sufficient. The kernel does the actual waiting in `epoll_wait()`, so a "no threads" design does not mean polling in user space; it means the only thread involved is the one the executor already runs, and it sleeps in the kernel until there is work.
+
+For an endpoint with no listener callback, the consequence to understand is that **delivery only happens while a thread is inside `rmw_wait()`.** A datagram sitting in a socket buffer is not moved into a subscription's queue until the next wait call drains it. In normal operation the executor is almost always in or returning to `rmw_wait()`, so this is invisible. But it means there is no asynchronous delivery: if an application thread blocks the executor and never returns to the wait loop, incoming messages accumulate in kernel socket buffers and are not processed until the executor comes back. The socket buffer is the only backlog that builds up in the meantime, bounded by the kernel's receive buffer size for that socket.
+
+### The listener thread: delivery without a wait
+
+Everything above assumes the executor calls `rmw_wait()`. One does not. `rclcpp`'s `EventsExecutor` — the default in `performance_test` and `ros2-benchmark-container` — registers a callback per endpoint and then blocks on its own event queue; it calls `rmw_take` only once a callback has told it there is something to take. Against a middleware that delivers exclusively inside `rmw_wait()`, that is a deadlock by construction: the callback never fires because nothing drains the socket, and nothing drains the socket because `rmw_take` is never called. Registering the callback is the entire interaction, and the executor then waits forever.
+
+So each `rmw_context_t` can run one listener thread. It owns an `epoll` instance of its own, separate from every wait set, plus a wake `eventfd` for watch-list changes and for stopping. It blocks in `epoll_wait` with no timeout, and on readiness it runs the same `drain_endpoint` every other caller runs and fires that endpoint's callback.
+
+**It starts lazily, and only on a callback registration.** `listener_watch` — reached from `rmw_subscription_set_on_new_message_callback`, `rmw_service_set_on_new_request_callback` and `rmw_client_set_on_new_response_callback` — starts the thread if it is not already running, as do the event callback setters for `message_lost` and matched (`rmw_event_set_callback`; a matched one whose doorbell the full registry had no slot for starts it through `listener_ensure_running`, to retry the doorbell). An executor that waits registers no callback, so a process using `SingleThreadedExecutor` or `MultiThreadedExecutor` starts no thread. What it does carry is one `delivery_fd` per wait set, which each `rmw_wait` reads once before its queue scan and which nothing ever writes. Async delivery is opt-in by what the application does, not by configuration. Clearing a callback unwatches the socket; the thread stays for the context's remaining lifetime and is joined in `rmw_shutdown`.
+
+**A watched endpoint may still be in a wait set.** Both the listener and `rmw_wait` may drain the same socket, and two hazards come with that.
+
+The first is **reordering**. `drain_endpoint` `recv`s outside `queue_mutex` and pushes inside it, so two concurrent drains can interleave as recv A / recv B / push B / push A and leave the queue holding one publisher's samples out of order. The queue mutex prevents corruption, not reordering, and ROS 2 guarantees per-publisher FIFO. A per-endpoint `drain_mutex`, held for the receive loop, serialises them — it is taken before `queue_mutex`, and nothing takes `listener_mutex` while holding it, so the lock graph stays acyclic. It is released before the callback fires, so no user code ever runs under it. The cost is that a drain in flight blocks another drain of the *same* endpoint. On application threads, drains of different endpoints never contend. The listener thread is the exception: it holds the context-wide `listener_mutex` while it waits for an endpoint's `drain_mutex`, so a long drain of one endpoint on an application thread — an `rmw_take` working through a deep socket backlog — also delays callback delivery for every other endpoint in the context, and blocks watch and unwatch until it finishes.
+
+The second is a **lost wakeup**, and `delivery_fd` is what closes it. A wait scans its queues, finds them empty, and then calls `epoll_pwait2`; if the listener drains the socket in that gap, the socket is no longer readable, `epoll` has nothing left to report, and the wait sleeps through a message that is already sitting in the queue.
+
+The fix is the doorbell's ordering pair, reused. The listener signals a `delivery_fd` eventfd **strictly after** it enqueues, and `rmw_wait` drains its `delivery_fd` **strictly before** it scans its queues. A message therefore either lands in that scan or leaves the level-triggered eventfd readable for the `epoll_pwait2` that follows — there is no order in which it is missed. Because it is signalled for any endpoint in the context, not just the ones a given wait set holds, a wake on it is not treated as progress: the dispatch re-runs the caller's own queue scan and ends the wait only if something the caller actually waits on became ready.
+
+**One `delivery_fd` per wait set, not one per context.** Reading an eventfd drains its whole counter, so a single shared fd is a single credit, and the ordering pair above only holds for whichever wait set wakes first. Two things went wrong with a shared fd. A wait set that gained no work of its own still consumed the credit and discarded it — its re-check covers only the caller's own queues — leaving the wait set that needed it asleep on a socket the listener had already emptied; with a finite timeout that costs latency, since the output pass re-checks queues at the deadline, but an infinite wait stalls until the next enqueue anywhere in the context, which for the last message of a burst or a one-shot client response never comes. And a wait that was already blocked when the listener started had armed nothing at all, because the fd was resolved once from a listener-running flag that was still false — while `rmw.h` allows a callback registration from any thread at any time.
+
+So each wait set creates its own eventfd in `rmw_create_wait_set` and registers it in the context's list under `delivery_fds_mutex`, the leaf lock every signal takes, so it works whether the listener starts before or after the wait set; `rmw_wait` arms it unconditionally, and the listener writes every registered fd after each enqueue, as does any thread after it records a lost message. A process that never registers a callback simply holds an eventfd nobody writes. `rmw_destroy_wait_set` deregisters under `delivery_fds_mutex` **strictly before** it closes the fd — the other order leaves a signal writing eight bytes into a recycled fd number.
+
+**Lifetime.** `listener_mutex` is held across the drain and the callback it fires, and `listener_unwatch` takes the same mutex, so a thread destroying an endpoint blocks until the in-flight drain has returned. `rmw_destroy_subscription`, `rmw_destroy_service` and `rmw_destroy_client` unwatch before they free anything.
+
+The rule this implies is **context-wide, not endpoint-local**, because there is one `listener_mutex` per context rather than one per endpoint: a listener callback must not destroy, register a callback on, or clear the callback of **any** endpoint in the context. Each of those would wait on a mutex its own caller holds, which is also why `listener_unwatch` blocks on whatever drain is in flight rather than specifically on a drain of the endpoint being unwatched. For the same reason a callback must not call `rmw_shutdown` or `rmw_context_fini` on its context — `listener_stop` takes that mutex and then joins the listener thread, which may be the thread the callback runs on — and it must not block, since delivery for every other endpoint in the context waits behind it.
+
+These rules hold wherever the callback runs: on the listener thread, inside an `rmw_wait` or `rmw_take` drain on an application thread, and in the backlog flush of a callback setter. Wherever it runs, the callback holds that endpoint's `callback_mutex`, and a listener drain of the same endpoint waits for that mutex while holding `listener_mutex`, so even off the listener thread a destroy, setter, or shutdown call made from the callback can deadlock against that drain.
+
+Calling `rmw_take` on its own endpoint, by contrast, **is** allowed: `drain_endpoint` releases `drain_mutex` and `queue_mutex` before it notifies, so the callback holds none of that endpoint's data locks — only `callback_mutex`, enough to keep the callback pointer stable while it is called (and, on the listener thread, `listener_mutex`, which `rmw_take` never takes). `callback_mutex` is a `std::recursive_mutex` for exactly this case: `rmw_take` drains before it pops, so the take re-enters `drain_endpoint` on the thread already inside the callback, and a nested drain that gains a datagram notifies again — the callback is then re-entered, on the same thread, with the new count. `rclcpp`'s callbacks only push to a queue, so none of this is reachable from an executor.
+
+**What it is not.** The listener is event-driven, not timer-driven: it wakes on socket readiness and never on a clock - with one degraded-state exception: while a matched callback waits for a doorbell the full registry had no slot for, it also wakes about once a second to retry (as `rmw_wait` bounds its block while its own doorbell is unregistered). It is not a timer, so it does not make deadline or liveliness QoS enforceable (see Timing policies: accepted, not enforced). Adding those would need a periodic wakeup, which is a different mechanism and a different decision. It does deliver the clock-free QoS status events to callbacks; see the next section.
+
+### QoS status events: message_lost and matched
+
+Three event types are reported: `RMW_EVENT_MESSAGE_LOST`, `RMW_EVENT_SUBSCRIPTION_MATCHED` and `RMW_EVENT_PUBLICATION_MATCHED`. None of them needs a clock, so the "no timer" property above holds. Each endpoint keeps its event state under its own `event_mutex`: the counts the rmw status structs report, the changes accumulated since the last `rmw_take_event`, an `unread` count of the changes recorded since then, and the callback.
+
+**message_lost comes from sequence gaps.** A publisher numbers each publish once, for all of its subscribers, and every datagram carries the publisher's GID and that number in its wire header. It serializes a volatile publish first, then chooses its recipients, numbers it and sends it under a per-publisher `send_mutex`. So concurrent publishes on one publisher reach every subscriber in sequence order, a subscription that joins receives every publish numbered after its first, and a failed serialization consumes no number. Each would otherwise read as a lost message. The TRANSIENT_LOCAL path already numbers and sends under `cache_mutex`. `drain_endpoint` keeps the highest number seen per GID; a jump means datagrams that never arrived here, dropped by the kernel or by the sender on a full socket. The check runs after the `ignore_local_publications` filter, since what a subscription drops on purpose cannot be lost to it, and before the TRANSIENT_LOCAL dedup, which drops on purpose too. The first datagram from a publisher only sets the baseline - for a TRANSIENT_LOCAL late joiner, the creation-time pull's watermark for that publisher when it is higher, since the sequences up to it came through the pull and may never have reached the socket. A large-payload descriptor whose payload is gone (the sender exited, or its ring lapped a slow reader) also counts: the datagram arrived, the message did not. Because a subscription reads large payloads from the ring at take time, a record lapped while its descriptor sat in the queue is counted by the drain that finds it at the front of the queue, or else by the take that finds it, after the take has released `queue_mutex`. A KEEP_LAST queue overflow does not count, as in DDS. Gaps are recorded once the drain has released `drain_mutex`, and fire the callback from wherever the drain ran: the listener thread, or an application thread inside `rmw_wait` or `rmw_take`.
+
+**matched comes from the registry.** An endpoint's peers are the endpoints of the other kind on its topic: a publisher's are the subscriptions, and a subscription's the publishers. That is exactly who a publish reaches, because a publisher sends to every subscription on the topic. The peer set is recomputed, with one `registry_query`, only when the registry generation has moved since the last recompute. The difference gives `current_count`, the cumulative `total_count` and the `*_change` fields. The first recompute runs at `*_event_init`, so an endpoint created into existing matches reports them, as DDS does.
+
+**How they wake.** A waited-on event is ready while `unread` is non-zero. A callback fires when `unread` goes from 0 to 1, one take credit per untaken batch: the executor takes once per callback, and a take collects every change since the last one. A take always succeeds and reports the current status, with zero changes when nothing is new, as the DDS RMWs do; rcl turns `taken == false` into an error that rclcpp logs.
+- A `message_lost` event gains changes in the drains of its subscription, which the same wait performs. A wait that holds the event but not its subscription arms the subscription's socket anyway, to drain it, and does not report the subscription it was not asked about. Whichever thread records a loss - the listener, a wait, a take - then signals the wait sets' `delivery_fd`s: its drain may have emptied a socket another wait is blocked on, whose epoll then never sees it readable. Only once the subscription has a `message_lost` event (before that, no wait can hold one, and a loss is just counted), and never the signalling wait's own fd: an `rmw_wait` re-checks its own queues and events after every point it signals from (`OwnDeliveryFd`). `delivery_fds_mutex` is a leaf lock for this, so the signal is safe under whatever the recording thread holds.
+- A `message_lost` callback has the listener watch its subscription's socket, as a message callback does, so an `EventsExecutor` that sets only the loss callback still sees losses. Clearing either callback keeps the watch while the other is set.
+- A wait set holding a matched event registers the context's doorbell, exactly as one holding a graph guard condition does, so a registry mutation in any process wakes it. After a ring, the wait recomputes.
+- For callbacks (an `EventsExecutor`, which never waits), registering a matched callback also registers the doorbell and has the listener thread watch it. The order is watch, then list, then recompute, the register-before-snapshot order `rmw_wait` uses, so no registry change falls between them. Every matched event with a callback is listed in `UdsContext::graph_events`, guarded by `listener_mutex`; the listener recomputes those and fires the ones that changed.
+
+**Whoever sees a graph change tells everyone.** Every `rmw_wait` in the process and the listener read the same doorbell socket, and a ring is consumed by whichever reads first: a GraphListener's wait can take the ring a matched callback, or another wait set's matched event, was waiting for. So the ring is not what carries the change; the generation is. `observe_generation` advances `UdsContext::last_registry_generation` forward only, with a compare-and-swap, and is true for exactly one observer of each change. That observer, wait or listener, triggers the graph guard conditions as before. If the context has any matched event (`UdsContext::matched_events`), it also signals every wait set's `delivery_fd` and wakes the listener (`listener_graph_changed`), and each of those recomputes its own events. A process with no matched event fans out exactly as it did before. A recompute is one generation compare per event when nothing changed for it.
+
+A recompute fires the callback itself whenever a change starts an untaken batch, on whichever path noticed it - a wait, the listener, or a registration. So a wait that absorbs a change cannot leave an `EventsExecutor` unaware of it. A take recomputes without firing, since it collects the change itself.
+
+**Locks.** `event_mutex` is recursive, because a callback may take its own event. A subscription's status callbacks also hold its `callback_mutex`, taken before `event_mutex`: a take can reach either lock (draining a message notifies under `callback_mutex`, finding a gap records the loss under `event_mutex`), so a message callback and a status callback that both take, on two threads, would otherwise each hold one and wait for the other. A subscription therefore runs one callback at a time, and `callback_mutex` always comes first; a publisher has no message callback, so its matched callback holds `event_mutex` alone. The listener calls `trigger_graph_gcs` (taking `graph_gcs_mutex`) while it holds `listener_mutex`; nothing takes them in the other order, since `rmw_wait` takes the two one after the other, never nested. A matched callback registration takes `listener_registration_mutex`, then `listener_mutex` (the watch, then the listing), and only after releasing it `callback_mutex` (a subscription's) and `event_mutex`. A `message_lost` callback registration holds `listener_registration_mutex` and takes `listener_mutex` (the watch), then `callback_mutex` and `event_mutex`, never nesting the watch with the other two. The listener takes `listener_mutex`, then `callback_mutex`, then `event_mutex`, so no two orders nest the wrong way round. The callback rules of the listener thread apply to event callbacks unchanged.
+
+**Cost.** A process that registers no matched event registers no doorbell, as before. One that does is rung on every registry mutation in the domain, as a GraphListener already is. Each ring costs one `registry_query` per matched event with a callback, and only when the generation moved.
+
+**Known limits.**
+- State is kept per endpoint and event type, as Fast DDS keeps it, so two `rmw_event_t` of one type on one endpoint share their callback and counts. `rclcpp` and `rclpy` create one of each.
+- A peer whose process crashes stays matched until its slot is reclaimed. That happens at the next `rmw_init` in the domain, at a throttled graph query, or when the registry fills; the reclaim then moves the generation as a removal does. Noticing a crash sooner is liveliness, which needs a clock.
+- The listener recomputes under `listener_mutex`, one `registry_query` per matched event with a callback per graph change, so many such events delay callback-driven delivery during a busy bring-up.
+- Event state lives and dies with its endpoint. rcl's `rcl_event_fini` calls librmw's own `rmw_event_fini`, which `rmw_implementation` does not forward to an RMW, so this RMW never sees a fini; `rclcpp` clears an event's callback before it finalizes the event. A process counts an endpoint in `matched_events` from its first matched event until the endpoint is destroyed, so the fan-out above runs for that long: each registry mutation in the domain then wakes every wait set in the process once, and a wait set holding no matched event goes back to sleep after one queue and event check. A busy launch or teardown pays that per mutation.
+- Concurrent publishes on one volatile publisher are serialised by `send_mutex`, from the recipient choice to the last send, so threads sharing a publisher no longer send in parallel. That is the price of a gap check that never mistakes a reordering for a loss; a loss once reported cannot be taken back.
+- A matched callback registered while the registry is full gets no doorbell at first. The listener (started for it) retries the registration about once a second until a slot frees, waking on its own to do so, and takes the doorbell up at once when a wait in the process registers it; until then the callback hears graph changes only through this process's own waits.
+- Both matched events count every peer on the topic, including the context's own publishers for a subscription that ignores local publications. DDS implementations differ on this.
+
+**Refused, on purpose.** Deadline and liveliness need a clock (see Timing policies). Incompatible QoS and incompatible type would claim a delivery failure this transport does not have: it delivers to every subscription on the topic whatever its QoS or type, so `rclcpp`'s default handler would print "No messages will be received from it" for messages that are received. Reporting them honestly would first need QoS- and type-aware matching.
+
+## QoS handling
+
+ROS 2 lets every publisher and subscription declare a QoS profile: reliability, durability, history, depth, and the timing policies (deadline, lifespan, liveliness). The RMW is free to honor a policy, reject an incompatible request, or accept it without enforcing it. This implementation honors the policies that map cleanly onto a copy transport over Unix domain sockets and accepts the rest without acting on them. Accepting-but-not-enforcing rather than rejecting keeps the system plug-and-play: a node that requests an unsupported policy still comes up and communicates, instead of failing to match.
+
+### Normalization at creation
+
+Both `rmw_create_publisher` and `rmw_create_subscription` pass the requested profile through a small `resolve_qos()` step that turns the "system default" and "best available" sentinels into concrete values, so the rest of the code never has to special-case them:
+
+- `history` SYSTEM_DEFAULT becomes KEEP_LAST.
+- `depth` of 0 becomes 10.
+- `reliability` SYSTEM_DEFAULT or BEST_AVAILABLE becomes RELIABLE.
+- `durability` SYSTEM_DEFAULT or BEST_AVAILABLE becomes VOLATILE.
+
+The resolved profile is stored on the endpoint and copied into its registry slot, so other processes can read each endpoint's QoS during discovery. `rmw_publisher_get_actual_qos` and `rmw_subscription_get_actual_qos` return this resolved profile.
+
+### History and depth: enforced
+
+`history = KEEP_LAST` with a bounded `depth` is the only history mode that is actually implemented, and it is enforced on the subscriber side. Incoming datagrams are drained into a per-subscription queue; after each push the queue is trimmed to `depth`, dropping the oldest messages first. An overflow at this point means the application is not calling `take()` fast enough, and it is logged (throttled) as a slow-consumer warning. Large messages (at or above `SHM_PAYLOAD_THRESHOLD`) are capped further by the publisher's ring: the queue holds their descriptors, so a KEEP_LAST depth-N subscription keeps at most what the ring still holds (at least four records of the largest payload), and older queued ones are reported as lost by the next drain or take (see Large payloads: the shared-memory ring). A KEEP_ALL subscription still copies large payloads out at drain time, so this cap does not apply to it.
+
+`history = KEEP_ALL` is accepted but not honored. There is no unbounded queue. A subscription that requests KEEP_ALL gets KEEP_LAST behavior at whatever depth it resolved to (10 if it asked for the default).
+
+### Durability: enforced
+
+`durability = VOLATILE` is the straightforward case: the publisher does not retain anything, so a subscription that joins after a message was published never sees it.
+
+`durability = TRANSIENT_LOCAL` is **pull-based**, the same philosophy as discovery itself: the latched history lives in shared memory, and the party that wants it reads it. At publish time the publisher writes each sample into a per-publisher latched-cache segment in `/dev/shm` (`ros2_uds_tl_<domain>_<pid>_<owner>`), a fixed ring of `depth` per-record-seqlocked slots created *before* the publisher's registry slot and named *in* that slot (the previously unused publisher `socket_path` field). A late-joining TRANSIENT_LOCAL subscription, inside `rmw_create_subscription`, queries the registry for matching latched publishers, maps each cache read-only, snapshots the committed records (bounded per-slot retries — a publisher killed mid-write poisons one slot, never the history, and never hangs creation), validates the segment's embedded 16-byte GID against the slot it came from, and enqueues the history into its own queue before the handle is returned. The idle publisher is never woken, polled, or rung — replay costs it nothing, ever.
+
+Losslessness rests on a store-buffering fence pair: the publisher does *ring-write → `seq_cst` fence → fresh generation load → refresh subscriber cache → fan out*, the subscriber does *registry_add → `seq_cst` fence → pull*. A sample therefore either lands in a cache the pull observes, or its publisher observes the subscriber's registration and delivers it as a datagram; the overlap is deduplicated by a per-publisher sequence watermark recorded at pull time (sequence numbers are assigned inside the latch critical section, so ring order equals sequence order and "at or below the watermark" exactly means "pulled or lapped"). Payloads above a small embed cap (`TL_EMBED_CAP`, 1 KiB) are staged once into the existing durable segments and the slot carries the 32-byte descriptor; the ring's byte footprint is capped (`TL_RING_MAX_BYTES`, 2 MiB), so an extreme `depth` replays the newest samples that fit — a stated, accepted limit. If the cache cannot be created or a slot cannot be committed (`/dev/shm` unavailable or full), the publisher runs latch-less with a logged error: live delivery is unaffected, late joiners get nothing — there is no heap fallback to replay from anymore. `depth` still controls this one publisher-side structure. Two consequences are deliberate: a VOLATILE late joiner no longer receives latched history (the pull is durability-gated — the DDS-correct behaviour, where the old push replayed to every subscriber on the topic), and replay from an already-dead publisher's still-mapped cache remains possible until its slot is reaped, a mild extension of DDS writer-lifetime semantics.
+
+Three operational notes. **/dev/shm budget:** latched history that used to live on the heap now lives in tmpfs — budget roughly one latched ring per TRANSIENT_LOCAL publisher (sparse file up to `TL_RING_MAX_BYTES`; committed pages only for slots actually latched, so a chatty depth-1000 topic like `/rosout` converges toward ~1 MiB) plus one durable segment per over-cap latched sample currently live in a ring, each committing its **whole payload** up front (`posix_fallocate`, page-rounded — a retained 5 MiB sample costs 5 MiB, not an inode), so add the sum of the retained over-cap payloads, up to each publisher's effective depth. Docker's default 64 MB `--shm-size` is not enough at fleet scale: the registry alone is 38 MB — size the mount explicitly. **Dedup bound:** the per-publisher watermark claims only "pulled or already lapped out of the publisher's ring at pull time"; a subscriber that matches mid-burst may therefore not receive samples older than the newest ring-depth — exactly the history DDS would not owe it either — and when a publisher latches concurrently with the pull's scan, the pull keeps only the contiguous prefix of what it saw, letting the rest arrive as datagrams rather than risk the watermark swallowing a missed sample. **Mixed-build reaping:** an old binary's stale-slot reaper does not know the tl_ prefix, so it zeroes a dead new-binary publisher's slot without unlinking the cache segment; the leak is bounded and reclaimed by any new-binary process's `rmw_init` sweep.
+
+### Reliability: accepted, not differentiated
+
+`RELIABLE` and `BEST_EFFORT` are accepted and recorded, but the transport treats them identically. There is no separate acknowledgment-and-retransmit path for RELIABLE. The reason is the nature of the medium. On localhost there is no network in between, so the kernel does not drop `AF_UNIX` datagrams in transit. Once a `sendmsg()` succeeds, the message is sitting in the receiver's socket buffer and will be delivered. In steady state, with a consumer that keeps up, delivery is lossless for both policies, which is why no distinct RELIABLE machinery is needed.
+
+The qualifier is the send side, where a slow consumer can cause a drop that the reliability policy does not prevent. As described in Send failure handling, sends are non-blocking, so a full receive buffer makes the next `sendmsg()` fail and the publisher logs the drop and moves on rather than blocking or retrying. This happens regardless of whether the subscription asked for RELIABLE or BEST_EFFORT. The two policies are the same here: localhost delivery is lossless in transit but bounded by how fast the consumer drains, and a consumer that falls behind drops messages either way.
+
+A second, independent drop point exists even after a datagram is safely in the socket buffer: the per-subscription KEEP_LAST queue described above trims to `depth` when `take()` lags. So "slow consumer drops messages" can mean either a full kernel receive buffer (send fails) or a full application-level queue (oldest popped). Neither is affected by the reliability policy.
+
+### Timing policies: accepted, not enforced
+
+`deadline`, `lifespan`, `liveliness`, and `liveliness_lease_duration` are accepted at endpoint creation and stored, but nothing acts on them. Each would require machinery this RMW deliberately does not have: deadline and liveliness need a periodic timer to detect missed intervals or lapsed heartbeats, and lifespan needs a per-message expiration check. The listener thread is event-driven, not timer-driven — it wakes on socket readiness, never on a clock — so there is still nothing that fires at a deadline, and no QoS-event is ever generated for a missed deadline or lost liveliness. Adding one would mean a timer source this RMW deliberately does not have (see No background threads, and why). A node may request any of these and will come up normally; the values simply have no effect.
+
+### Compatibility checking
+
+`rmw_qos_profile_check_compatible` reports two mismatches as `RMW_QOS_COMPATIBILITY_WARNING`, never as an error:
+
+- A BEST_EFFORT publisher paired with a RELIABLE subscriber. On this RMW the two behave identically, but the pairing signals a likely intent mismatch, so it is surfaced.
+- A VOLATILE publisher paired with a TRANSIENT_LOCAL subscriber. The subscriber expects late-joining replay that a VOLATILE publisher does not provide, so it will never receive past messages.
+
+Both checks append to the `reason` buffer rather than overwrite, so when both mismatches are present both reasons are reported. Every other combination returns `RMW_QOS_COMPATIBILITY_OK`. Nothing is reported as incompatible, which keeps matching permissive by design.
+
+### Summary
+
+| Policy | Status |
+|---|---|
+| `history` = KEEP_LAST | Enforced (subscription queue trimmed to `depth`) |
+| `history` = KEEP_ALL | Accepted, not enforced (treated as KEEP_LAST) |
+| `depth` | Enforced (subscription queue and TRANSIENT_LOCAL cache size) |
+| `durability` = VOLATILE | Enforced (no caching, no replay) |
+| `durability` = TRANSIENT_LOCAL | Enforced (publisher caches last `depth`, replays to late joiners) |
+| `reliability` = RELIABLE | Accepted, not differentiated from BEST_EFFORT |
+| `reliability` = BEST_EFFORT | Accepted, not differentiated from RELIABLE |
+| `deadline` | Accepted, not enforced |
+| `lifespan` | Accepted, not enforced |
+| `liveliness` / `liveliness_lease_duration` | Accepted, not enforced |
+
+## Services, the graph, and GIDs
+
+### Services and clients
+
+Request/response works the same way as topics. A service server and a service client are each just another kind of registry entry with their own receive socket. `rmw_create_service` and `rmw_create_client` follow an identical sequence: generate a GID, bind a `SOCK_DGRAM` socket under `/tmp/ros2_uds/<domain>/` (prefix `srv` for servers, `cli` for clients), then add one slot to the shared-memory registry. The slot's type is `ENTRY_SERVICE` or `ENTRY_CLIENT`, its `topic_name` field holds the service name, and its `socket_path` field holds the address peers send to. Discovery for services is therefore the same registry scan used for pub/sub, filtered by entry type and service name.
+
+The data path uses the one transport for everything. A client serializes the request, builds the wire header with `msg_type = 1` (request), and sends one datagram to the server's socket. The server serializes its reply, builds a header with `msg_type = 2` (response), and sends it back to the client's socket. The `msg_type` byte lets each side ignore datagrams meant for the other direction: `rmw_take_request` skips anything that is not a request, `rmw_take_response` skips anything that is not a response.
+
+Routing a reply back to the right client is the only part that needs a lookup, and it reuses the same generation-keyed cache the publisher uses for subscribers. The reason is identical: re-scanning the registry on every reply would take the registry lock in the hot path. So a server caches the list of its clients as `(GID, socket_path)` pairs keyed on the registry generation counter, and a client caches the single server socket path the same way. When the generation is unchanged, the cached list is used and the lock is never taken. The request carries the client's GID in its wire header, and `rmw_send_response` matches that GID against the cached client list to pick the return socket.
+
+Request and response are correlated by sequence number, and that correlation is left to the rcl layer rather than done in the RMW. The client stamps a per-client monotonic `sequence_number` into each request header (`cli_data->sequence_number.fetch_add(1)`). The server echoes both the client's GID and that same `sequence_number` back in the response header. `rmw_take_response` then returns queued responses first-in-first-out and copies `(writer_guid, sequence_number)` out of the wire header into `rmw_request_id_t`, so rcl can match a response to the request it issued. The RMW itself does no sequence-number matching and no per-request demultiplexing; with several requests in flight, it hands every response up in arrival order and rcl pairs them.
+
+### The graph guard condition
+
+ROS 2 lets a node block until the graph changes (a node, publisher, subscription, service, or client appears or disappears). The mechanism is a graph guard condition: rcl adds it to a wait set, and the RMW arranges for that wait set to wake when the graph moves.
+
+The signal source is the registry's `generation` counter. Every successful add, remove, and stale-slot reclaim does `generation.fetch_add(1)` after publishing its slot change, then rings every registered doorbell (see The doorbell under Wait set). A single monotonic counter in shared memory is enough to mean "something in the graph changed" without saying what; the doorbell is what carries that fact into a process that is asleep.
+
+Each node owns its own graph guard condition, created at `rmw_node_create` as an `eventfd` (see the wait section), stored on the node, and registered in the context's list of graph guard conditions. `rmw_node_get_graph_guard_condition` hands that per-node guard condition to rcl, so the object rcl waits on is the node's — and it is exactly the object `rmw_wait` triggers when it observes a generation change (`UdsContext::last_registry_generation` records the new value, so each change is observed once per context). The doorbell wakes the blocked wait, the generation check runs, the per-node guard conditions fire, and rcl's graph machinery proceeds — with no polling interval anywhere in the path.
+
+### GID generation
+
+Every entity needs a globally unique identifier in the RMW GID format, which is a fixed `RMW_GID_STORAGE_SIZE` (16) byte blob. `UdsGid::generate()` produces one without any UUID library:
+
+- bytes 0–3: the process PID (`getpid()`)
+- bytes 4–7: a per-process atomic counter (`g_gid_counter`, incremented once per entity)
+- bytes 8–15: the `context_id` of the `rmw_context_t` that owns the entity (`UdsContext::context_id`, see Context identity and `ignore_local_publications` below)
+
+PID plus counter is unique on a single host by construction: two different processes have different PIDs, and within one process the monotonic counter guarantees distinct GIDs across all publishers, subscriptions, services, and clients. Sixteen bytes fits the RMW storage size exactly, and the scheme has no external dependency. The GID is what the request/response routing matches on: the client stamps its GID into every request header, and the server matches that GID to choose the reply socket.
+
+### Context identity and `ignore_local_publications`
+
+`rmw_subscription_options_t::ignore_local_publications` asks the middleware not to deliver messages published from the same `rmw_context_t`, not merely the same process — a process can in principle hold more than one context, so "local" is defined at context granularity. Each context gets a `context_id`, generated once in `rmw_init()` and stored on `UdsContext`; every node created from that `rmw_context_t*` shares the same `UdsContext` instance (`rmw_create_node` reuses `context->impl` rather than allocating a new one), so by default — one process, one `rclcpp::init()`, one context — every publisher and subscription in that process shares the same `context_id` automatically, exactly like nodes share `rclcpp`'s global default context unless a caller explicitly builds a separate one.
+
+The id itself is drawn from the kernel's entropy source (`std::random_device`, two 32-bit reads combined into a `uint64_t`) rather than derived from `getpid()`. Unlike the GID's PID field, which only has to disambiguate entities within one process's own generated GIDs, the context id is compared *across* processes and potentially across containers, where PIDs are only unique within their own PID namespace — two containers on the same host (e.g. separate docker-compose services sharing `/dev/shm`) can observe the same PID at the same instant. With 64 random bits, an accidental collision between concurrently running contexts is astronomically unlikely regardless of process or container topology.
+
+Because `UdsGid::generate()` embeds the owning context's id in the trailing 8 bytes of every GID, and the GID is copied verbatim into `WireHeader::gid` on every datagram, a receiver can decide "did this come from my own context?" purely from bytes already on the wire, with no extra traffic. `is_same_context(hdr, context_id)` extracts those trailing 8 bytes and compares them; `drain_endpoint()` calls it only when the subscription actually requested `ignore_local_publications`, so a subscription that leaves the option at its default (`false`) never pays for or triggers the check.
+
+
+
+## Operational requirements
+
+Required system tuning for a production deployment. Without these, you will hit transient drops and silent buffer clamps under load.
+
+| Knob | Default | Recommended | Why |
+|---|--:|--:|---|
+| `net.core.rmem_max` | ~212 KB | 48 MB+ | Caps `SO_RCVBUF`. We request 48 MB; without this we get ~212 KB and large messages drop. |
+| `net.core.wmem_max` | ~212 KB | 48 MB+ | Same for `SO_SNDBUF`. Especially relevant for `EMSGSIZE` on point clouds. |
+| `net.unix.max_dgram_qlen` | 512 | 4096 | Per-Unix-dgram-socket pending-datagram cap. Bursty fan-out (e.g. a new node appearing on a 150-node fleet) overflows 512 with small messages. |
+| `ulimit -n` (`nofile`) | 1024 | 65536 | Each pub/sub/service/client takes 1–2 fds. A 150-node fleet exceeds 1024 quickly. |
+
+Docker requirements:
+- `--ipc=host` — for `/dev/shm` sharing
+- `--pid=host` — for cross-container stale-PID cleanup correctness
+- `-v /tmp/ros2_uds:/tmp/ros2_uds` — for socket file sharing
+
+Files under `/tmp/ros2_uds/<domain>/` must not be removed while their owning processes are alive: they are live sockets (data and doorbell), not temp files, and an external cleaner deleting one silently severs delivery or wakeups to that process. Exempt the directory from tmpfile sweepers, e.g. a `tmpfiles.d` drop-in containing `x /tmp/ros2_uds`. (Ubuntu's default configuration cleans `/tmp` only at boot, and Docker containers run no cleaner, so this bites mainly on hosts with a cron-driven `tmpwatch`/`tmpreaper`.)
+
+## Resource usage, limitations, and build
+
+### Resource profile
+
+The implementation runs no daemon, and starts no background thread unless an application registers a listener callback (see No background threads, and why). When no ROS 2 process is using a domain, nothing belonging to this RMW is running. All discovery state lives in a memory-mapped file, and message I/O happens inside `rmw_wait()` on the executor's own thread — or, for a callback-driven endpoint, on the context's listener thread. There is no process to supervise, no startup ordering to respect, and no idle CPU cost.
+
+Memory use is dominated by two parts: a fixed shared-memory region per domain, and a small per-endpoint cost that grows linearly with the number of live endpoints.
+
+The shared-memory registry is the fixed ~38 MB region described in Registry layout, created once per domain at `/dev/shm/ros2_uds_<domain_id>` and mapped `MAP_SHARED` so every process sees the same bytes. Its size is constant and does not depend on how many nodes are running. The cost is that the region occupies its full size from the first process onward, so a system using only a few endpoints still maps the whole 38 MB. Because the file is sparse on most filesystems, untouched slots do not consume physical pages until they are written.
+
+The region is also not removed on clean shutdown. `rmw_context_fini` unmaps the registry (via `registry_close`) but never calls `shm_unlink`, so `/dev/shm/ros2_uds_<domain>` persists for the lifetime of the host and is reused by the next process that joins that domain. It is removed only by an incompatible-version reclaim (a later process finding a wrong-size file unlinks and recreates it) or by hand (`rm /dev/shm/ros2_uds_<id>`). For containers this means a fresh container gets a fresh `/dev/shm`, and the host's `/dev/shm` must have room for the ~38 MB region (page-resident only as slots are touched). A default tmpfs `/dev/shm` is usually sized at half of RAM, which is far more than enough.
+
+The per-endpoint cost is what scales with the system. Each node, publisher, subscription, service, and client consumes exactly one registry slot. Each receiving endpoint (subscription, service, client) also owns one bound `AF_UNIX` datagram socket: one file descriptor plus one socket file under `/tmp/ros2_uds/<domain_id>/`. Each process holds a single shared send socket regardless of how many publishers it owns. Each wait set holds one `epoll` file descriptor, and each guard condition holds one `eventfd`. For a system of 200 nodes with ten publishers and ten subscriptions each, this is roughly 4000 registry slots, about 2000 socket files, and on the order of 2000 file descriptors spread across all processes. Memory therefore tracks the live endpoint count linearly on top of the fixed registry region. The slot count is the resource to watch as a system grows, because a large graph can use a meaningful fraction of the 32768 available slots (see Scaling characteristics).
+
+| Resource | Usage |
+|----------|-------|
+| Shared memory | ~38 MB (fixed, one region per domain) |
+| Registry slot | 1 per node, publisher, subscription, service, and client |
+| Receive socket | 1 fd + 1 file in `/tmp/ros2_uds/` per subscription, service, and client |
+| Send socket | 1 fd per process, shared by all publishers/clients/services |
+| epoll fd | 1 per wait set, plus 1 per context that starts a listener |
+| eventfd | 1 per guard condition, 1 per wait set (its delivery fd), plus 1 per context that starts a listener (its wake fd) |
+| Payload buffers | Kept for reuse per subscription, service, and client: up to the queue depth (+1 per concurrent take, +1 for the drain), each as large as the largest message it held (see The receive path) |
+| Background threads | 0, unless an endpoint in the context registers a listener callback — then exactly 1 for that context, for the rest of its life |
+
+### Limitations and unsupported features
+
+#### Localhost only, by design
+
+This RMW communicates only between processes on a single host. `AF_UNIX` sockets are local to the machine by definition, and the shared-memory registry is a single host-local file. There is no network transport, no multi-host discovery, and no DDS interoperability: every node on the machine must use `rmw_unix_socket_cpp`, and it cannot exchange messages with CycloneDDS, FastDDS, Connext, or Zenoh endpoints. There is also no DDS-Security: no authentication, encryption, or access control. Anything on the host that can read `/dev/shm` and `/tmp/ros2_uds/` can observe and inject traffic. For networked communication or secured deployments, a DDS-based RMW is the right choice. The implementation is also Linux-specific, because it relies on `epoll`, `eventfd`, `/dev/shm`, and `AF_UNIX`.
+
+#### The single-datagram size cap (~400 KB)
+
+Each message must fit in a single datagram; the usable cap is roughly 400 KB on a stock kernel. See The per-message size cap (~400 KB) under Transport for the full derivation and the sysctl remedy.
+
+#### Notification requires a thread inside rmw_wait
+
+Graph events are serviced from inside `rmw_wait` (woken by the doorbell). A process none of whose threads ever enters `rmw_wait` — an executor wedged in a user callback — cannot observe graph changes until it next waits. `TRANSIENT_LOCAL` late-joiner replay no longer has this limit at all: the joining subscriber pulls the latched cache itself, so an idle, wedged, or never-waiting publisher process still replays.
+
+#### Functions that return `RMW_RET_UNSUPPORTED`
+
+These functions are part of the RMW API but cannot be backed by a copy-based Unix-socket transport. Returning `RMW_RET_UNSUPPORTED` is the contract that tells rcl/rclcpp to skip the feature gracefully rather than fail.
+
+- **Loaned (zero-copy) messages**: `rmw_borrow_loaned_message`, `rmw_publish_loaned_message`, `rmw_take_loaned_message`, `rmw_take_loaned_message_with_info`, `rmw_return_loaned_message_from_publisher`, `rmw_return_loaned_message_from_subscription`. Loaned messages require publisher and subscriber to share the same memory region. This transport copies payloads through kernel socket buffers, so there is no shared region to lend.
+- **Dynamic message types**: `rmw_take_dynamic_message`, `rmw_take_dynamic_message_with_info`, `rmw_serialization_support_init`. Dynamic typing needs a runtime type-discovery protocol (such as DDS Type Object) to learn remote message layouts. The registry carries only a type name string, not a type description.
+- **Network flow endpoints**: `rmw_publisher_get_network_flow_endpoints`, `rmw_subscription_get_network_flow_endpoints`. These report IP addresses and ports for QoS tracing. `AF_UNIX` sockets are addressed by filesystem path, so there is no IP flow to report.
+- **Content filtering**: `rmw_subscription_set_content_filter`, `rmw_subscription_get_content_filter`. Filtering requires a per-message expression engine. Every subscriber receives every message on its topic.
+- **QoS status events other than message_lost and matched**: deadline, liveliness, incompatible QoS and incompatible type (see QoS status events: message_lost and matched for why). `rmw_event_type_is_supported` returns `false` for them, and both `*_event_init` functions reject them with `RMW_RET_UNSUPPORTED`. `rclcpp` turns that into `UnsupportedEventTypeException` and catches it for the default incompatible-QoS and incompatible-type handlers every endpoint gets — silently on jazzy, with one `RCLCPP_WARN` per handler on kilted and later. A handler the application registers itself for one of these types is refused the same way: on jazzy the exception reaches the caller, and on kilted and later it is logged and the callback never fires. Reporting success for an event that is never generated is worse than refusing: `rclcpp` then builds a live event handler, and the failure resurfaces, unhandled, when an executor registers its callback.
+
+  This is separate from the **listener callbacks** — `rmw_subscription_set_on_new_message_callback`, `rmw_service_set_on_new_request_callback`, `rmw_client_set_on_new_response_callback` — which are supported, and are what an `EventsExecutor` actually needs. See The listener thread.
+
+#### Functions that return `RMW_RET_OK` but are no-ops
+
+These succeed silently and do nothing. The RMW spec permits an implementation to accept a feature without enforcing it.
+
+- `rmw_init_publisher_allocation` / `rmw_fini_publisher_allocation` and `rmw_init_subscription_allocation` / `rmw_fini_subscription_allocation`: serialization allocates per-publish via `fastcdr`, so pre-allocation hints are accepted and ignored.
+- `rmw_publisher_assert_liveliness` and `rmw_node_assert_liveliness`: liveliness is not tracked.
+- `rmw_publisher_wait_for_all_acked`: localhost delivery is immediate, so there is nothing to wait for.
+- `rmw_set_log_severity`: there is no internal logging level to set.
+
+#### QoS policies that are not enforced
+
+Several QoS policies are accepted at creation but not acted on. The QoS handling section and its summary table are the authoritative treatment of which policies are enforced and which are accepted-but-ignored, including the `rmw_qos_profile_check_compatible` warnings.
+
+### Testing and validation
+
+The design rests on subtle concurrency claims (a lock-free seqlock, an ABA guard via the sequence recheck, no torn reads, bounded reader retries), so those claims are backed by tests rather than left as assertions. The suite is wired through `ament_add_gtest` under `BUILD_TESTING` and covers each component with unit tests: registry, transport, serialization, QoS, pub/sub, service/client, wait set, and guard conditions. The load-bearing one for the registry is `test/test_registry_concurrent.cpp`, a stress test that runs concurrent writers and readers against the slot array to exercise the no-torn-read and ABA-guard properties the registry sections claim. A `test/perf` directory holds microbenchmarks. Run the suite with:
+
+```bash
+colcon test --packages-select rmw_unix_socket_cpp
+colcon test-result --verbose
+```
+
+### Build and file structure
+
+The package builds with `ament_cmake`, using `configure_rmw_library()` and `register_rmw_implementation()` to register itself as a selectable RMW. Its only dependencies are standard ROS 2 packages and Linux kernel APIs: `rmw` (the abstract interface), `rcutils` and `rcpputils` (utilities), `fastcdr` with `rosidl_typesupport_fastrtps_c` / `rosidl_typesupport_fastrtps_cpp` (CDR serialization), and `pthread` / `rt` (POSIX threading and shared memory). No DDS or other external middleware is pulled in; everything else is implemented directly on kernel primitives that are always present.
+
+To build and select it:
+
+```bash
+colcon build --packages-select rmw_unix_socket_cpp
+export RMW_IMPLEMENTATION=rmw_unix_socket_cpp
+ros2 run demo_nodes_cpp talker     # one terminal
+ros2 run demo_nodes_cpp listener   # another terminal, same env var
+```
+
+The source under `src/` is organized so each concern sits in one place:
+
+| File | Purpose |
+|------|---------|
+| `identifier.hpp` | Implementation identifier string |
+| `logging.hpp` | Internal logging helpers |
+| `types.hpp` | Internal C++ data types |
+| `registry.hpp` / `registry.cpp` | Shared-memory discovery registry |
+| `serialization.hpp` / `serialization.cpp` | CDR serialization via `fastcdr` |
+| `transport.hpp` / `transport.cpp` | Unix socket send/receive helpers |
+| `rmw_init.cpp` | Context init and shutdown |
+| `rmw_node.cpp` | Node create/destroy |
+| `rmw_publisher.cpp` | Publisher create/destroy/publish |
+| `rmw_subscription.cpp` | Subscription create/destroy/take |
+| `rmw_service.cpp` | Service server |
+| `rmw_client.cpp` | Service client |
+| `rmw_guard_condition.cpp` | Guard conditions (`eventfd`) |
+| `rmw_wait.cpp` | Wait set (`epoll`) |
+| `drain.cpp` | The one socket-receive loop, shared by every caller |
+| `listener.cpp` | Listener thread for callback-driven delivery |
+| `rmw_graph.cpp` | Graph introspection queries |
+| `rmw_event.cpp` | QoS status events: message_lost and matched; the rest refused |
+| `rmw_serialize.cpp` | Public serialize/deserialize API |
+| `rmw_features.cpp` | Feature queries, identifier, QoS |
+| `rmw_unsupported.cpp` | Unsupported and no-op stubs |

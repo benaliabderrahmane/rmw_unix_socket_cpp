@@ -1,0 +1,136 @@
+// Copyright 2026 Abderahmane BENALI
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#ifndef RMW_UNIX_SOCKET_CPP__TRANSPORT_HPP_
+#define RMW_UNIX_SOCKET_CPP__TRANSPORT_HPP_
+
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "types.hpp"
+
+namespace rmw_uds
+{
+
+// Ensure the socket directory exists for the given domain_id.
+// Returns the directory path.
+std::string ensure_socket_dir(size_t domain_id);
+
+// Create a bound SOCK_DGRAM Unix domain socket at the given path.
+// Returns fd >= 0 on success, -1 on failure.
+int create_bound_socket(const std::string & path);
+
+// Create an unbound SOCK_DGRAM Unix domain socket for sending.
+// Returns fd >= 0 on success, -1 on failure.
+int create_send_socket();
+
+// ConfigError = EMSGSIZE (hard, surface to caller); SoftDrop = transient.
+enum class SendResult { Ok, SoftDrop, ConfigError };
+
+// Send a datagram (header + payload) to the given socket path. `peer_label`,
+// if non-null, is a human-readable peer identity (see make_peer_label) shown
+// in the drop/failure diagnostics; pass null when no identity is available.
+SendResult send_to(
+  int send_fd,
+  const std::string & dest_path,
+  const WireHeader & header,
+  const uint8_t * payload,
+  size_t payload_size,
+  const char * peer_label = nullptr);
+
+// Build a human-readable peer identity for diagnostics, e.g.
+// "node '/ns/name' on topic '/topic'". Null/empty fields are omitted; a "/"
+// (root) namespace collapses to a single leading slash (ROS fully-qualified
+// name), so ("/", "name", ...) yields "/name" rather than "//name".
+std::string make_peer_label(
+  const char * node_namespace, const char * node_name, const char * topic);
+
+// Receive a single datagram from a non-blocking socket.
+// Returns true if a message was received, false if EAGAIN/EWOULDBLOCK or error.
+bool recv_from(
+  int socket_fd,
+  WireHeader & header_out,
+  std::vector<uint8_t> & payload_out);
+
+// Bytes to put on the wire for an outbound message: either the inline payload
+// or a staged shm descriptor. Returned by shm_prepare_send.
+struct OutboundPayload { const uint8_t * data; size_t size; };
+
+// Choose inline vs shared memory for an outbound message. If payload_size is at
+// or above SHM_PAYLOAD_THRESHOLD, stage the bytes into `ring` (guarded by
+// `mtx`) and, on success, set SHM_PAYLOAD_FLAG on `hdr`, rewrite
+// hdr.payload_size, and return a span over `desc` (which must outlive the
+// send). Otherwise — small payload, or shm unavailable — return a span over the
+// inline bytes and leave `hdr` unchanged. Shared by every large-payload sender
+// (topic publish, service response, client request).
+OutboundPayload shm_prepare_send(
+  ShmRingWriter & ring,
+  std::mutex & mtx,
+  size_t domain_id,
+  const uint8_t * payload,
+  size_t payload_size,
+  WireHeader & hdr,
+  ShmPayloadDescriptor & desc);
+
+// Serialize an outbound ROS message and choose its destination by size, in
+// one pass: a payload that will reach SHM_PAYLOAD_THRESHOLD is serialized
+// DIRECTLY into a reserved ring record (no intermediate heap payload, no
+// staging copy) and `wire` carries the descriptor with SHM_PAYLOAD_FLAG set
+// on `hdr`; smaller payloads — or any shm failure — are serialized into
+// `payload` for the inline datagram path. hdr.payload_size is set in both
+// modes. Returns false only when the message itself cannot be serialized
+// (`payload`/`wire` are then unusable). Used by every serializing sender:
+// non-latched rmw_publish, rmw_send_request, rmw_send_response.
+bool shm_serialize_prepare_send(
+  ShmRingWriter & ring,
+  std::mutex & mtx,
+  size_t domain_id,
+  const void * ros_message,
+  const message_type_support_callbacks_t * callbacks,
+  WireHeader & hdr,
+  ShmPayloadDescriptor & desc,
+  std::vector<uint8_t> & payload,
+  OutboundPayload & wire);
+
+// Resolve an inbound datagram whose payload may be a shm descriptor. If
+// SHM_PAYLOAD_FLAG is set on `hdr`, swap `payload` for the real bytes via
+// `cache` (clearing the flag and fixing hdr.payload_size). Returns false if the
+// datagram must be dropped (descriptor unresolvable — sender gone or ring
+// lapped), true otherwise, including the plain inline case. Shared by every
+// receiver (subscription drain, wait drain, service/client take).
+bool shm_resolve_incoming(
+  ShmReaderCache & cache,
+  size_t domain_id,
+  WireHeader & hdr,
+  std::vector<uint8_t> & payload);
+
+// Generate a unique socket path for the given prefix and domain_id.
+std::string make_socket_path(size_t domain_id, const char * prefix);
+
+// Close a socket and unlink its path.
+void close_socket(int fd, const std::string & path);
+
+// Scan /tmp/ros2_uds/<domain_id>/ for .sock files whose owner PID (encoded
+// in the filename) is no longer alive in our PID namespace, and unlink them.
+// Safe to call at startup to clean up after ungraceful shutdowns.
+void cleanup_orphan_socket_files(size_t domain_id);
+
+// One-shot per-process: warn if net.core.{w,r}mem_max < SO_{SND,RCV}BUF.
+void warn_if_sysctl_buffers_undersized();
+
+}  // namespace rmw_uds
+
+#endif  // RMW_UNIX_SOCKET_CPP__TRANSPORT_HPP_

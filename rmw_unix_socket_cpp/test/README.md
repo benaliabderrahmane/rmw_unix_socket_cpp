@@ -1,0 +1,276 @@
+# rmw_unix_socket_cpp — Test Suite
+
+This document describes every test in the suite, what it validates, and why each test exists.
+
+---
+
+## Test Architecture
+
+Tests are organized in two tiers:
+
+1. **Unit tests** — test internal components (registry, serialization, transport) in isolation by compiling source files directly into the test binary. These bypass the shared library's hidden visibility.
+2. **RMW API tests** — test the public `rmw_*` C functions through the shared library, validating the full stack from API call to socket I/O.
+
+All tests use Google Test (gtest) via `ament_add_gtest`. RMW API test binaries use separate domain IDs to avoid interfering with parallel tests; unit tests that use shared resources also have private domain IDs.
+
+---
+
+## Unit Tests
+
+### test_registry.cpp
+
+Tests the POSIX shared memory discovery registry (`/dev/shm/ros2_uds_<domain_id>`).
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `OpenCreatesValidHeader` | `registry_open` initializes version and max_entries correctly | A corrupted header would break all discovery. This confirms the mmap'd region is properly initialized on first creation. |
+| `AddAndRemoveEntry` | Add a node entry, query it back, remove it, confirm it's gone | Core CRUD. If add/remove is broken, nodes/publishers/subscribers can't register or unregister, causing ghost entries or missing discovery. |
+| `GenerationIncrementsOnChange` | Generation counter increases on add and again on remove | The generation counter drives graph guard condition triggers. If it doesn't increment, `ros2 node list` and `ros2 topic list` never update. |
+| `QueryReturnsNamesOfEveryLength` | Names of every length from 0 to 255 round-trip through add and query in all five string fields | A snapshot copies each name only up to the word holding its terminator. A terminator in a field's unaligned head, on a word boundary, in its tail or in its last byte must not truncate or extend the name. |
+| `QueryFiltersByType` | Adding a PUBLISHER and SUBSCRIPTION on the same topic, then querying by type returns only the requested type | Prevents `rmw_count_publishers` from accidentally counting subscribers, or `rmw_publish` from sending to other publishers instead of subscribers. |
+| `MultipleEntriesSameType` | Add 50 node entries, query returns all 50 | Validates the registry scales beyond trivial counts. Catches off-by-one errors in slot scanning and ensures the linear search over 8192 slots works. |
+| `DoorbellBitTracksDoorbellSlots` | The header's `doorbell_bits` bitmap marks a doorbell slot on add and unmarks it on remove and on stale reclaim, and never marks a node slot | `ring_doorbells` finds doorbells through this bitmap (#53). A missing bit is a lost wakeup for a blocked graph waiter; a bit left set after a reclaim is harmless only because of the type re-check the next test pins. |
+| `MutationRingsOnlyDoorbellSlots` | A mutation rings doorbells in the first and in a later bitmap word exactly once each, and a stale bit over a subscription slot sends nothing to its socket | Pins both halves of the bitmap walk: every word below `high_water_slot` is visited, and a bit is a hint that the seqlock type check filters, so a wake octet never lands on a data socket. |
+| `MutationRingsDoorbellsAtWordBoundary` | Doorbells in slots 63 and 64 (the last bit of bitmap word 0 and the first of word 1) are each rung exactly once per mutation | The walk skips to the next word when the rest of a word is empty; an off-by-one there loses or doubles the doorbell on either side of the boundary. |
+| `CorruptHeaderBoundsStayInsideTheRegistry` | With `max_entries` and `high_water_slot` overwritten to `UINT32_MAX`, add, ring, query and stale cleanup still work and stay inside the registry | The header is shared memory any local process can write. Every scan clamps to `REGISTRY_MAX_ENTRIES`, so a corrupt bound cannot walk the slot array or `doorbell_bits` past the mapping. |
+
+### test_serialization.cpp
+
+Tests the introspection-based binary serializer that converts ROS messages to/from byte buffers.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `BasicTypes` | Round-trip bool, byte, char, float32/64, int8/16/32/64, uint8/16/32/64 | Every primitive type must survive serialization. A single misaligned offset or wrong size would corrupt all downstream messages. |
+| `Strings` | Round-trip `std::string` fields | Strings are length-prefixed (uint32 + bytes). Incorrect length encoding would truncate or over-read, causing data corruption or crashes. |
+| `EmptyStrings` | Round-trip empty `""` strings | Edge case: zero-length strings must serialize as `[0x00000000]` (4-byte zero), not be skipped. Many serializers break on empty strings. |
+| `NestedMessage` | Round-trip a message containing another message (`Nested` contains `BasicTypes`) | Tests recursive serialization. If the sub-message offset or member traversal is wrong, nested fields get misaligned. |
+| `UnboundedSequences` | Round-trip `std::vector<int32_t>`, `std::vector<std::string>`, `std::vector<bool>`, `std::vector<double>` | Dynamic sequences use `size_function`/`get_const_function`/`resize_function` from introspection. `std::vector<bool>` is a bitfield requiring special handling (`fetch_function`/`assign_function` instead of raw pointers). This test caught a segfault from null `get_function` on bool vectors. |
+| `EmptySequences` | Round-trip a message where all sequences are empty (size=0) | Ensures `resize_function(ptr, 0)` and zero-count serialization don't crash. Default-constructed messages have empty vectors. |
+| `Arrays` | Round-trip fixed-size arrays of bools, ints, doubles, strings | Fixed arrays use direct offset math (not function pointers). Incorrect `array_size_` handling would read/write wrong memory. |
+| `LargeString` | Round-trip a 10,000-character string | Validates the serializer handles payloads larger than typical socket buffers. Catches buffer overflow bugs in `append_bytes`. |
+
+### test_transport.cpp
+
+Tests the Unix domain socket send/receive layer.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `CreateBoundSocket` | `create_bound_socket` returns a valid fd | If socket creation fails (permissions, path too long, missing directory), no subscriber can receive messages. |
+| `CreateSendSocket` | `create_send_socket` returns a valid unbound fd | The send socket is shared by all publishers in a context. If it fails, nothing can publish. |
+| `SendAndReceive` | Send a WireHeader + payload, receive and verify all fields match | End-to-end datagram integrity. Validates `sendmsg`/`recvmsg` with `iovec`, WireHeader packing, and payload extraction. |
+| `RecvFromEmptyReturnsF` | `recv_from` on a socket with no pending data returns false | Non-blocking recv must not block or crash. This is called in tight loops during `rmw_wait` draining. |
+| `MultipleMessages` | Send 10 messages, receive all 10 in order with correct sequence numbers | Validates FIFO ordering (guaranteed by Unix DGRAM sockets) and that no messages are lost or reordered in rapid succession. |
+
+---
+
+## RMW API Tests
+
+### test_rmw_init.cpp
+
+Tests context initialization and shutdown lifecycle.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `GetIdentifier` | `rmw_get_implementation_identifier()` returns `"rmw_unix_socket_cpp"` | The identifier string is used by `RMW_CHECK_TYPE_IDENTIFIERS_MATCH` in every API call. Wrong identifier = every call rejected. |
+| `GetSerializationFormat` | `rmw_get_serialization_format()` returns `"cdr"` | Used by rosbag2 and tools to identify the wire format. The payload is standard DDS-CDR (fastcdr), so bags are interoperable with other CDR RMWs. |
+| `InitOptionsLifecycle` | Init, copy, fini of `rmw_init_options_t` | Options carry domain_id, security, allocator. A leak in copy/fini would accumulate over process lifetime. |
+| `InitShutdownLifecycle` | `rmw_init` → `rmw_shutdown` → `rmw_context_fini` | Full lifecycle. Validates shared memory registry is opened, send socket is created, and everything is cleaned up. Leaked fds or shm would accumulate across init/fini cycles. |
+| `NullArgumentsRejected` | Null pointers return `RMW_RET_INVALID_ARGUMENT` | Prevents segfaults from user error. Every public API must validate inputs. |
+
+### test_rmw_node.cpp
+
+Tests node creation and destruction.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `CreateDestroyNode` | Node has correct name, namespace, identifier | Node metadata is used by `ros2 node list` and graph introspection. Wrong values = broken tooling. |
+| `MultipleNodes` | Create 10 nodes, destroy all | Validates registry supports multiple nodes and cleanup doesn't corrupt other entries. |
+| `GraphGuardCondition` | `rmw_node_get_graph_guard_condition` returns a valid guard condition | The graph guard condition wakes up `rmw_wait` when the graph changes. Without it, `ros2 topic list` would never update. |
+| `NullNodeArgs` | Null context/name/namespace rejected | Prevents crashes from invalid arguments. |
+
+### test_rmw_guard_condition.cpp
+
+Tests eventfd-based guard conditions.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `CreateDestroyGuardCondition` | Valid eventfd is created, identifier matches | Guard conditions are the signaling backbone of `rmw_wait`. A failed eventfd = executor hangs forever. |
+| `TriggerGuardCondition` | Trigger writes to eventfd, read confirms non-zero value | Validates the trigger→wakeup path. Used by graph changes, timers, and shutdown signals. |
+| `NullGuardConditionArgs` | Null pointers rejected | Prevents crashes. |
+
+### test_rmw_pub_sub.cpp
+
+Tests the complete publish/subscribe data path.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `CreateDestroyPublisher` | Publisher has correct topic, identifier, `can_loan_messages=false` | Publisher metadata used by graph introspection and QoS negotiation. |
+| `CreateDestroySubscription` | Subscription has correct topic, identifier | Subscription creates a bound socket and registry entry. Failure here = no messages received. |
+| `PublishAndTake` | Publish BasicTypes → take → verify all fields match | The fundamental data path: serialize → sendmsg → recvmsg → deserialize. If this fails, nothing works. |
+| `TakeWithInfo` | Take with message_info, verify timestamps and sequence numbers | Message metadata (source_timestamp, reception_sequence_number, publisher_gid) is used by QoS monitoring, rosbag2, and application logic. |
+| `TakeEmptyReturnsFalse` | Take on empty subscription sets `taken=false` | Executor relies on this to know when to stop taking. A wrong return would cause infinite loops. |
+| `MultipleMessages` | Publish 5, take 5, verify values and order | Validates FIFO ordering and that the message queue doesn't drop or reorder. |
+| `PublisherCountMatchedSubscriptions` | 0 before sub, 1 after sub | Used by `ros2 topic info` and application-level "wait for subscriber" patterns. |
+| `PublisherGetGid` | GID is non-zero and has correct identifier | GIDs identify publishers across the system. Zero GIDs would break `rmw_compare_gids_equal`. |
+| `StringMessages` | Publish/take `test_msgs::msg::Strings` with a string payload | Tests serialization of variable-length types through the full pub/sub stack (not just the serializer unit test). |
+
+### test_rmw_service_client.cpp
+
+Tests service request/response communication.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `CreateDestroyService` | Service has correct name, identifier | Service server creates a socket and registry entry. |
+| `CreateDestroyClient` | Client has correct name, identifier | Client creates a socket for receiving responses. |
+| `ServiceServerIsAvailable` | False before service exists, true after | Used by `ros2 service call --wait` and rclcpp's `wait_for_service`. Without this, clients can't discover servers. |
+| `RequestResponseRoundTrip` | Client sends request → service takes it → service sends response → client takes it, all fields verified | Full RPC round-trip: serialize request → send to service socket → deserialize → serialize response → look up client socket by GID → send → deserialize. Tests the GID-based response routing. |
+
+### test_rmw_wait.cpp
+
+Tests the epoll-based wait set.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `CreateDestroyWaitSet` | Valid epoll fd created, identifier matches | The wait set is the core of the executor. Every node has at least one. |
+| `WaitWithGuardCondition` | Pre-triggered guard condition causes immediate return with `RMW_RET_OK` | Validates the "already ready" fast path — avoids unnecessary epoll_wait when data is already available. |
+| `WaitTimeoutWhenNoData` | Returns `RMW_RET_TIMEOUT` after specified duration, guard condition nulled out | Validates the timeout path. Without this, the executor would hang indefinitely when no messages arrive. |
+| `WaitWithSubscription` | Publish → wait on subscription → returns ready → take succeeds | End-to-end: message arrives on socket → epoll detects it → drain into queue → subscription marked ready → take succeeds. Tests the full executor wakeup path. |
+| `WaitKeepsSubMillisecondTimeoutResolution` | 0.3 ms and 1.7 ms waits return `RMW_RET_TIMEOUT` no earlier than the timeout and less than 0.5 ms after it | rcl passes the time to the next timer in nanoseconds. Rounding it to whole milliseconds made a 1.7 ms wait end after 1 ms (a false timeout) and a 0.3 ms wait take 1 ms. |
+| `OneKilohertzWaitLoopStaysOnSchedule` | A 1 kHz loop of deadline-based `rmw_wait` calls wakes within 0.5 ms of each period in at least 95 % of 500 periods | This is what an executor does for a 1 kHz timer. With millisecond rounding the loop slid behind schedule and rclcpp skipped periods. |
+
+### test_rmw_listener_callbacks.cpp
+
+Tests the `on_new_message` / `on_new_request` / `on_new_response` listener
+callbacks, and the listener thread that fires them without a wait.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `SubscriptionCallbackFiresExactlyOnceOnDelivery` | A callback registered on a subscription is notified exactly once for one published message | Only the `rmw_take` path used to notify, so a callback was silent for every message that arrived while a thread sat in `rmw_wait`. Registering the callback also hands the socket to the listener, so either path may deliver; the count is the invariant, not which one won. |
+| `SubscriptionCallbackReportsTheBatchCount` | Three messages produce `number_of_events` summing to 3 | `rmw/event_callback_type.h` defines the count as events since the last call and allows `> 1`. Asserts the total, not the number of calls — the listener splits a burst into however many batches its `epoll` reports, so the call count is not the middleware's to promise. |
+| `BatchCountMatchesWhatCanBeTaken` | For a burst larger than `qos.depth`, the events reported equal the number of messages `rmw_take` returns | `number_of_events` is a take credit. Counting datagrams read instead of queue growth over-reports on every overflow and spends the difference on takes that find nothing. |
+| `ReRegisteringTheCallbackDoesNotReflushTheBacklog` | Setting the callback twice against the same backlog reports it once | `rclcpp` sets the rmw callback twice in a row deliberately (`subscription_base.hpp`), so a flush that pays out per call doubles every replayed TRANSIENT_LOCAL sample. |
+| `EmptyDrainDoesNotNotify` | A drain that enqueues nothing fires nothing | The contract says the count "should never be 0", so notifying on an empty drain would report an event that did not happen. |
+| `ClearingTheCallbackStopsNotifications` | Registering `nullptr` stops notification | `callback == NULL` is the documented way to clear a callback. |
+| `ACallbackMayTakeWhileItsOwnEndpointGainsMessages` | A callback that publishes once to its own topic and takes on every call sees 2 calls, 2 events and 2 takes | `rmw_take` drains before it pops, so the take re-enters `drain_endpoint` on the thread already inside the callback, and a nested drain that gains a datagram notifies again. With a plain `std::mutex` for `callback_mutex` the thread deadlocked against itself. Fails by hanging until the ctest timeout, not by an assertion. |
+| `ServiceCallbackFiresOnRequest` / `ClientCallbackFiresOnResponse` | Request and response callbacks fire on arrival | Both were stored by their setters and flushed once against an existing backlog, then never fired again by any drain. |
+| `CallbackFiresWithNoThreadInWaitOrTake` | A published message reaches the callback with neither `rmw_wait` nor `rmw_take` ever called | The whole reason the listener thread exists. `EventsExecutor` calls neither until a callback tells it to, so without this it waits forever. Fails by timing out on the pre-listener code. |
+| `ServiceCallbackFiresWithNoThreadInWaitOrTake` / `ClientCallbackFiresWithNoThreadInWaitOrTake` | The same for a service request and a client response | Services and clients reach the listener the same way subscriptions do. |
+| `NoListenerThreadUntilACallbackIsRegistered` | `/proc/self/task` is unchanged by creating a subscription, and grows by exactly one on registration | Pins the lazy start. An executor that waits must still get the zero-background-thread behavior the design promises. |
+| `ClearingTheCallbackStopsAsyncDelivery` | After register then clear, a published message fires nothing within 200 ms | Pins the listener side of `callback == NULL`: the message arrives with no `rmw_wait` or `rmw_take` running, so only the listener could fire, and after a clear it must not fire the old callback. |
+| `DestroySubscriptionWhileMessagesArrive` | 20 rounds of register → publish → destroy with datagrams in flight | `listener_unwatch` must not return while the listener is inside a drain, or the `delete` that follows frees the endpoint underneath it. Run under TSan/ASan to make a regression loud. |
+| `WaitAndListenerOnTheSameSubscriptionDoNotHang` | 50 rounds of publishing into a blocked `rmw_wait` on a watched subscription | If the listener empties the socket between a wait's queue scan and its `epoll_wait`, `epoll` has nothing left to report and the wait would sleep on a full queue. `delivery_fd` closes that window; this drives the race rather than interleaving it exactly. |
+| `ASecondWaitSetDoesNotStealTheDeliveryWakeup` | The same 50 rounds, with a second wait set spinning `rmw_wait` against them throughout | An eventfd read drains the whole counter, so one shared per-context `delivery_fd` was one credit: a wait set that gained no work still consumed it and discarded it. One fd per wait set removes the sharing. The window itself cannot be opened from a test — the victim has to be between its queue scan and its `epoll_wait` — so this drives the path rather than pinning the interleaving. |
+| `DestroyingWaitSetsWhileTheListenerDeliversIsSafe` | 200 wait sets created and destroyed while the listener delivers continuously | A wait set's `delivery_fd` has to leave the context's list before it is closed; the other order leaves the listener writing eight bytes into a recycled fd number. Run under TSan/ASan to make a regression loud. |
+| `RegisteringACallbackWhileTheContextShutsDownDoesNotAbort` | 250 rounds of four threads registering callbacks against a concurrent `rmw_shutdown` | `listener_watch` used to read `is_shutdown` outside `listener_mutex`, and `listener_stop` must release that mutex to join. A registration landing in that window restarted the listener — move-assigning over a joinable `std::thread` (`std::terminate`) and replacing the epoll and wake fds, so the stop's wake-up was lost and `rmw_shutdown` never returned. Fails by wedging or aborting the binary, not by an assertion. |
+| `ConcurrentDrainsPreservePublisherOrder` | 1500 samples drained concurrently by the listener and an `rmw_take` loop, checked for sequence inversions | `drain_endpoint` `recv`s outside `queue_mutex` and pushes inside it, so two drains could interleave and break the per-publisher FIFO ordering ROS 2 guarantees. Reported "531 then 530" before the per-endpoint `drain_mutex`. The deep QoS depth ensures a gap means reordering, not overflow. |
+| `ACallbackMayTakeFromItsOwnEndpoint` | A callback that calls `rmw_take` on its own subscription completes, both from the setter's backlog flush and from a listener drain | `drain_endpoint` and the flush release `drain_mutex` and `queue_mutex` before they notify, which is what makes this legal. Holding either across the callback deadlocks the take one frame up, so this fails by wedging the binary rather than by an assertion. |
+
+### test_rmw_event.cpp
+
+Tests the QoS status events: which types are accepted or refused, the entry points' argument checks, and the behaviour of `message_lost` and both `matched` events.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `OnlyClockFreeEventTypesAreSupported` | `rmw_event_type_is_supported` is true for `message_lost` and both `matched` events, false for every other type | Iterates the whole enum, whose ordinals differ across distros. |
+| `SubscriptionEventInitAcceptsOnlyItsTypes` / `PublisherEventInitAcceptsOnlyPublicationMatched` | Supported types init and fini cleanly; every other type returns `RMW_RET_UNSUPPORTED` with an error message | `RMW_RET_UNSUPPORTED` is the one init failure `rclcpp` swallows; anything else crashes later, when the executor registers its callback. |
+| `RejectedEventInitLeavesTheHandleZeroInitialized` | A refused init leaves the handle untouched | A failed `EventHandler` construction must not leave rcl holding a handle that looks like ours. |
+| `EventInitRejectsForeignEndpoints` / `SetOnNewMessageCallbackRejectsForeignSubscription` / `EventInitRejectsNullArguments` / `TakeEventRejectsBadArguments` | Identifier and null-argument checks on every event entry point | Mixing RMWs, or a null handle, must fail with the documented code rather than dereference. |
+| `TakeEventWithNothingNewReportsZeroChanges` | A take with nothing new still succeeds and reports zero changes | Like the DDS RMWs: rcl turns `taken == false` into `RCL_RET_EVENT_TAKE_FAILED`, which rclcpp logs as an error, and a MultiThreadedExecutor can race two takes of one ready event. |
+| `EventFiniOfAnUninitializedHandleIsANoOp` | `rmw_event_fini` on a zero-initialized handle returns OK | rcl never makes this call, but fini must stay harmless for a handle no init filled in. |
+| `EventSetCallbackReportsUnsupportedWithAMessage` | A callback for a refused type fails with an error message | The original `EventsExecutor` crash read "error not set": a failure with no message behind it. |
+| `MatchedReportsThePeerAnEndpointIsCreatedInto` | Both matched events report the existing peer as a change once; the next take reports the same match with zero changes | DDS reports the matches an endpoint is created into; a second take must not repeat them as new. |
+| `PublicationMatchedTracksSubscriptionsJoiningAndLeaving` | A joining subscription moves `current_count` +1 and `total_count` +1; leaving moves `current_count` −1 and leaves `total_count`; other topics are ignored | `total_count` is cumulative and `current_count` is not; both must follow the registry. |
+| `MatchedEventWakesABlockedWait` | A wait holding only a publisher's matched event wakes when a subscriber appears | image_pipeline's lazy nodes block exactly like this until someone subscribes; the wait needs the doorbell. |
+| `MatchedCallbackFiresWithNoThreadInWait` | A matched callback fires for a new subscriber with no thread in `rmw_wait` | An `EventsExecutor` never waits: the listener thread must hear the registry change itself. |
+| `ReRegisteringAMatchedCallbackDoesNotRepayIt` | Setting the callback twice pays the unread change out once | `rclcpp` sets event callbacks twice in a row on purpose. |
+| `MessageLostCountsSequenceGaps` | The first message from a publisher sets the baseline; skipped sequence numbers count as lost, cumulatively | A gap in a publisher's numbering is what a dropped datagram leaves. |
+| `MessageLostIsReportedByTheWaitThatFoundIt` | A wait holding the subscription and its message_lost event reports the event from the drain that found the gap | rosbag2's recorder runs a waiting executor; before this, `ros2 bag record` exited at startup on jazzy. |
+| `MessageLostCallbackFiresFromTheListenerDrain` | With a message callback set, the listener's drain fires the message_lost callback | The `EventsExecutor` path: no thread waits or takes. |
+| `EventCallbackFiresOncePerUntakenBatch` | Two losses before a take fire one callback, the take collects both, and a loss after it fires again | The executor takes once per callback; a callback per change would leave takes with nothing new. |
+| `MatchedCallbackFiresWhenAnotherWaitConsumesTheRing` | A matched callback fires while a GraphListener-style thread keeps draining the doorbell | Every rmw_wait and the listener read one doorbell; whoever sees the generation move must wake the listener. Failed 2 of 10 runs before the fan-out. |
+| `MatchedWaitWakesWhenAnotherWaitConsumesTheRing` | A wait holding only a publisher's matched event wakes while another wait set drains the doorbell | The image_pipeline lazy node beside a GraphListener: the change has to reach this wait set's `delivery_fd`. |
+| `ConcurrentPublishesOnOnePublisherAreNotLost` | Two threads publish 2000 each on one publisher; message_lost never exceeds what is actually missing | Numbered outside a lock, datagrams reached the subscriber out of order and counted as lost: 750 false losses of 4000 before the send lock. |
+| `GapsFromAnIgnoredLocalPublisherAreNotLost` | A subscription ignoring its own context's publications counts no loss from that publisher's gaps | What a subscription drops on purpose cannot be lost to it. |
+| `AChangeReadByASecondHandlesInitIsStillAnnounced` | A match that a second handle's init is first to read fires the callback registered through the first | Event state is per endpoint, so the init reads for both handles; the listener stays silent on a generation already read. Failed 10/10 before. |
+| `AChangeReadByAReRegistrationIsStillAnnounced` | A match that a callback re-registration is first to read still fires the callback | `rclcpp` registers twice, and the listener, finding that generation read, stays silent. Never fired before the fix. |
+| `AMessageLostCallbackAloneWatchesTheSocket` | With only a message_lost callback set, a gap fires it | An `EventsExecutor` may set no message callback; nothing else would drain the socket. |
+| `AWaitHoldingOnlyAMessageLostEventFindsTheGap` | A wait holding only a message_lost event drains the subscription, reports the event, and does not report the queued message | The rmw contract does not require waiting on the subscription with its events. |
+| `AnUnresolvableShmDescriptorCountsAsLost` | A forged descriptor naming no ring, alone on the socket, counts as one loss and queues nothing | What a gone or lapping sender leaves: the datagram arrived, the message did not. |
+| `HistoryDeliveredByTheLateJoinerPullIsNotLost` | A TRANSIENT_LOCAL late joiner whose socket holds a sequence below the pull's watermark counts no loss at the next live message | The pull delivered the sequences between; counted from the socket alone, one was lost. |
+| `AWaitWakesForALossAnotherThreadRecorded` | A wait blocked on a message_lost event wakes promptly for each of 20 losses while another thread's `rmw_take` drains the socket first | A drain can empty the socket the wait's epoll watches; the thread that records the loss must signal every wait set. Before, 19 or 20 of 20 waited out their timeout. |
+| `ADestroyedEndpointReleasesItsMatchedCount` | Two matched handles on one publisher count it once in `matched_events`, and destroying the publisher without any fini releases it | rcl never reaches an RMW's `rmw_event_fini` (librmw implements it), so the endpoint is the only lifetime the count can follow; leaked, every graph change woke every wait set. Failed 10/10 before. |
+| `AnEventOnlyWaitWakesTheWaitWhoseSocketItDrained` | A wait blocked on a subscription takes each of 20 messages promptly while another wait set, holding only the subscription's message_lost event, drains it first | The event-only drain can empty the socket the other wait's epoll watches, so it must signal the wait sets when it enqueues. Failed 8/10 before. |
+| `DestroyingTheLastMatchedCallbacksEndpointUnwatchesTheDoorbell` | Destroying a publisher whose matched callback is still set stops the listener watching the doorbell | rclcpp clears the callback first, but an rcl user need not; the listener would otherwise wake on every registry mutation. |
+| `ADatagramNumberedBelowOneIsNotGapChecked` | Datagrams numbered 0 then `INT64_MAX` from one GID count no loss | The gap check does arithmetic on wire values any local process can write; a 0 baseline made `seq - seen - 1` overflow and counted ~9.2e18 losses. |
+| `AWaitThatSeesAGraphChangeDoesNotWaitForTheListener` | With `listener_mutex` held, as during a listener drain, an `rmw_wait` that observes a graph change still returns | The fan-out used to take `listener_mutex`, stalling a GraphListener's wait behind a drain and deadlocking a listener callback that polls a wait set. Failed 3/3 before. |
+| `AnUnresolvableDescriptorAlreadyCountedIsNotCountedAgain` | An unresolvable descriptor numbered below its publisher's high-water mark adds no loss | Only a publish the gap check had not passed can be newly lost. Failed 3/3 before. |
+| `ALossCallbackThatTakesCannotDeadlockAMessageCallback` | With `callback_mutex` held, as by a message callback on another thread, a drain that finds a gap and runs a message_lost callback that takes does not hold `event_mutex` | A take reaches `callback_mutex` when it drains a message and `event_mutex` when it finds a gap, so a message callback and a loss callback that both take, on two threads, deadlocked. Failed 3/3 before. |
+| `AMatchedCallbackThatTakesCannotDeadlockAMessageCallback` | The same for a subscription's matched callback fired by an `rmw_wait` that reads a graph change | Same lock-order inversion, through the matched callback. Failed 3/3 before. |
+| `ALossWithNoMessageLostEventWakesNoWaitSet` | A loss on a subscription with no message_lost event leaves every wait set's delivery fd unsignalled, and is still counted for an event made later | Every gap on every lossy topic woke every wait set in the process, though nothing could wait on the event. Failed 3/3 before. |
+| `AMatchedCallbackWithNoDoorbellSocketDoesNotPollForOne` | With the context's doorbell socket unbound, a matched callback is registered without flagging a doorbell retry, and still reports the existing match | A failed bind was treated as a full registry: the listener polled once a second for a doorbell that could never exist, and logged "registry full?". Failed 3/3 before. |
+| `AMatchedCallbackRegisteredWhileTheRegistryIsFullHearsLaterChanges` | A matched callback registered with the registry full (`max_entries` clamped, as in `test_registry`) has the listener watch the doorbell a wait registers later, and fires for a peer created after, with no thread waiting | The listener never took the doorbell up after a failed registration, so an EventsExecutor's matched callback stayed deaf for the endpoint's life. Failed 3/3 before. Runs in `RegistryFullEventTest`: a private domain (108) whose registry is unlinked before and after each test, so a crashed or concurrent run leaves nothing clamped. `registry.cpp` is compiled into this test to fill the registry. |
+| `AWaitingMatchedCallbackRetriesTheDoorbellWithNothingToWakeIt` | The same once the listener has used up its wakes: after slots free, with no wait and no message, it registers and watches the doorbell on its own | The retry ran only when something woke the listener - and checked the flag before draining the wake that announced it - so a callback could stay deaf with a free slot. Failed 3/3 before; takes about a second (the retry period). |
+| `AWaitDoesNotSignalItsOwnDeliveryFd` | A wait that drains a subscription for its message_lost event returns with its own delivery fd unsignalled | The wait re-checks its own events after each signal it sends; signalling itself cost an extra epoll pass or a spurious wake on its next call. Failed 3/3 before. |
+| `ASubscriptionThatJoinsMidPublishSeesNoFalseGap` | Over 100 rounds of four threads publishing while a subscription joins, the newcomer counts no loss | A publish that chose its recipients before the join, numbered after one that reached the newcomer, leaves a gap nothing dropped. Failed 4 of 10 runs before recipients were chosen under the send lock. |
+
+### test_rmw_graph.cpp
+
+Tests graph introspection (discovery queries).
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `GetNodeNames` | Our test node appears in node list with correct namespace | Powers `ros2 node list`. Reads from shared memory registry. |
+| `CountPublishersAndSubscribers` | Counts go 0→1 on create, 1→0 on destroy | Powers `ros2 topic info`. Validates registry add/remove correctly updates counts. |
+| `GetTopicNamesAndTypes` | Created publisher's topic appears with its type | Powers `ros2 topic list -t`. Validates type name encoding from introspection members. |
+| `CompareGidsEqual` | Same GID data = true, different = false | Used internally to match service responses to clients by GID. |
+
+### test_rmw_qos.cpp
+
+Tests QoS policies, TRANSIENT_LOCAL (latched), and multi-endpoint scenarios.
+
+| Test | What it validates | Why it matters |
+|------|-------------------|----------------|
+| `TransientLocalLateJoiner` | Publish 3 messages before subscriber exists → create subscriber → publish 1 more → subscriber receives all 4 | **The core latched topic test.** TRANSIENT_LOCAL publishers cache messages. When a new subscriber is detected (on next publish), the cache is replayed. Without this, `ros2 topic echo --qos-durability transient_local` on a latched topic would miss the initial value. |
+| `TransientLocalCacheDepthEnforced` | Publish 5 into depth=3 cache → late joiner gets only the 3 most recent + current | Prevents unbounded memory growth. The cache evicts oldest messages when full. |
+| `VolatileNoCache` | Publish before subscriber with VOLATILE → late joiner gets nothing | Confirms VOLATILE publishers don't cache. A bug here would waste memory on every publisher. |
+| `QueueDepthEnforced` | Publish 5 into depth=3 subscription queue → take returns only last 3 | Subscription message queues must respect KEEP_LAST depth. Without enforcement, a slow subscriber would consume unbounded memory. |
+| `QosCompatibilityCheck` | RELIABLE+RELIABLE=OK, BEST_EFFORT+RELIABLE=WARNING, VOLATILE+TRANSIENT_LOCAL=WARNING, TRANSIENT_LOCAL+TRANSIENT_LOCAL=OK | `rmw_qos_profile_check_compatible` is called by rclcpp to warn users about mismatched QoS. Wrong results = silent data loss or misleading warnings. |
+| `MultipleSubscribersOnePublisher` | 1 publisher, 3 subscribers — all 3 receive the message | Validates the publisher fanout loop sends to every subscriber socket in the registry. A bug here would cause some subscribers to miss messages. |
+| `MultipleClientsOneService` | 2 clients, 1 service — both clients see the service as available | Validates service discovery works with multiple clients. |
+
+---
+
+## What is NOT tested (and why)
+
+| Feature | Reason |
+|---------|--------|
+| Loaned messages | Not implemented — Unix sockets copy through kernel, zero-copy requires shared memory. Returns `RMW_RET_UNSUPPORTED`. |
+| Dynamic messages | Not implemented — requires middleware type discovery. Returns `RMW_RET_UNSUPPORTED`. |
+| Network flow endpoints | Not applicable — AF_UNIX has no IP endpoints. Returns `RMW_RET_UNSUPPORTED`. |
+| Content filtering | Not implemented. Returns `RMW_RET_UNSUPPORTED`. |
+| Cross-process tests | All tests run in a single process. Cross-process communication works via the same shared-memory registry and socket paths, but testing it requires launching separate processes (integration test territory). |
+| Deadline / lifespan QoS | Not enforced — these are timer-based policies that require background monitoring. The listener thread is event-driven, not timer-driven (socket readiness, never a clock), so it does not make them enforceable. Accepted as a known limitation for this lightweight implementation. |
+| Deadline, liveliness, incompatible-QoS and incompatible-type events | Not generated. `test_rmw_event.cpp` tests the refusal instead: `rmw_event_type_is_supported` returns `false` for them and both `*_event_init` functions reject with `RMW_RET_UNSUPPORTED`, which `rclcpp` catches for the handlers it installs by default. |
+| `message_lost` from a real kernel drop | `test_rmw_event.cpp` injects the sequence gap a drop leaves instead of making the kernel drop datagrams, which a test cannot do on demand. |
+| Stress / scale tests (200+ nodes) | Requires a launch file and process management. Can be tested with the `test200.launch.xml` launch file separately. |
+
+---
+
+## Running the tests
+
+```bash
+# Build with tests
+source /opt/ros/jazzy/setup.bash
+colcon build --packages-select rmw_unix_socket_cpp --cmake-args -DBUILD_TESTING=ON
+
+# Run only gtest (skip linters)
+source install/setup.bash
+cd build/rmw_unix_socket_cpp
+ctest -L gtest --output-on-failure
+
+# Run a specific test
+./test_rmw_qos --gtest_filter="*TransientLocal*"
+
+# Run everything including linters
+ctest --output-on-failure
+```
