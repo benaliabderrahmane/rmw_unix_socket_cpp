@@ -20,6 +20,9 @@
 #include "rmw/rmw.h"
 #include "rmw/dynamic_message_type_support.h"
 #include "rmw/get_network_flow_endpoints.h"
+#if __has_include("rmw/get_service_endpoint_info.h")
+#include "rmw/get_service_endpoint_info.h"
+#endif
 
 extern "C"
 {
@@ -178,5 +181,32 @@ rmw_ret_t rmw_subscription_get_network_flow_endpoints(
   (void)subscription; (void)allocator; (void)network_flow_endpoint_array;
   return RMW_RET_UNSUPPORTED;
 }
+
+#if __has_include("rmw/get_service_endpoint_info.h")
+// --- Service endpoint info ---
+// Post-Kilted API; rmw_implementation resolves every symbol at load.
+
+rmw_ret_t rmw_get_clients_info_by_service(
+  const rmw_node_t * node,
+  rcutils_allocator_t * allocator,
+  const char * service_name,
+  bool no_mangle,
+  rmw_service_endpoint_info_array_t * clients_info)
+{
+  (void)node; (void)allocator; (void)service_name; (void)no_mangle; (void)clients_info;
+  return RMW_RET_UNSUPPORTED;
+}
+
+rmw_ret_t rmw_get_servers_info_by_service(
+  const rmw_node_t * node,
+  rcutils_allocator_t * allocator,
+  const char * service_name,
+  bool no_mangle,
+  rmw_service_endpoint_info_array_t * servers_info)
+{
+  (void)node; (void)allocator; (void)service_name; (void)no_mangle; (void)servers_info;
+  return RMW_RET_UNSUPPORTED;
+}
+#endif
 
 }  // extern "C"
